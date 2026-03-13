@@ -1808,7 +1808,8 @@ client.on('interactionCreate', async interaction => {
 // ============================================================================
 function keepAlive() {
   const server = http.createServer((req, res) => { res.writeHead(200); res.end('Bot online'); });
-  server.listen(process.env.PORT || 3000, () => console.log(`[Web] Keep-alive en puerto ${process.env.PORT || 3000}`));
+  if (!process.env.PORT) return;
+  server.listen(process.env.PORT, () => console.log(`[Web] Keep-alive en puerto ${process.env.PORT}`));
 }
 
 // ============================================================================
