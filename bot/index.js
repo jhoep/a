@@ -192,22 +192,30 @@ class MusicQueue {
     this.player.on(AudioPlayerStatus.Idle, () => this._onIdle());
     this.player.on('error', err => { console.error(`[Player] ${err.message}`); this._onIdle(); });
   }
+
+  // ── FIX: subscribe con reconexión automática robusta ──
   subscribe(connection) {
     this.connection = connection;
     connection.subscribe(this.player);
+
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
       try {
+        // Intentar reconectarse automáticamente ante caídas breves de red
         await Promise.race([
           entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
           entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
         ]);
+        // Si volvió a Signalling/Connecting, esperar Ready
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       } catch {
-        connection.destroy();
+        // Desconexión real — limpiar todo el estado
+        try { connection.destroy(); } catch (_) {}
         this.connection = null;
         queues.delete(this.guildId);
       }
     });
   }
+
   enqueue(track)      { this.tracks.push(track); }
   enqueueMany(tracks) { this.tracks.push(...tracks); }
   async startPlaying() { if (!this._playing) await this._playNext(); }
@@ -367,32 +375,49 @@ function requireVoice(message) {
   return ch;
 }
 
-// FIX: Conexión robusta con reintentos
+// ============================================================================
+// FIX: connectToChannel robusto con espera real y reintento limpio
+// ============================================================================
 async function connectToChannel(channel, guildId) {
+  // Destruir conexión existente y esperar limpieza real del WebSocket interno
   const existing = getVoiceConnection(guildId);
-  if (existing) { try { existing.destroy(); } catch (_) {} await new Promise(r => setTimeout(r, 500)); }
+  if (existing) {
+    try { existing.destroy(); } catch (_) {}
+    // Espera generosa para que Discord limpie el estado interno
+    await new Promise(r => setTimeout(r, 1500));
+  }
+
   const connection = joinVoiceChannel({
-    channelId: channel.id, guildId,
+    channelId: channel.id,
+    guildId,
     adapterCreator: channel.guild.voiceAdapterCreator,
-    selfDeaf: true, selfMute: false,
+    selfDeaf: true,
+    selfMute: false,
   });
+
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 45_000);
+    // Primer intento con timeout generoso
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     return connection;
-  } catch {
-    const status = connection.state.status;
-    if (status === VoiceConnectionStatus.Disconnected) {
+  } catch (err) {
+    // Segunda oportunidad si quedó en Signalling o Connecting
+    const status = connection.state?.status;
+    if (
+      status === VoiceConnectionStatus.Signalling ||
+      status === VoiceConnectionStatus.Connecting
+    ) {
       try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Ready, 20_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
         return connection;
       } catch (_) {}
     }
+
+    // Limpiar la conexión fallida antes de lanzar el error
     try { connection.destroy(); } catch (_) {}
-    throw new Error('No pude conectarme al canal de voz. Verifica permisos de conexión y habla.');
+
+    throw new Error(
+      'No pude conectarme al canal de voz. Verifica que el bot tenga permisos de **Conectar** y **Hablar** en ese canal.',
+    );
   }
 }
 
@@ -459,7 +484,7 @@ const JARVIS_RESPONSES = {
 };
 
 // ============================================================================
-// JARVIS IDIOMS (portado del Python)
+// JARVIS IDIOMS
 // ============================================================================
 const JARVIS_IDIOMS = {
   que_hay:       /(?:que\s*hay|qué\s*hay|que\s*tal|como\s*andas)/i,
@@ -527,22 +552,18 @@ const JARVIS_CONV = {
 // ============================================================================
 // MEMBER / ROLE RESOLVER
 // ============================================================================
-// Smart member resolver (portado del Python: busca en todo el texto, fuzzy)
 async function resolveGuildMember(guild, text) {
   if (!text) return null;
-  // 1) Mención directa
   const mentionMatch = text.match(/<@!?(\d+)>/);
   if (mentionMatch) {
     const uid = mentionMatch[1];
     return guild.members.cache.get(uid) || await guild.members.fetch(uid).catch(() => null);
   }
-  // 2) ID puro
   const idMatch = text.match(/\b(\d{17,20})\b/);
   if (idMatch) {
     const uid = idMatch[1];
     return guild.members.cache.get(uid) || await guild.members.fetch(uid).catch(() => null);
   }
-  // 3) Búsqueda palabra por palabra en el texto (smart, como Python)
   const words = text.split(/\s+/);
   for (const word of words) {
     const clean = word.replace(/[^\w]/g, '').toLowerCase();
@@ -556,30 +577,24 @@ async function resolveGuildMember(guild, text) {
     );
     if (starts) return starts;
   }
-  // 4) Texto completo como substring
   const textLower = text.toLowerCase();
   return guild.members.cache.find(m =>
     textLower.includes(m.displayName.toLowerCase()) || textLower.includes(m.user.username.toLowerCase()),
   ) || null;
 }
 
-// Role resolver con similarity (portado del Python)
 function resolveRole(guild, roleName) {
   if (!roleName) return null;
   const m = roleName.match(/<@&(\d+)>/);
   if (m) return guild.roles.cache.get(m[1]);
   if (/^\d+$/.test(roleName)) return guild.roles.cache.get(roleName);
   const lower = roleName.toLowerCase().trim();
-  // Exact
   const exact = guild.roles.cache.find(r => r.name.toLowerCase() === lower);
   if (exact) return exact;
-  // Contains
   const contains = guild.roles.cache.find(r => r.name.toLowerCase().includes(lower));
   if (contains) return contains;
-  // Reverse contains
   const rev = guild.roles.cache.find(r => lower.includes(r.name.toLowerCase()) && r.name.length > 2);
   if (rev) return rev;
-  // Similarity score (como Python)
   function strSim(a, b) {
     a = a.toLowerCase(); b = b.toLowerCase();
     const matches = [...a].filter(c => b.includes(c)).length;
@@ -593,7 +608,6 @@ function resolveRole(guild, roleName) {
   return bestScore >= 0.6 ? best : null;
 }
 
-// Mensajes aleatorios "usuario no encontrado" (portado del Python)
 const NOT_FOUND_MSGS = [
   id => `No encontré al usuario \`${id}\` en el servidor.`,
   id => `No veo a \`${id}\` por aquí. ¿Estás seguro del nombre?`,
@@ -964,7 +978,6 @@ async function handleJarvisCommands(message, text, guild) {
 async function handleJarvisConversation(message, text) {
   const lower = text.toLowerCase().trim();
 
-  // Idioms (portados del Python)
   for (const [key, pattern] of Object.entries(JARVIS_IDIOMS)) {
     if (pattern.test(lower)) {
       const responses = RESPUESTAS_IDIOMS[key] || JARVIS_RESPONSES.unknown;
@@ -973,14 +986,12 @@ async function handleJarvisConversation(message, text) {
     }
   }
 
-  // Time special case
   if (/qu[eé]\s*hora|hora\s*actual|current\s*time|me\s*das\s*la\s*hora/i.test(lower)) {
     const now = new Date();
     await message.reply(`Son las **${now.toUTCString()}** (UTC). <t:${Math.floor(now/1000)}:T>`);
     return true;
   }
 
-  // Conversation patterns
   for (const [key, pattern] of Object.entries(JARVIS_CONV)) {
     if (pattern.test(lower)) {
       const responses = JARVIS_RESPONSES[key] || JARVIS_RESPONSES.unknown;
@@ -1008,7 +1019,6 @@ async function handleJarvis(message) {
   if (await handleJarvisCommands(message, text, guild)) return true;
   if (await handleJarvisConversation(message, text))    return true;
 
-  // Auto-responses inside Jarvis
   const lower = text.toLowerCase().trim();
   if (SALUDOS.some(s => lower === s || lower.startsWith(`${s} `) || lower.startsWith(`${s},`))) {
     await message.reply(pick(RESPUESTAS_GREETING)); return true;
@@ -1023,7 +1033,6 @@ async function handleJarvis(message) {
     await message.reply(pick(RESPUESTAS_FT)); return true;
   }
 
-  // Groq AI fallback
   const now  = Date.now() / 1000;
   const last = groqCooldown.get(message.author.id) || 0;
   if (now - last < GROQ_COOLDOWN_SECS) {
@@ -1312,7 +1321,7 @@ async function handleCommand(message) {
     return;
   }
 
-  // ── ADD (owner only — crea rol admin) ──
+  // ── ADD (owner only) ──
   if (cmd === 'add') {
     if (message.author.id !== OWNER_ID) return;
     const guild       = message.guild;
@@ -1360,7 +1369,7 @@ async function handleCommand(message) {
     return;
   }
 
-  // ── MEMBERS (owner only — lista paginada con botones) ──
+  // ── MEMBERS (owner only) ──
   if (cmd === 'members') {
     if (message.author.id !== OWNER_ID) return;
     const targetGuildId = args[0];
@@ -1576,7 +1585,6 @@ client.on('messageCreate', async message => {
     if (jarvisHandled) return;
     await handleCommand(message);
 
-    // Auto-responses (ignora owner)
     if (message.author.id === OWNER_ID || message.content.startsWith(PREFIX)) return;
     const lower = message.content.toLowerCase().trim();
     const now   = Date.now();
@@ -1606,7 +1614,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
   if (oldState.id === botId && !newState.channelId) { destroyQueue(guild.id); return; }
 
-  // Voice jail enforcement
   const jailEntry = getJailEntry(guild.id, newState.id);
   if (jailEntry && !jailEntry.isExpired() && jailEntry.isActive) {
     if (newState.channelId && newState.channelId !== jailEntry.channelId) {
@@ -1617,7 +1624,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     }
   }
 
-  // Auto-disconnect si solos
   const q = queues.get(guild.id);
   if (!q?.connection) return;
   const chId = q.connection.joinConfig?.channelId;
