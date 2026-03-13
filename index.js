@@ -1,3 +1,4 @@
+
 'use strict';
 
 // ============================================================================
@@ -391,10 +392,26 @@ function requireVoice(message) {
 }
 
 // ============================================================================
-// ============================================================================
-// connectToChannel — reutiliza conexión válida, destruye solo si es necesario
+// connectToChannel — reutiliza conexión y da errores más claros
 // ============================================================================
 async function connectToChannel(channel, guildId, retries = 3) {
+  // Comprobaciones rápidas de permisos / estado del canal
+  if (!channel.joinable) {
+    throw new Error(
+      'No puedo unirme a ese canal.\n' +
+      'Revisa que mi rol tenga permiso de **Conectar** y que el canal no tenga restricciones por rol.'
+    );
+  }
+  if (!channel.speakable) {
+    throw new Error(
+      'Puedo entrar, pero no hablar en ese canal.\n' +
+      'Dame permiso de **Hablar** en ese canal o en mi rol.'
+    );
+  }
+  if (channel.userLimit && channel.full) {
+    throw new Error('El canal de voz está lleno (límite de usuarios alcanzado).');
+  }
+
   const existing = getVoiceConnection(guildId);
 
   if (existing && existing.state.status === VoiceConnectionStatus.Ready) {
@@ -436,10 +453,11 @@ async function connectToChannel(channel, guildId, retries = 3) {
       } else {
         throw new Error(
           `No pude conectarme al canal de voz.\n` +
-          `El bot no tiene permiso de Conectar o Hablar en ese canal.\n` +
-          `El canal esta lleno (tiene limite de usuarios).\n` +
-          `El hosting bloquea UDP — Discord Voice requiere puertos UDP abiertos.\n` +
-          `Estado interno al fallar: ${status}`,
+          `Posibles causas:\n` +
+          `• El bot no tiene permiso de Conectar o Hablar en ese canal.\n` +
+          `• El canal está lleno (tiene límite de usuarios).\n` +
+          `• El hosting bloquea UDP — Discord Voice requiere puertos UDP abiertos.\n` +
+          `Estado interno al fallar: ${status}`
         );
       }
     }
@@ -453,10 +471,10 @@ function jarvisEmbed(title, description, color = 0x3498db) {
 // ============================================================================
 // GROQ
 // ============================================================================
-const JARVIS_TRIGGER       = /^jarvis[,;:.\s]*/i;
-const JARVIS_SEARCH_PAT    = /busca|buscar|googlea|investiga|search|encuentra|dime\s*sobre|que\s*es|quien\s*es|cuanto|cuando|donde|como\s*funciona|explicame|que\s*sabes\s*de|info\s*sobre/i;
+const JARVIS_TRIGGER    = /^jarvis[,;:.\s]*/i;
+const JARVIS_SEARCH_PAT = /busca|buscar|googlea|investiga|search|encuentra|dime\s*sobre|qu[eé]\s*es|qu[eé]\s*significa|qu[ié]n\s*es|cu[aá]nto|cuando|d[oó]nde|como\s*funciona|expl[ií]came|que\s*sabes\s*de|info\s*sobre|res[uú]meme|resumen\s+de/i;
 
-const SYSTEM_PROMPT = `Eres Jarvis, un asistente inteligente de Discord. Tienes personalidad: eres amigable, cercano, con un toque de humor, y hablas de forma natural como un amigo. Usas expresiones coloquiales de vez en cuando (ej: 'pues mira', 'la verdad es que', 'te cuento', 'vamos a ver', 'oye', etc.). Responde siempre en el mismo idioma del usuario (español o inglés). Sé conciso pero completo. Máximo 1500 caracteres. No uses markdown excesivo. Si no sabes algo, admítelo con honestidad y ofrece alternativas.`;
+const SYSTEM_PROMPT = `Eres Jarvis, un asistente inteligente de Discord integrado en servidores de comunidad y gaming. Tienes personalidad: eres amigable, cercano, con un toque de humor, y hablas de forma natural como un amigo. Usas expresiones coloquiales de vez en cuando (ej: 'pues mira', 'la verdad es que', 'te cuento', 'vamos a ver', 'oye', etc.). Responde siempre en el mismo idioma del usuario (español o inglés). Sé conciso pero completo. Máximo 1500 caracteres. No uses markdown excesivo. Si no sabes algo, admítelo con honestidad y ofrece alternativas. Si la pregunta tiene que ver con el servidor de Discord, asume que estás dentro de ese contexto y responde en tono cercano.`;
 
 async function askGroq(prompt, useSearch = false) {
   if (!GROQ_API_KEY) return 'No hay GROQ_API_KEY configurada.';
@@ -1002,6 +1020,45 @@ async function handleJarvisCommands(message, text, guild) {
 // ============================================================================
 async function handleJarvisConversation(message, text) {
   const lower = text.toLowerCase().trim();
+
+  // Cálculo rápido
+  const calcMatch = lower.match(/^(?:cu[aá]nto\s*es|cu[aá]nto\s*da|calcula|hazme\s*una\s*cuenta)\s+(.+)/i);
+  if (calcMatch) {
+    const exprRaw = calcMatch[1];
+    const expr = exprRaw.replace(/[^0-9+\-*/().,^%\s]/g, '');
+    if (!expr.trim()) {
+      await message.reply('Necesito una expresión numérica, por ejemplo: "calcula 2+2*3".');
+      return true;
+    }
+    try {
+      const result = Function('"use strict"; return (' + expr + ')')();
+      if (typeof result !== 'number' || !isFinite(result)) {
+        await message.reply('Esa cuenta no tiene mucho sentido para mí.');
+      } else {
+        await message.reply(`El resultado es **${result}**.`);
+      }
+    } catch {
+      await message.reply('No pude calcular eso, revisa si la expresión está bien escrita.');
+    }
+    return true;
+  }
+
+  // Traducción sencilla usando Groq
+  const tradMatch = lower.match(/^traduce\s+(.+?)\s+a\s+(ingl[eé]s|espa[nñ]ol|english|spanish)\s*$/i);
+  if (tradMatch) {
+    const sentence = tradMatch[1];
+    const targetLang = tradMatch[2].toLowerCase().includes('ingl') || tradMatch[2].includes('english')
+      ? 'inglés'
+      : 'español';
+
+    const prompt = `Traduce el siguiente texto al ${targetLang}.\n` +
+                   `Solo devuelve la traducción, sin explicaciones ni comillas.\n\n` +
+                   sentence;
+
+    const resp = await askGroq(prompt, false);
+    await message.reply(resp.slice(0, 1900));
+    return true;
+  }
 
   for (const [key, pattern] of Object.entries(JARVIS_IDIOMS)) {
     if (pattern.test(lower)) {
@@ -1594,7 +1651,7 @@ async function handleCommand(message) {
 // ============================================================================
 // EVENTS
 // ============================================================================
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(` Bot listo: ${client.user.tag}`);
   console.log(` Conectado a ${client.guilds.cache.size} servidores`);
   console.log(` Cookies: ${fs.existsSync(COOKIES_FILE) ? 'Encontrado' : 'No encontrado'}`);
@@ -1845,3 +1902,4 @@ function keepAlive() {
     }
   }
 })();
+
