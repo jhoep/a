@@ -376,16 +376,28 @@ function requireVoice(message) {
 }
 
 // ============================================================================
-// FIX: connectToChannel robusto con espera real y reintento limpio
+// ============================================================================
+// connectToChannel — reutiliza conexión válida, destruye solo si es necesario
 // ============================================================================
 async function connectToChannel(channel, guildId) {
-  // Destruir conexión existente y esperar limpieza real del WebSocket interno
   const existing = getVoiceConnection(guildId);
-  if (existing) {
+
+  // Si ya hay una conexión Ready al mismo canal, reutilizarla directamente
+  if (existing && existing.state.status === VoiceConnectionStatus.Ready) {
+    if (existing.joinConfig.channelId === channel.id) {
+      console.log('[Voice] Reutilizando conexion existente.');
+      return existing;
+    }
+    // Canal distinto — destruir y esperar
     try { existing.destroy(); } catch (_) {}
-    // Espera generosa para que Discord limpie el estado interno
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 1000));
+  } else if (existing) {
+    // Existe pero no está Ready — destruir
+    try { existing.destroy(); } catch (_) {}
+    await new Promise(r => setTimeout(r, 1000));
   }
+
+  console.log(`[Voice] Conectando a canal: ${channel.name} (${channel.id})`);
 
   const connection = joinVoiceChannel({
     channelId: channel.id,
@@ -396,28 +408,21 @@ async function connectToChannel(channel, guildId) {
   });
 
   try {
-    // Primer intento con timeout generoso
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+    console.log('[Voice] Conexion lista.');
     return connection;
   } catch (err) {
-    // Segunda oportunidad si quedó en Signalling o Connecting
     const status = connection.state?.status;
-    if (
-      status === VoiceConnectionStatus.Signalling ||
-      status === VoiceConnectionStatus.Connecting
-    ) {
-      try {
-        await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
-        return connection;
-      } catch (_) {}
-    }
-
-    // Limpiar la conexión fallida antes de lanzar el error
+    console.error(`[Voice] Fallo al conectar. Estado: ${status}. Error: ${err.message}`);
     try { connection.destroy(); } catch (_) {}
 
-    throw new Error(
-      'No pude conectarme al canal de voz. Verifica que el bot tenga permisos de **Conectar** y **Hablar** en ese canal.',
-    );
+    const hints = [
+      'El bot no tiene permiso de Conectar o Hablar en ese canal.',
+      'El canal esta lleno (tiene limite de usuarios).',
+      'El hosting bloquea UDP — Discord Voice requiere puertos UDP abiertos.',
+      `Estado interno al fallar: ${status}`,
+    ];
+    throw new Error(`No pude conectarme al canal de voz.\n${hints.join('\n')}`);
   }
 }
 
