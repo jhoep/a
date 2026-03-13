@@ -527,29 +527,79 @@ const JARVIS_CONV = {
 // ============================================================================
 // MEMBER / ROLE RESOLVER
 // ============================================================================
+// Smart member resolver (portado del Python: busca en todo el texto, fuzzy)
 async function resolveGuildMember(guild, text) {
   if (!text) return null;
+  // 1) Mención directa
   const mentionMatch = text.match(/<@!?(\d+)>/);
-  if (mentionMatch) return guild.members.cache.get(mentionMatch[1]) || await guild.members.fetch(mentionMatch[1]).catch(() => null);
+  if (mentionMatch) {
+    const uid = mentionMatch[1];
+    return guild.members.cache.get(uid) || await guild.members.fetch(uid).catch(() => null);
+  }
+  // 2) ID puro
   const idMatch = text.match(/\b(\d{17,20})\b/);
-  if (idMatch) return guild.members.cache.get(idMatch[1]) || await guild.members.fetch(idMatch[1]).catch(() => null);
-  const lower = text.toLowerCase().trim();
+  if (idMatch) {
+    const uid = idMatch[1];
+    return guild.members.cache.get(uid) || await guild.members.fetch(uid).catch(() => null);
+  }
+  // 3) Búsqueda palabra por palabra en el texto (smart, como Python)
+  const words = text.split(/\s+/);
+  for (const word of words) {
+    const clean = word.replace(/[^\w]/g, '').toLowerCase();
+    if (clean.length < 2) continue;
+    const exact = guild.members.cache.find(m =>
+      m.displayName.toLowerCase() === clean || m.user.username.toLowerCase() === clean,
+    );
+    if (exact) return exact;
+    const starts = guild.members.cache.find(m =>
+      m.displayName.toLowerCase().startsWith(clean) || m.user.username.toLowerCase().startsWith(clean),
+    );
+    if (starts) return starts;
+  }
+  // 4) Texto completo como substring
+  const textLower = text.toLowerCase();
   return guild.members.cache.find(m =>
-    m.displayName.toLowerCase() === lower || m.user.username.toLowerCase() === lower ||
-    m.displayName.toLowerCase().startsWith(lower) || m.user.username.toLowerCase().startsWith(lower),
+    textLower.includes(m.displayName.toLowerCase()) || textLower.includes(m.user.username.toLowerCase()),
   ) || null;
 }
 
+// Role resolver con similarity (portado del Python)
 function resolveRole(guild, roleName) {
   if (!roleName) return null;
   const m = roleName.match(/<@&(\d+)>/);
   if (m) return guild.roles.cache.get(m[1]);
   if (/^\d+$/.test(roleName)) return guild.roles.cache.get(roleName);
   const lower = roleName.toLowerCase().trim();
-  return guild.roles.cache.find(r => r.name.toLowerCase() === lower)
-      || guild.roles.cache.find(r => r.name.toLowerCase().includes(lower))
-      || null;
+  // Exact
+  const exact = guild.roles.cache.find(r => r.name.toLowerCase() === lower);
+  if (exact) return exact;
+  // Contains
+  const contains = guild.roles.cache.find(r => r.name.toLowerCase().includes(lower));
+  if (contains) return contains;
+  // Reverse contains
+  const rev = guild.roles.cache.find(r => lower.includes(r.name.toLowerCase()) && r.name.length > 2);
+  if (rev) return rev;
+  // Similarity score (como Python)
+  function strSim(a, b) {
+    a = a.toLowerCase(); b = b.toLowerCase();
+    const matches = [...a].filter(c => b.includes(c)).length;
+    return matches / Math.max(a.length, b.length, 1);
+  }
+  let best = null, bestScore = 0;
+  for (const role of guild.roles.cache.values()) {
+    const score = strSim(lower, role.name);
+    if (score > bestScore) { bestScore = score; best = role; }
+  }
+  return bestScore >= 0.6 ? best : null;
 }
+
+// Mensajes aleatorios "usuario no encontrado" (portado del Python)
+const NOT_FOUND_MSGS = [
+  id => `No encontré al usuario \`${id}\` en el servidor.`,
+  id => `No veo a \`${id}\` por aquí. ¿Estás seguro del nombre?`,
+  id => `Ups, no reconozco a \`${id}\`. Prueba mencionándolo con @`,
+];
+function notFound(id) { return pick(NOT_FOUND_MSGS)(id); }
 
 // ============================================================================
 // JARVIS COMMAND HANDLER
@@ -576,44 +626,48 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // ── MEMBERS COUNT ──
-  if (/cu[aá]ntos\s*miembros|cu[aá]nta\s*gente|cu[aá]ntos\s*(?:somos|hay|est[aá]n)|members?\s*count|total\s*de\s*miembros/i.test(text)) {
+  if (/cu[aá]ntos\s*miembros|cu[aá]nta\s*gente|cu[aá]ntos\s*(?:somos|hay|est[aá]n)|members?\s*count|total\s*de\s*miembros|cuantos\s*usuarios|numero\s*de\s*miembros|poblaci[oó]n/i.test(text)) {
     await guild.members.fetch().catch(() => {});
     const total  = guild.memberCount;
     const humans = guild.members.cache.filter(m => !m.user.bot).size;
     const bots   = guild.members.cache.filter(m =>  m.user.bot).size;
+    const online = guild.members.cache.filter(m => !m.user.bot && m.presence?.status && m.presence.status !== 'offline').size;
     const embed  = jarvisEmbed('Estadísticas del Servidor',
-      `**${guild.name}**\n\nTotal: **${total}**\nHumanos: **${humans}**\nBots: **${bots}**\nCreado: <t:${Math.floor(guild.createdTimestamp/1000)}:D>`,
+      `**${guild.name}**\n\nTotal: **${total}**\nHumanos: **${humans}**\nBots: **${bots}**\nEn línea: **${online}**\nCreado: <t:${Math.floor(guild.createdTimestamp/1000)}:D>`,
       0x3498db);
     await message.reply({ embeds: [embed] });
     return true;
   }
 
   // ── SERVER INFO ──
-  if (/info(?:rmaci[oó]n)?\s*(?:del\s*)?server|datos?\s*(?:del\s*)?server|server\s*info|como\s*se\s*llama\s*el\s*server/i.test(text)) {
+  if (/info(?:rmaci[oó]n)?\s*(?:del\s*)?server|datos?\s*(?:del\s*)?server|server\s*info|como\s*se\s*llama\s*el\s*server|nombre\s*del\s*servidor/i.test(text)) {
     const g     = guild;
     const embed = jarvisEmbed(`Información de ${g.name}`, '\u200b', 0x3498db);
     if (g.iconURL()) embed.setThumbnail(g.iconURL());
     embed.addFields(
-      { name: 'ID',       value: `\`${g.id}\``, inline: true },
-      { name: 'Miembros', value: `${g.memberCount}`, inline: true },
-      { name: 'Canales',  value: `${g.channels.cache.size}`, inline: true },
-      { name: 'Roles',    value: `${g.roles.cache.size}`, inline: true },
-      { name: 'Boosts',   value: `Nivel ${g.premiumTier} (${g.premiumSubscriptionCount} boosts)`, inline: true },
-      { name: 'Creado',   value: `<t:${Math.floor(g.createdTimestamp/1000)}:R>`, inline: true },
+      { name: 'ID',          value: `\`${g.id}\``, inline: true },
+      { name: 'Propietario', value: `<@${g.ownerId}>`, inline: true },
+      { name: 'Miembros',    value: `${g.memberCount}`, inline: true },
+      { name: 'Texto',       value: `${g.channels.cache.filter(c => c.type === ChannelType.GuildText).size}`, inline: true },
+      { name: 'Voz',         value: `${g.channels.cache.filter(c => c.type === ChannelType.GuildVoice).size}`, inline: true },
+      { name: 'Roles',       value: `${g.roles.cache.size}`, inline: true },
+      { name: 'Boosts',      value: `Nivel ${g.premiumTier} (${g.premiumSubscriptionCount} boosts)`, inline: true },
+      { name: 'Creado',      value: `<t:${Math.floor(g.createdTimestamp/1000)}:R>`, inline: true },
     );
     await message.reply({ embeds: [embed] });
     return true;
   }
 
   // ── CAPABILITIES / HELP ──
-  if (/ayuda|help|qu[eé]\s*(?:puedes|sabes)\s*hacer|comandos|capacidades|funciones|qu[eé]\s*haces|para\s*qu[eé]\s*sirves/i.test(text)) {
-    const embed = jarvisEmbed('Mis Capacidades', pick(JARVIS_RESPONSES.unknown.concat(['Mira, te cuento todo lo que puedo hacer:'])), 0xf1c40f);
+  if (/ayuda|help|qu[eé]\s*(?:puedes|sabes)\s*hacer|comandos|capacidades|funciones|qu[eé]\s*haces|para\s*qu[eé]\s*sirves|como\s*funcionas/i.test(text)) {
+    const embed = jarvisEmbed('Mis Capacidades', 'Mira, te cuento todo lo que puedo hacer:', 0xf1c40f);
     embed.addFields(
-      { name: '🔨 Moderación', value: '`jarvis banea a @user [razon]`\n`jarvis expulsa a @user [razon]`\n`jarvis silencia a @user 10m [razon]`\n`jarvis desmutea a @user`\n`jarvis desbanea 123456789`', inline: false },
-      { name: '📝 Canal',      value: '`jarvis borra 50 mensajes`\n`jarvis pon slowmode 5s`\n`jarvis quita el slowmode`\n`jarvis bloquea el canal`\n`jarvis desbloquea el canal`', inline: false },
-      { name: '👤 Usuarios',   value: '`jarvis dame el rol Admin`\n`jarvis dale el rol Admin a @user`\n`jarvis muestra los roles`\n`jarvis cambia el nick de @user a Nuevo`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`', inline: false },
-      { name: '🎵 YouTube',    value: '`jarvis busca en youtube <cancion>`', inline: false },
-      { name: '📊 Servidor',   value: '`jarvis cuantos miembros hay`\n`jarvis info del server`\n`jarvis muestra la whitelist`', inline: false },
+      { name: '🔨 Moderación',    value: '`jarvis banea a @user [razon]`\n`jarvis expulsa a @user [razon]`\n`jarvis silencia a @user 10m [razon]`\n`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis revoca el ban 123456789`', inline: false },
+      { name: '📝 Canal',         value: '`jarvis borra 50 mensajes`\n`jarvis pon slowmode 5s`\n`jarvis pon cooldown 1m`\n`jarvis quita el slowmode`\n`jarvis bloquea el canal`\n`jarvis desbloquea el canal`', inline: false },
+      { name: '👤 Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis dale el rol Admin a @user`\n`jarvis quita el rol Admin a @user`\n`jarvis muestra los roles`\n`jarvis cambia el nick de @user a Nuevo`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`', inline: false },
+      { name: '🎵 YouTube',       value: '`jarvis busca en youtube <cancion>`\n`jarvis pon en yt <cancion>`', inline: false },
+      { name: '📊 Servidor',      value: '`jarvis cuantos miembros hay`\n`jarvis info del server`\n`jarvis muestra la whitelist`', inline: false },
+      { name: '🔒 Voice Jail',    value: '`/voicejail @user #canal 10m`\n`/voicejailstatus`\n`/voicejailremove @user`\n`/voicejailclear`', inline: false },
       { name: '🤖 IA y Búsqueda', value: '`jarvis busca [tema]`\n`jarvis que es [cosa]`\n`jarvis [cualquier pregunta]`', inline: false },
     );
     await message.reply({ embeds: [embed] });
@@ -621,15 +675,15 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // ── BAN ──
-  const banM = text.match(/(?:banea?|prohibe|veta|echalo|elimina[r]?)\s+(?:a\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|raz[oó]n)\s+(.+))?/i);
+  const banM = text.match(/(?:banea?(?:le)?|prohibe|veta|ban\s+al?)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|raz[oó]n|ya\s*que)\s+(.+))?/i);
   if (banM) {
     const member = await resolveGuildMember(guild, banM[1]);
     const reason = banM[2] || 'Orden de Jarvis';
-    if (!member) { await message.reply(`No encontré al usuario \`${banM[1]}\`.`); return true; }
-    if (member.id === author.id)          { await message.reply('No puedes banearte a ti mismo.'); return true; }
-    if (member.id === client.user.id)     { await message.reply('No me pidas que me banee.'); return true; }
+    if (!member) { await message.reply(notFound(banM[1])); return true; }
+    if (member.id === author.id)          { await message.reply(pick(['No puedes banearte a ti mismo.', 'Autobanearse no está permitido.'])); return true; }
+    if (member.id === client.user.id)     { await message.reply(pick(['¿Por qué querrías banearme? ¡Soy tu amigo!', 'No me pidas que me banee.'])); return true; }
     if (member.id === guild.ownerId)      { await message.reply('No puedo banear al dueño del servidor.'); return true; }
-    if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) { await message.reply(`Mi rol es inferior al de ${member}. No puedo banearlo.`); return true; }
+    if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) { await message.reply(`Mi rol es inferior al de ${member}. Necesito un rol más alto.`); return true; }
     try {
       try { await member.send(`Has sido baneado de **${guild.name}**.\nRazón: ${reason}\nPor: ${author.tag}`); } catch (_) {}
       await member.ban({ reason: `[Jarvis] ${reason} (por ${author.tag})`, deleteMessageDays: 0 });
@@ -642,13 +696,13 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // ── KICK ──
-  const kickM = text.match(/(?:kickea?|expulsa[r]?|sac[ao]|echa[r]?|bota[r]?)\s+(?:a\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque)\s+(.+))?/i);
+  const kickM = text.match(/(?:kickea?|kick|expulsa[r]?|sac[ao](?:\s*a)?|echa[r]?(?:\s*a)?|bota[r]?(?:\s*a)?|echalo|sacalo|botarlo|expulsalo|que\s*se\s*vaya)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque)\s+(.+))?/i);
   if (kickM) {
     const member = await resolveGuildMember(guild, kickM[1]);
     const reason = kickM[2] || 'Orden de Jarvis';
-    if (!member) { await message.reply(`No encontré al usuario \`${kickM[1]}\`.`); return true; }
+    if (!member) { await message.reply(notFound(kickM[1])); return true; }
     if (member.id === author.id || member.id === client.user.id) { await message.reply('No puedo hacer eso.'); return true; }
-    if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) { await message.reply(`Mi rol es inferior al de ${member}.`); return true; }
+    if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) { await message.reply(`Mi rol es inferior al de ${member}. No puedo expulsarlo.`); return true; }
     try {
       try { await member.send(`Has sido expulsado de **${guild.name}**.\nRazón: ${reason}\nPor: ${author.tag}`); } catch (_) {}
       await member.kick(`[Jarvis] ${reason} (por ${author.tag})`);
@@ -661,15 +715,15 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // ── TIMEOUT ──
-  const toM = text.match(/(?:silencia[r]?|timeout|mutea?|calla[r]?)\s+(?:a\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(\S+)(?:\s+(?:por|porque)\s+(.+))?/i);
+  const toM = text.match(/(?:silencia[r]?|timeout|mutea?(?:le)?|calla[r]?(?:lo)?|ponle\s*(?:mute|timeout|silencio)|d[eé]jalo\s*callado|que\s*(?:no\s*hable|se\s*calle))\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:por\s+|durante\s+)?(\S+)(?:\s+(?:por|porque|raz[oó]n)\s+(.+))?/i);
   if (toM) {
     const member = await resolveGuildMember(guild, toM[1]);
     const secs   = parseNaturalDuration(toM[2]);
     const reason = toM[3] || 'Orden de Jarvis';
-    if (!member) { await message.reply('No encontré al usuario.'); return true; }
-    if (member.id === author.id) { await message.reply('No puedes silenciarte a ti mismo.'); return true; }
-    if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) { await message.reply(`Mi rol es inferior al de ${member}.`); return true; }
-    if (!secs || secs > 2419200) { await message.reply(`Duración inválida: \`${toM[2]}\`. Usa: 10m, 1h, 'un rato', 'media hora'.`); return true; }
+    if (!member) { await message.reply(notFound(toM[1])); return true; }
+    if (member.id === author.id) { await message.reply(pick(['No puedes silenciarte a ti mismo, señor.', '¿Por qué querrías silenciarte? Me niego.'])); return true; }
+    if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) { await message.reply(`Mi rol es inferior al de ${member}. No puedo silenciarlo.`); return true; }
+    if (!secs || secs > 2419200) { await message.reply(`No entendí la duración: \`${toM[2]}\`. Usa: 10m, 1h, 'un rato', 'media hora'.`); return true; }
     try {
       const until = new Date(Date.now() + secs * 1000);
       try { await member.send(`Has sido silenciado en **${guild.name}** por ${toM[2]}.\nExpira: <t:${Math.floor(until/1000)}:R>`); } catch (_) {}
@@ -687,25 +741,29 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // ── UNTIMEOUT ──
-  const utoM = text.match(/(?:desmutea[r]?|unmute|untimeout|dessilencia[r]?|quita\s*el\s*(?:mute|timeout|silencio))\s+(?:a\s+)?(<@!?\d+>|\d{17,20}|\S+)/i);
+  const utoM = text.match(/(?:desmutea[r]?|unmute|untimeout|dessilencia[r]?|quita\s*el\s*(?:mute|timeout|silencio)|permite\s*hablar\s*a|ya\s*puede\s*hablar)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)/i);
   if (utoM) {
     const member = await resolveGuildMember(guild, utoM[1]);
-    if (!member) { await message.reply('No encontré al usuario.'); return true; }
-    if (!member.isCommunicationDisabled()) { await message.reply(`${member} no tiene un timeout activo.`); return true; }
+    if (!member) { await message.reply(notFound(utoM[1])); return true; }
+    if (!member.isCommunicationDisabled()) { await message.reply(`${member} no tiene un timeout activo, señor.`); return true; }
     try {
       await member.timeout(null, `[Jarvis] Removido por ${author.tag}`);
+      try { await member.send(`Tu timeout ha sido removido en **${guild.name}**.`); } catch (_) {}
       await message.reply({ embeds: [jarvisEmbed('Timeout Removido', `Se quitó el timeout a **${member}**.`, 0x2ecc71)] });
     } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
     return true;
   }
 
   // ── UNBAN ──
-  const ubanM = text.match(/(?:desbanea[r]?|unban|quita\s*el\s*ban)\s+(?:a\s+)?(\d{17,20})/i);
+  const ubanM = text.match(/(?:desbanea[r]?|unban|quita\s*el\s*ban|revoca\s*el\s*ban|anula\s*el\s*ban|perdona\s*a)\s+(?:a[l]?\s+)?(\d{17,20})/i);
   if (ubanM) {
     try {
       await guild.bans.remove(ubanM[1], `[Jarvis] por ${author.tag}`);
       await message.reply({ embeds: [jarvisEmbed('Unban Ejecutado', `Usuario \`${ubanM[1]}\` desbaneado.`, 0x2ecc71)] });
-    } catch (e) { await message.reply(`❌ No pude desbanear: ${e.message}`); }
+    } catch (e) {
+      if (e.code === 10026) await message.reply(`No hay ningún usuario baneado con ID \`${ubanM[1]}\`.`);
+      else await message.reply(`❌ No pude desbanear: ${e.message}`);
+    }
     return true;
   }
 
