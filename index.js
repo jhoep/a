@@ -59,7 +59,7 @@ const GROQ_COOLDOWN_SECS = 4;
 async function autoUpdateYtdlp() {
   return new Promise(resolve => {
     console.log('[STARTUP] Actualizando yt-dlp...');
-    const proc = spawn('pip', ['install', '-U', 'yt-dlp', '-q'], { stdio: 'inherit' });
+    const proc = spawn('pip3', ['install', '-U', 'yt-dlp', '-q'], { stdio: 'inherit' });
     proc.on('close', code => {
       console.log(code === 0 ? '[STARTUP] yt-dlp actualizado.' : `[STARTUP] yt-dlp salió con código ${code}.`);
       resolve();
