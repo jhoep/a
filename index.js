@@ -57,15 +57,8 @@ const GROQ_COOLDOWN_SECS = 4;
 // YT-DLP AUTO-UPDATE
 // ============================================================================
 async function autoUpdateYtdlp() {
-  return new Promise(resolve => {
-    console.log('[STARTUP] Actualizando yt-dlp...');
-    const proc = spawn('python3', ['-m', 'pip', 'install', '-U', 'yt-dlp', '-q', '--break-system-packages'], { stdio: 'inherit' });
-    proc.on('close', code => {
-      console.log(code === 0 ? '[STARTUP] yt-dlp actualizado.' : `[STARTUP] yt-dlp salió con código ${code}.`);
-      resolve();
-    });
-    proc.on('error', err => { console.log(`[STARTUP] No se pudo actualizar yt-dlp: ${err.message}`); resolve(); });
-  });
+  // yt-dlp se instala en build via nixpacks.toml
+  console.log('[STARTUP] yt-dlp listo (instalado en build).');
 }
 
 // ============================================================================
