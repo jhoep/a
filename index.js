@@ -134,8 +134,12 @@ function createFFmpegResource(url, volume = 1.0) {
   const proc = spawn(ffmpegCmd, [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-reconnect_on_network_error', '1', '-i', url,
-    '-analyzeduration', '0', '-loglevel', '0', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
-  ], { stdio: ['ignore', 'pipe', 'ignore'] });
+    '-analyzeduration', '0', '-loglevel', 'error', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  proc.on('error', (err) => { console.error(`[FFmpeg] Spawn error: ${err.message}`); });
+  proc.on('exit', (code, signal) => {
+    if (code !== 0 && code !== null) console.error(`[FFmpeg] Exited with code ${code}, signal ${signal}`);
+  });
   const resource = createAudioResource(proc.stdout, { inputType: StreamType.Raw, inlineVolume: true });
   resource.volume?.setVolume(volume);
   resource._ffmpegProc = proc;
@@ -231,7 +235,24 @@ class MusicQueue {
       if (!track.title || track.title === 'Desconocido') track.title = info.title;
       if (!track.thumbnail) track.thumbnail = info.thumbnail;
       if (!track.duration)  track.duration  = info.duration || 0;
-      const resource = createFFmpegResource(track.url, this.volume);
+
+      let resource;
+      try {
+        resource = createFFmpegResource(track.url, this.volume);
+      } catch (ffErr) {
+        console.error(`[Music] FFmpeg error: ${ffErr.message}`);
+        if (this.textChannel) this.textChannel.send(` Error de FFmpeg: ${ffErr.message}`).catch(() => {});
+        this._playing = false;
+        await this._playNext();
+        return;
+      }
+
+      resource.on('error', (err) => {
+        console.error(`[Music] Resource error: ${err.message}`);
+        this._playing = false;
+        this._playNext();
+      });
+
       this.player.play(resource);
       if (this.textChannel) this.textChannel.send({ embeds: [track.nowPlayingEmbed()] }).catch(() => {});
     } catch (err) {
