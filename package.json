@@ -4,8 +4,7 @@
   "description": "Discord bot with music, Jarvis AI and moderation",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "postinstall": "pip install -U yt-dlp"
+    "start": "node index.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
