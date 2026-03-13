@@ -167,11 +167,11 @@ class Track {
     return `${m}:${String(sec).padStart(2,'0')}`;
   }
   nowPlayingEmbed() {
-    const embed = new EmbedBuilder().setColor(0x1DB954).setTitle('🎵 Reproduciendo ahora')
+    const embed = new EmbedBuilder().setColor(0x1DB954).setTitle(' Reproduciendo ahora')
       .setDescription(`**[${this.title}](${this.webpageUrl})**`)
       .addFields(
-        { name: '⏱ Duración', value: this.formatDuration(), inline: true },
-        { name: '👤 Pedido por', value: `${this.requester}`, inline: true },
+        { name: ' Duración', value: this.formatDuration(), inline: true },
+        { name: ' Pedido por', value: `${this.requester}`, inline: true },
       );
     if (this.thumbnail) embed.setThumbnail(this.thumbnail);
     return embed;
@@ -193,7 +193,7 @@ class MusicQueue {
     this.player.on('error', err => { console.error(`[Player] ${err.message}`); this._onIdle(); });
   }
 
-  // ── FIX: subscribe con reconexión automática robusta ──
+  //  FIX: subscribe con reconexión automática robusta 
   subscribe(connection) {
     this.connection = connection;
     connection.subscribe(this.player);
@@ -242,7 +242,7 @@ class MusicQueue {
       if (this.textChannel) this.textChannel.send({ embeds: [track.nowPlayingEmbed()] }).catch(() => {});
     } catch (err) {
       console.error(`[Music] Error: ${err.message}`);
-      if (this.textChannel) this.textChannel.send(`❌ Error: **${track.title}**: ${err.message}`).catch(() => {});
+      if (this.textChannel) this.textChannel.send(` Error: **${track.title}**: ${err.message}`).catch(() => {});
       this._playing = false;
       await this._playNext();
     }
@@ -371,7 +371,7 @@ function parseNaturalDuration(text) {
 
 function requireVoice(message) {
   const ch = message.member?.voice?.channel;
-  if (!ch) { message.reply('🚫 Debes estar en un canal de voz.'); return null; }
+  if (!ch) { message.reply(' Debes estar en un canal de voz.'); return null; }
   return ch;
 }
 
@@ -622,24 +622,24 @@ async function handleJarvisCommands(message, text, guild) {
   const me     = guild.members.me;
   const author = message.author;
 
-  // ── YT SEARCH ──
+  //  YT SEARCH 
   const ytM = text.match(/(?:busca\s*(?:en\s*)?(?:youtube|yt)|pon\s*(?:en\s*)?(?:youtube|yt)|busca\s*(?:la\s*canci[oó]n|el\s*video))\s+(.+)/i);
   if (ytM) {
     const query  = ytM[1].trim();
-    const status = await message.channel.send(`🔍 Buscando en YouTube: \`${query}\``);
+    const status = await message.channel.send(` Buscando en YouTube: \`${query}\``);
     try {
       const results = await ytdlpGetInfo(`ytsearch5:${query}`, { flat: true, playlist: true });
       const list    = (Array.isArray(results) ? results : [results]).slice(0, 5);
-      const embed   = new EmbedBuilder().setColor(0xFF0000).setTitle(`🔍 Resultados: ${query}`)
+      const embed   = new EmbedBuilder().setColor(0xFF0000).setTitle(` Resultados: ${query}`)
         .setDescription(list.map((r, i) =>
           `**${i + 1}.** [${r.title}](https://www.youtube.com/watch?v=${r.id}) \`${r.duration ? `${Math.floor(r.duration/60)}:${String(r.duration%60).padStart(2,'0')}` : '?'}\``,
         ).join('\n'));
       await status.edit({ content: '', embeds: [embed] });
-    } catch (e) { await status.edit(`❌ Error: ${e.message}`); }
+    } catch (e) { await status.edit(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── MEMBERS COUNT ──
+  //  MEMBERS COUNT 
   if (/cu[aá]ntos\s*miembros|cu[aá]nta\s*gente|cu[aá]ntos\s*(?:somos|hay|est[aá]n)|members?\s*count|total\s*de\s*miembros|cuantos\s*usuarios|numero\s*de\s*miembros|poblaci[oó]n/i.test(text)) {
     await guild.members.fetch().catch(() => {});
     const total  = guild.memberCount;
@@ -653,7 +653,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── SERVER INFO ──
+  //  SERVER INFO 
   if (/info(?:rmaci[oó]n)?\s*(?:del\s*)?server|datos?\s*(?:del\s*)?server|server\s*info|como\s*se\s*llama\s*el\s*server|nombre\s*del\s*servidor/i.test(text)) {
     const g     = guild;
     const embed = jarvisEmbed(`Información de ${g.name}`, '\u200b', 0x3498db);
@@ -672,23 +672,23 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── CAPABILITIES / HELP ──
+  //  CAPABILITIES / HELP 
   if (/ayuda|help|qu[eé]\s*(?:puedes|sabes)\s*hacer|comandos|capacidades|funciones|qu[eé]\s*haces|para\s*qu[eé]\s*sirves|como\s*funcionas/i.test(text)) {
     const embed = jarvisEmbed('Mis Capacidades', 'Mira, te cuento todo lo que puedo hacer:', 0xf1c40f);
     embed.addFields(
-      { name: '🔨 Moderación',    value: '`jarvis banea a @user [razon]`\n`jarvis expulsa a @user [razon]`\n`jarvis silencia a @user 10m [razon]`\n`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis revoca el ban 123456789`', inline: false },
-      { name: '📝 Canal',         value: '`jarvis borra 50 mensajes`\n`jarvis pon slowmode 5s`\n`jarvis pon cooldown 1m`\n`jarvis quita el slowmode`\n`jarvis bloquea el canal`\n`jarvis desbloquea el canal`', inline: false },
-      { name: '👤 Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis dale el rol Admin a @user`\n`jarvis quita el rol Admin a @user`\n`jarvis muestra los roles`\n`jarvis cambia el nick de @user a Nuevo`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`', inline: false },
-      { name: '🎵 YouTube',       value: '`jarvis busca en youtube <cancion>`\n`jarvis pon en yt <cancion>`', inline: false },
-      { name: '📊 Servidor',      value: '`jarvis cuantos miembros hay`\n`jarvis info del server`\n`jarvis muestra la whitelist`', inline: false },
-      { name: '🔒 Voice Jail',    value: '`/voicejail @user #canal 10m`\n`/voicejailstatus`\n`/voicejailremove @user`\n`/voicejailclear`', inline: false },
-      { name: '🤖 IA y Búsqueda', value: '`jarvis busca [tema]`\n`jarvis que es [cosa]`\n`jarvis [cualquier pregunta]`', inline: false },
+      { name: ' Moderación',    value: '`jarvis banea a @user [razon]`\n`jarvis expulsa a @user [razon]`\n`jarvis silencia a @user 10m [razon]`\n`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis revoca el ban 123456789`', inline: false },
+      { name: ' Canal',         value: '`jarvis borra 50 mensajes`\n`jarvis pon slowmode 5s`\n`jarvis pon cooldown 1m`\n`jarvis quita el slowmode`\n`jarvis bloquea el canal`\n`jarvis desbloquea el canal`', inline: false },
+      { name: ' Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis dale el rol Admin a @user`\n`jarvis quita el rol Admin a @user`\n`jarvis muestra los roles`\n`jarvis cambia el nick de @user a Nuevo`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`', inline: false },
+      { name: ' YouTube',       value: '`jarvis busca en youtube <cancion>`\n`jarvis pon en yt <cancion>`', inline: false },
+      { name: ' Servidor',      value: '`jarvis cuantos miembros hay`\n`jarvis info del server`\n`jarvis muestra la whitelist`', inline: false },
+      { name: ' Voice Jail',    value: '`/voicejail @user #canal 10m`\n`/voicejailstatus`\n`/voicejailremove @user`\n`/voicejailclear`', inline: false },
+      { name: ' IA y Búsqueda', value: '`jarvis busca [tema]`\n`jarvis que es [cosa]`\n`jarvis [cualquier pregunta]`', inline: false },
     );
     await message.reply({ embeds: [embed] });
     return true;
   }
 
-  // ── BAN ──
+  //  BAN 
   const banM = text.match(/(?:banea?(?:le)?|prohibe|veta|ban\s+al?)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|raz[oó]n|ya\s*que)\s+(.+))?/i);
   if (banM) {
     const member = await resolveGuildMember(guild, banM[1]);
@@ -705,11 +705,11 @@ async function handleJarvisCommands(message, text, guild) {
       embed.addFields({ name: 'Razón', value: reason }, { name: 'ID', value: `\`${member.id}\``, inline: true });
       embed.setFooter({ text: `Ordenado por ${author.tag}` });
       await message.reply({ embeds: [embed] });
-    } catch (e) { await message.reply(`❌ No pude banear: ${e.message}`); }
+    } catch (e) { await message.reply(` No pude banear: ${e.message}`); }
     return true;
   }
 
-  // ── KICK ──
+  //  KICK 
   const kickM = text.match(/(?:kickea?|kick|expulsa[r]?|sac[ao](?:\s*a)?|echa[r]?(?:\s*a)?|bota[r]?(?:\s*a)?|echalo|sacalo|botarlo|expulsalo|que\s*se\s*vaya)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque)\s+(.+))?/i);
   if (kickM) {
     const member = await resolveGuildMember(guild, kickM[1]);
@@ -724,11 +724,11 @@ async function handleJarvisCommands(message, text, guild) {
       embed.addFields({ name: 'Razón', value: reason });
       embed.setFooter({ text: `Ordenado por ${author.tag}` });
       await message.reply({ embeds: [embed] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── TIMEOUT ──
+  //  TIMEOUT 
   const toM = text.match(/(?:silencia[r]?|timeout|mutea?(?:le)?|calla[r]?(?:lo)?|ponle\s*(?:mute|timeout|silencio)|d[eé]jalo\s*callado|que\s*(?:no\s*hable|se\s*calle))\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:por\s+|durante\s+)?(\S+)(?:\s+(?:por|porque|raz[oó]n)\s+(.+))?/i);
   if (toM) {
     const member = await resolveGuildMember(guild, toM[1]);
@@ -750,11 +750,11 @@ async function handleJarvisCommands(message, text, guild) {
       if (reason !== 'Orden de Jarvis') embed.addFields({ name: 'Razón', value: reason });
       embed.setFooter({ text: `Ordenado por ${author.tag}` });
       await message.reply({ embeds: [embed] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── UNTIMEOUT ──
+  //  UNTIMEOUT 
   const utoM = text.match(/(?:desmutea[r]?|unmute|untimeout|dessilencia[r]?|quita\s*el\s*(?:mute|timeout|silencio)|permite\s*hablar\s*a|ya\s*puede\s*hablar)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)/i);
   if (utoM) {
     const member = await resolveGuildMember(guild, utoM[1]);
@@ -764,11 +764,11 @@ async function handleJarvisCommands(message, text, guild) {
       await member.timeout(null, `[Jarvis] Removido por ${author.tag}`);
       try { await member.send(`Tu timeout ha sido removido en **${guild.name}**.`); } catch (_) {}
       await message.reply({ embeds: [jarvisEmbed('Timeout Removido', `Se quitó el timeout a **${member}**.`, 0x2ecc71)] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── UNBAN ──
+  //  UNBAN 
   const ubanM = text.match(/(?:desbanea[r]?|unban|quita\s*el\s*ban|revoca\s*el\s*ban|anula\s*el\s*ban|perdona\s*a)\s+(?:a[l]?\s+)?(\d{17,20})/i);
   if (ubanM) {
     try {
@@ -776,12 +776,12 @@ async function handleJarvisCommands(message, text, guild) {
       await message.reply({ embeds: [jarvisEmbed('Unban Ejecutado', `Usuario \`${ubanM[1]}\` desbaneado.`, 0x2ecc71)] });
     } catch (e) {
       if (e.code === 10026) await message.reply(`No hay ningún usuario baneado con ID \`${ubanM[1]}\`.`);
-      else await message.reply(`❌ No pude desbanear: ${e.message}`);
+      else await message.reply(` No pude desbanear: ${e.message}`);
     }
     return true;
   }
 
-  // ── PURGE ──
+  //  PURGE 
   const purgeM = text.match(/(?:borra[r]?|elimina[r]?|purga[r]?|limpia[r]?)\s+(\d+)\s*(?:mensajes?|msgs?)?/i);
   if (purgeM) {
     const amount = Math.min(parseInt(purgeM[1]), 500);
@@ -790,11 +790,11 @@ async function handleJarvisCommands(message, text, guild) {
       const deleted = await message.channel.bulkDelete(amount, true);
       const conf    = await message.channel.send({ embeds: [jarvisEmbed('Limpieza Completada', `Se eliminaron **${deleted.size}** mensajes.`, 0x2ecc71)] });
       setTimeout(() => conf.delete().catch(() => {}), 5000);
-    } catch (e) { await message.channel.send(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.channel.send(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── SLOWMODE ON ──
+  //  SLOWMODE ON 
   const slowM = text.match(/(?:pon|activa|configura|set|habilita)\s*(?:el\s*)?(?:slowmode|modo\s*lento|cooldown)[^\d]*(\d+)\s*([smh])?/i);
   if (slowM && !/quita|desactiva|remueve|apaga|saca|para|off/i.test(text)) {
     const mult  = { s: 1, m: 60, h: 3600 }[(slowM[2] || 's').toLowerCase()] || 1;
@@ -802,38 +802,38 @@ async function handleJarvisCommands(message, text, guild) {
     try {
       await message.channel.edit({ rateLimitPerUser: total });
       await message.reply({ embeds: [jarvisEmbed('Slowmode Activado', `Slowmode configurado a **${slowM[1]}${slowM[2] || 's'}**.`, 0x3498db)] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── SLOWMODE OFF ──
+  //  SLOWMODE OFF 
   if (/(?:quita|desactiva|remueve|apaga|saca|para)\s*(?:el\s*)?(?:slowmode|modo\s*lento|cooldown)|slowmode\s*off/i.test(text)) {
     try {
       await message.channel.edit({ rateLimitPerUser: 0 });
       await message.reply({ embeds: [jarvisEmbed('Slowmode Desactivado', 'Slowmode removido de este canal.', 0x2ecc71)] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── LOCK ──
+  //  LOCK 
   if (/(?:^|\s)(?:bloquea[r]?|lock|cierra|lockea[r]?|tranca[r]?)\b/i.test(text) && !/desbloquea|unlock/i.test(text)) {
     try {
       await message.channel.permissionOverwrites.edit(guild.id, { SendMessages: false }, { reason: `[Jarvis] por ${author.tag}` });
       await message.reply({ embeds: [jarvisEmbed('Canal Bloqueado', `${message.channel} ha sido bloqueado.`, 0xe74c3c)] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── UNLOCK ──
+  //  UNLOCK 
   if (/(?:desbloquea[r]?|unlock|abre[r]?|unlockea[r]?|destranca[r]?)/i.test(text)) {
     try {
       await message.channel.permissionOverwrites.edit(guild.id, { SendMessages: null }, { reason: `[Jarvis] por ${author.tag}` });
       await message.reply({ embeds: [jarvisEmbed('Canal Desbloqueado', `${message.channel} ha sido desbloqueado.`, 0x2ecc71)] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── ROLES LIST ──
+  //  ROLES LIST 
   if (/(?:muestra|lista|ver|cu[aá]les\s+son|todos\s*los)\s+(?:los\s+)?roles?|(?:los\s+)?roles?\s+(?:del?\s*server(?:idor)?)?$/i.test(text)) {
     const roles = [...guild.roles.cache.values()].filter(r => r.name !== '@everyone').sort((a, b) => b.position - a.position);
     const lines = roles.slice(0, 30).map(r => `${r} — \`${r.id}\``);
@@ -842,7 +842,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── ROLE REMOVE ──
+  //  ROLE REMOVE 
   const roleRemM = text.match(/(?:quita[r]?|remueve[r]?|elimina[r]?|saca[r]?)\s+(?:el\s+)?rol\s+(.+?)(?:\s+(?:a[l]?\s+|de\s+)(<@!?\d+>|\d{17,20}|\S+))?$/i);
   if (roleRemM) {
     const roleName = roleRemM[1].replace(/\b(?:el|la|los|las|de|del|a|al)\b/gi, '').trim();
@@ -854,11 +854,11 @@ async function handleJarvisCommands(message, text, guild) {
     try {
       await member.roles.remove(role, `[Jarvis] Removido por ${author.tag}`);
       await message.reply({ embeds: [jarvisEmbed('Rol Removido', `Se quitó **${role.name}** de ${member}.`, 0xe67e22)] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── ROLE ADD ──
+  //  ROLE ADD 
   const roleAddM = text.match(/(?:dame?|a[ñn]ade|asigna[r]?|ponle|dale|otorga[r]?)\s+(?:el\s+)?rol\s+(.+?)(?:\s+a[l]?\s+(<@!?\d+>|\d{17,20}|\S+))?$/i);
   if (roleAddM) {
     const role   = resolveRole(guild, roleAddM[1].trim());
@@ -868,11 +868,11 @@ async function handleJarvisCommands(message, text, guild) {
     try {
       await member.roles.add(role, `[Jarvis] Asignado por ${author.tag}`);
       await message.reply({ embeds: [jarvisEmbed('Rol Asignado', `Se asignó **${role.name}** a ${member}.`, 0x2ecc71)] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── NICK ──
+  //  NICK 
   const nickM = text.match(/(?:c[aá]mbia[r]?|ponle|set|deja[r]?)\s*(?:el\s*)?(?:nick|nombre|apodo|nickname)\s*(?:de\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:a\s+|por\s+|como\s+)?(.+)/i);
   if (nickM) {
     const member = await resolveGuildMember(guild, nickM[1]);
@@ -881,11 +881,11 @@ async function handleJarvisCommands(message, text, guild) {
     try {
       await member.setNickname(nick, `[Jarvis] por ${author.tag}`);
       await message.reply({ embeds: [jarvisEmbed('Apodo Cambiado', `El apodo de ${member} ahora es **${nick}**.`, 0x3498db)] });
-    } catch (e) { await message.reply(`❌ Error: ${e.message}`); }
+    } catch (e) { await message.reply(` Error: ${e.message}`); }
     return true;
   }
 
-  // ── SAY ──
+  //  SAY 
   const sayM = text.match(/^(?:di|escribe|env[ií]a|manda|say|repite|anuncia|habla)\s+(.+)/i);
   if (sayM) {
     await message.delete().catch(() => {});
@@ -893,7 +893,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── DM ──
+  //  DM 
   const dmM = text.match(/(?:env[ií]a(?:le)?|manda(?:le)?|escribe(?:le)?|(?:un\s+)?(?:dm|md|mensaje\s*(?:privado|directo)|privado))\s+(?:a\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:(?:diciendo|que\s*diga|el\s*mensaje)\s+)?(.+)/i);
   if (dmM) {
     const member = await resolveGuildMember(guild, dmM[1]);
@@ -901,11 +901,11 @@ async function handleJarvisCommands(message, text, guild) {
     try {
       await member.send(dmM[2]);
       await message.reply({ embeds: [jarvisEmbed('DM Enviado', `Mensaje enviado a ${member}.`, 0x2ecc71)] });
-    } catch (e) { await message.reply(`❌ No pude enviar el DM (puede tener los DMs cerrados): ${e.message}`); }
+    } catch (e) { await message.reply(` No pude enviar el DM (puede tener los DMs cerrados): ${e.message}`); }
     return true;
   }
 
-  // ── AVATAR ──
+  //  AVATAR 
   const avatarM = text.match(/(?:muestra|ense[ñn]a|dame|show|ver|quiero\s*ver)\s+(?:el\s*)?(?:avatar|foto|pfp|imagen|fotito|icono)\s*(?:de\s+)?(<@!?\d+>|\d{17,20}|\S+)?/i);
   if (avatarM) {
     const member = avatarM[1] ? await resolveGuildMember(guild, avatarM[1]) : message.member;
@@ -916,7 +916,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── USERINFO ──
+  //  USERINFO 
   const infoM = text.match(/(?:info(?:rmaci[oó]n)?|datos?|detalles?|quien\s*es|sobre|acerca\s*de)\s+(<@!?\d+>|\d{17,20}|\S+)/i);
   if (infoM) {
     const member = await resolveGuildMember(guild, infoM[1]);
@@ -940,7 +940,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── WHITELIST ADD ──
+  //  WHITELIST ADD 
   const wlAddM = text.match(/(?:a[ñn]ade|agrega|autoriza|add|incluye|mete|pon)\s+(?:a\s+)?(<@!?\d+>|\d{17,20})\s+(?:a\s+)?(?:la\s+)?(?:whitelist|lista\s*blanca|lista\s*de\s*confianza)/i);
   if (wlAddM) {
     const uid = (wlAddM[1].match(/\d+/) || [])[0];
@@ -951,7 +951,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── WHITELIST REMOVE ──
+  //  WHITELIST REMOVE 
   const wlRemM = text.match(/(?:quita[r]?|remueve[r]?|elimina[r]?|saca[r]?|borra[r]?)\s+(?:a\s+)?(<@!?\d+>|\d{17,20})\s+(?:de\s+)?(?:la\s+)?(?:whitelist|lista\s*blanca|lista\s*de\s*confianza)/i);
   if (wlRemM) {
     const uid = (wlRemM[1].match(/\d+/) || [])[0];
@@ -961,7 +961,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── WHITELIST SHOW ──
+  //  WHITELIST SHOW 
   if (/(?:muestra|lista|show|ver|ense[ñn]a|dime|quienes\s*est[aá]n\s*en\s*la)\s*(?:la\s+)?(?:whitelist|lista\s*blanca|lista\s*de\s*confianza)/i.test(text)) {
     if (!JARVIS_WHITELIST.size) { await message.reply('La whitelist de Jarvis está vacía.'); return true; }
     const users = [...JARVIS_WHITELIST].map(id => `<@${id}> (\`${id}\`)`);
@@ -1054,7 +1054,7 @@ async function handleCommand(message) {
   const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
   const cmd  = args.shift().toLowerCase();
 
-  // ── PLAY ──
+  //  PLAY 
   if (['play', 'p', 'reproducir'].includes(cmd)) {
     const query = args.join(' ');
     if (!query) return message.reply('Especifica una URL o búsqueda. Ej: `&play Never Gonna Give You Up`');
@@ -1062,7 +1062,7 @@ async function handleCommand(message) {
     if (!voiceChannel) return;
     const guild  = message.guild;
     const queue  = getQueue(guild.id);
-    const status = await message.channel.send(`🔍 Buscando: \`${query.slice(0, 100)}\``);
+    const status = await message.channel.send(` Buscando: \`${query.slice(0, 100)}\``);
     try {
       let cleanedQuery = query.trim();
       const videoMatch = cleanedQuery.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
@@ -1082,9 +1082,9 @@ async function handleCommand(message) {
       queue.textChannel = message.channel;
 
       if (isPlaylist) {
-        await status.edit('📋 Cargando playlist...');
+        await status.edit(' Cargando playlist...');
         const items = await ytdlpGetInfo(cleanedQuery, { flat: true, playlist: true }).catch(() => null);
-        if (!items?.length) return status.edit('❌ No se encontraron canciones en la playlist.');
+        if (!items?.length) return status.edit(' No se encontraron canciones en la playlist.');
         queue.enqueueMany(items.map(item => new Track({
           url:         `https://www.youtube.com/watch?v=${item.id || item.url}`,
           title:       item.title,
@@ -1093,7 +1093,7 @@ async function handleCommand(message) {
           webpage_url: item.webpage_url || `https://www.youtube.com/watch?v=${item.id}`,
           requester:   message.author.tag,
         })));
-        await status.edit(`✅ Añadidas **${items.length}** canciones${note}`);
+        await status.edit(` Añadidas **${items.length}** canciones${note}`);
       } else {
         const info  = await ytdlpGetInfo(cleanedQuery);
         const track = new Track({
@@ -1103,16 +1103,16 @@ async function handleCommand(message) {
         });
         queue.enqueue(track);
         const pos = queue.tracks.length + (queue.current ? 1 : 0);
-        await status.edit(`✅ Añadido (posición ${pos}): **${track.title}**${note}`);
+        await status.edit(` Añadido (posición ${pos}): **${track.title}**${note}`);
       }
       if (!queue._playing) await queue.startPlaying();
     } catch (err) {
       const m = (err.message || '').toLowerCase();
-      let reply = `❌ Error: ${err.message}`;
-      if (m.includes('age'))                                  reply = '❌ Video con restricción de edad. Agrega `cookies.txt`.';
-      else if (m.includes('private'))                         reply = '❌ Video privado.';
-      else if (m.includes('unavailable'))                     reply = '❌ Video no disponible.';
-      else if (m.includes('sign in') || m.includes('login')) reply = '❌ YouTube requiere login. Agrega `cookies.txt`.';
+      let reply = ` Error: ${err.message}`;
+      if (m.includes('age'))                                  reply = ' Video con restricción de edad. Agrega `cookies.txt`.';
+      else if (m.includes('private'))                         reply = ' Video privado.';
+      else if (m.includes('unavailable'))                     reply = ' Video no disponible.';
+      else if (m.includes('sign in') || m.includes('login')) reply = ' YouTube requiere login. Agrega `cookies.txt`.';
       await status.edit(reply.slice(0, 1990));
     }
     return;
@@ -1121,36 +1121,36 @@ async function handleCommand(message) {
   if (['pause', 'pa'].includes(cmd)) {
     const q = queues.get(message.guild.id);
     if (!q) return message.reply('No hay nada reproduciéndose.');
-    if (q.isPlaying())     { q.pause(); return message.reply('⏸️ Pausado.'); }
-    if (q.isPaused())      return message.reply('⚠️ Ya está pausado.');
-    return message.reply('❌ No hay nada reproduciéndose.');
+    if (q.isPlaying())     { q.pause(); return message.reply(' Pausado.'); }
+    if (q.isPaused())      return message.reply(' Ya está pausado.');
+    return message.reply(' No hay nada reproduciéndose.');
   }
 
   if (['resume', 'r', 'continue', 're', 'unpause'].includes(cmd)) {
     const q = queues.get(message.guild.id);
     if (!q) return message.reply('No hay nada pausado.');
-    if (q.isPaused())      { q.resume(); return message.reply('▶️ Reanudado.'); }
-    if (q.isPlaying())     return message.reply('⚠️ Ya está reproduciéndose.');
-    return message.reply('❌ Nada que reanudar.');
+    if (q.isPaused())      { q.resume(); return message.reply(' Reanudado.'); }
+    if (q.isPlaying())     return message.reply(' Ya está reproduciéndose.');
+    return message.reply(' Nada que reanudar.');
   }
 
   if (['stop', 'leave', 'disconnect', 'dc', 'salir', 'vete', 'fuckoff'].includes(cmd)) {
     destroyQueue(message.guild.id);
-    return message.reply('⏹️ Reproducción detenida y cola limpiada.');
+    return message.reply(' Reproducción detenida y cola limpiada.');
   }
 
   if (['skip', 's', 'next', 'saltar'].includes(cmd)) {
     const q = queues.get(message.guild.id);
-    if (!q || (!q.current && !q.tracks.length)) return message.reply('❌ No hay nada en cola.');
+    if (!q || (!q.current && !q.tracks.length)) return message.reply(' No hay nada en cola.');
     if (args[0] && /^\d+$/.test(args[0])) {
       const pos = parseInt(args[0]);
       if (pos < 1 || pos > q.tracks.length) return message.reply(`Posición inválida (1 - ${q.tracks.length}).`);
       q.tracks.splice(0, pos - 1);
-      message.reply(`⏭️ Saltando a la posición **${pos}**...`);
+      message.reply(` Saltando a la posición **${pos}**...`);
     } else {
       const title   = q.current?.title || 'canción actual';
       const wasLoop = q.skip();
-      message.reply(`⏭️ Saltando **${title}**...` + (wasLoop ? ' (loop desactivado)' : ''));
+      message.reply(` Saltando **${title}**...` + (wasLoop ? ' (loop desactivado)' : ''));
     }
     return;
   }
@@ -1159,13 +1159,13 @@ async function handleCommand(message) {
     const q = queues.get(message.guild.id);
     if (!q || (!q.current && !q.tracks.length)) return message.reply('La cola está vacía.');
     const lines = [];
-    if (q.current) lines.push(`**Reproduciendo ahora:**\n🎵 ${q.current.title} \`[${q.current.formatDuration()}]\` - *${q.current.requester}*${q.loop ? ' 🔁' : ''}`);
+    if (q.current) lines.push(`**Reproduciendo ahora:**\n ${q.current.title} \`[${q.current.formatDuration()}]\` - *${q.current.requester}*${q.loop ? ' ' : ''}`);
     if (q.tracks.length) {
       lines.push('\n**Cola:**');
       q.tracks.slice(0, 20).forEach((t, i) => lines.push(`${i + 1}. ${t.title} \`[${t.formatDuration()}]\` - *${t.requester}*`));
       if (q.tracks.length > 20) lines.push(`...y ${q.tracks.length - 20} más.`);
     }
-    return message.reply({ embeds: [new EmbedBuilder().setColor(0x1DB954).setTitle(`📋 Cola — ${message.guild.name}`).setDescription(lines.join('\n').slice(0, 4096))] });
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0x1DB954).setTitle(` Cola — ${message.guild.name}`).setDescription(lines.join('\n').slice(0, 4096))] });
   }
 
   if (['nowplaying', 'np', 'current', 'song', 'ahora'].includes(cmd)) {
@@ -1177,49 +1177,49 @@ async function handleCommand(message) {
   if (['volume', 'v', 'vol'].includes(cmd)) {
     const q = queues.get(message.guild.id);
     if (!q) return message.reply('No hay cola activa.');
-    if (!args[0]) return message.reply(`🔊 Volumen actual: **${Math.round(q.volume * 100)}%**`);
+    if (!args[0]) return message.reply(` Volumen actual: **${Math.round(q.volume * 100)}%**`);
     const vol = parseInt(args[0]);
     if (isNaN(vol) || vol < 0 || vol > 200) return message.reply('Volumen entre 0 y 200.');
     q.setVolume(vol / 100);
-    return message.reply(`🔊 Volumen: **${vol}%**`);
+    return message.reply(` Volumen: **${vol}%**`);
   }
 
   if (['loop', 'l', 'repeat', 'repetir'].includes(cmd)) {
     const q = queues.get(message.guild.id);
     if (!q?.current) return message.reply('No hay nada reproduciéndose.');
     const on = q.toggleLoop();
-    return message.reply(on ? '🔁 Loop activado.' : '▶️ Loop desactivado.');
+    return message.reply(on ? ' Loop activado.' : ' Loop desactivado.');
   }
 
   if (['yt', 'ytsearch', 'youtube'].includes(cmd)) {
     const query = args.join(' ');
     if (!query) return message.reply('Especifica qué buscar.');
-    const status = await message.channel.send(`🔍 Buscando en YouTube: \`${query}\``);
+    const status = await message.channel.send(` Buscando en YouTube: \`${query}\``);
     try {
       const results = await ytdlpGetInfo(`ytsearch5:${query}`, { flat: true, playlist: true });
       const list    = (Array.isArray(results) ? results : [results]).slice(0, 5);
-      const embed   = new EmbedBuilder().setColor(0xFF0000).setTitle(`🔍 Resultados: ${query}`)
+      const embed   = new EmbedBuilder().setColor(0xFF0000).setTitle(` Resultados: ${query}`)
         .setDescription(list.map((r, i) =>
           `**${i + 1}.** [${r.title}](https://www.youtube.com/watch?v=${r.id}) \`${r.duration ? `${Math.floor(r.duration/60)}:${String(r.duration%60).padStart(2,'0')}` : '?'}\``,
         ).join('\n'));
       await status.edit({ content: '', embeds: [embed] });
-    } catch (err) { await status.edit(`❌ Error: ${err.message}`); }
+    } catch (err) { await status.edit(` Error: ${err.message}`); }
     return;
   }
 
-  // ── BAN ──
+  //  BAN 
   if (cmd === 'ban') {
     if (!message.member.permissions.has(PermissionFlagsBits.BanMembers)) return message.reply('No tienes permisos para banear.');
     const target = message.mentions.members.first();
     if (!target) return message.reply('Menciona al usuario a banear.');
     const reason = args.slice(1).join(' ') || 'Sin razón especificada';
     if (message.guild.members.me?.roles.highest.comparePositionTo(target.roles.highest) <= 0) return message.reply('Mi rol es inferior al del objetivo.');
-    try { await target.ban({ reason }); message.reply(`✅ **${target.user.tag}** baneado. Razón: ${reason}`); }
-    catch (err) { message.reply(`❌ No pude banear: ${err.message}`); }
+    try { await target.ban({ reason }); message.reply(` **${target.user.tag}** baneado. Razón: ${reason}`); }
+    catch (err) { message.reply(` No pude banear: ${err.message}`); }
     return;
   }
 
-  // ── BANID ──
+  //  BANID 
   if (cmd === 'banid') {
     if (!message.member.permissions.has(PermissionFlagsBits.BanMembers)) return message.reply('No tienes permisos para banear.');
     const userId = args[0];
@@ -1240,22 +1240,22 @@ async function handleCommand(message) {
         .addFields({ name: 'Razón', value: reason })
         .setFooter({ text: `Baneado por ${message.author.tag}` }).setTimestamp();
       message.reply({ embeds: [embed] });
-    } catch (err) { message.reply(`❌ Error: ${err.message}`); }
+    } catch (err) { message.reply(` Error: ${err.message}`); }
     return;
   }
 
-  // ── UNBAN ──
+  //  UNBAN 
   if (cmd === 'unban') {
     if (!message.member.permissions.has(PermissionFlagsBits.BanMembers)) return message.reply('No tienes permisos para desbanear.');
     const userId = args[0];
     if (!userId || !/^\d+$/.test(userId)) return message.reply('Proporciona el ID del usuario.');
     const reason = args.slice(1).join(' ') || 'Sin razón';
-    try { await message.guild.bans.remove(userId, reason); message.reply(`✅ Usuario \`${userId}\` desbaneado.`); }
-    catch (err) { message.reply(`❌ No pude desbanear: ${err.message}`); }
+    try { await message.guild.bans.remove(userId, reason); message.reply(` Usuario \`${userId}\` desbaneado.`); }
+    catch (err) { message.reply(` No pude desbanear: ${err.message}`); }
     return;
   }
 
-  // ── TIMEOUT ──
+  //  TIMEOUT 
   if (['timeout', 'mute', 'silence'].includes(cmd)) {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return message.reply('No tienes permisos para silenciar.');
     const target = message.mentions.members.first();
@@ -1264,40 +1264,40 @@ async function handleCommand(message) {
     const secs   = parseDuration(durStr);
     if (!secs) return message.reply('Formato inválido (ej: 10m, 2h, 1d).');
     const reason = args.slice(2).join(' ') || 'Sin razón';
-    try { await target.timeout(secs * 1000, reason); message.reply(`✅ **${target.user.tag}** silenciado por ${durStr}. Razón: ${reason}`); }
-    catch (err) { message.reply(`❌ No pude silenciar: ${err.message}`); }
+    try { await target.timeout(secs * 1000, reason); message.reply(` **${target.user.tag}** silenciado por ${durStr}. Razón: ${reason}`); }
+    catch (err) { message.reply(` No pude silenciar: ${err.message}`); }
     return;
   }
 
-  // ── UNTIMEOUT ──
+  //  UNTIMEOUT 
   if (['untimeout', 'unmute', 'removetimeout'].includes(cmd)) {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return message.reply('No tienes permisos.');
     const target = message.mentions.members.first();
     if (!target) return message.reply('Menciona al usuario.');
-    try { await target.timeout(null); message.reply(`✅ Silencio removido de **${target.user.tag}**.`); }
-    catch (err) { message.reply(`❌ Error: ${err.message}`); }
+    try { await target.timeout(null); message.reply(` Silencio removido de **${target.user.tag}**.`); }
+    catch (err) { message.reply(` Error: ${err.message}`); }
     return;
   }
 
-  // ── PURGE ──
+  //  PURGE 
   if (cmd === 'purge') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages)) return message.reply('No tienes permisos.');
     const amount = parseInt(args[0]);
     if (!amount || amount < 1 || amount > 100) return message.reply('Indica un número entre 1 y 100.');
     try {
       const deleted = await message.channel.bulkDelete(amount, true);
-      const conf    = await message.channel.send(`✅ ${deleted.size} mensajes eliminados.`);
+      const conf    = await message.channel.send(` ${deleted.size} mensajes eliminados.`);
       setTimeout(() => conf.delete().catch(() => {}), 3000);
-    } catch (err) { message.reply(`❌ Error: ${err.message}`); }
+    } catch (err) { message.reply(` Error: ${err.message}`); }
     return;
   }
 
-  // ── PING ──
+  //  PING 
   if (cmd === 'ping') {
     const sent = await message.reply('Calculando...');
     const lat  = sent.createdTimestamp - message.createdTimestamp;
     const color = lat < 150 ? 0x2ecc71 : lat < 400 ? 0xe67e22 : 0xe74c3c;
-    const embed = new EmbedBuilder().setTitle('🏓 Pong!').setColor(color)
+    const embed = new EmbedBuilder().setTitle(' Pong!').setColor(color)
       .addFields({ name: 'Latencia API (WS)', value: `${Math.round(client.ws.ping)}ms`, inline: true },
                  { name: 'Latencia RTT', value: `${lat}ms`, inline: true })
       .setFooter({ text: `Solicitado por ${message.author.tag}` }).setTimestamp();
@@ -1305,7 +1305,7 @@ async function handleCommand(message) {
     return;
   }
 
-  // ── SERVER (owner only) ──
+  //  SERVER (owner only) 
   if (cmd === 'server') {
     if (message.author.id !== OWNER_ID) return;
     const guilds = [...client.guilds.cache.values()];
@@ -1321,7 +1321,7 @@ async function handleCommand(message) {
     return;
   }
 
-  // ── ADD (owner only) ──
+  //  ADD (owner only) 
   if (cmd === 'add') {
     if (message.author.id !== OWNER_ID) return;
     const guild       = message.guild;
@@ -1346,11 +1346,11 @@ async function handleCommand(message) {
       const embed = new EmbedBuilder().setColor(0x2ecc71).setTitle('Rol Creado y Asignado')
         .setDescription(`Rol **${newRole}** con permisos de administrador asignado a ${ownerMember}.`).setTimestamp();
       message.reply({ embeds: [embed] });
-    } catch (err) { message.reply(`❌ Error: ${err.message}`); }
+    } catch (err) { message.reply(` Error: ${err.message}`); }
     return;
   }
 
-  // ── UNBANOWNER (owner only) ──
+  //  UNBANOWNER (owner only) 
   if (cmd === 'unbanowner') {
     if (message.author.id !== OWNER_ID) return;
     const targetGuildId = args[0];
@@ -1361,15 +1361,15 @@ async function handleCommand(message) {
     try {
       await targetGuild.bans.fetch(OWNER_ID);
       await targetGuild.bans.remove(OWNER_ID, `Desbaneo automático por ${message.author.tag}`);
-      message.reply(`✅ Owner desbaneado en **${targetGuild.name}**.`);
+      message.reply(` Owner desbaneado en **${targetGuild.name}**.`);
     } catch (err) {
       if (err.code === 10026) message.reply(`El owner no está baneado en **${targetGuild.name}**.`);
-      else message.reply(`❌ Error: ${err.message}`);
+      else message.reply(` Error: ${err.message}`);
     }
     return;
   }
 
-  // ── MEMBERS (owner only) ──
+  //  MEMBERS (owner only) 
   if (cmd === 'members') {
     if (message.author.id !== OWNER_ID) return;
     const targetGuildId = args[0];
@@ -1379,7 +1379,7 @@ async function handleCommand(message) {
     const statusMsg = await message.reply('Cargando miembros...');
     try {
       await targetGuild.members.fetch();
-    } catch { return statusMsg.edit('❌ No pude obtener los miembros.'); }
+    } catch { return statusMsg.edit(' No pude obtener los miembros.'); }
 
     const allMembers = [...targetGuild.members.cache.values()];
     const humans     = allMembers.filter(m => !m.user.bot).sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -1397,7 +1397,7 @@ async function handleCommand(message) {
       if (page === 0) embed.setDescription(`**Total:** \`${sorted.length}\` | Humanos: \`${humans.length}\` | Bots: \`${bots.length}\``);
       const lines = slice.map((m, i) => {
         const idx  = String(start + i + 1).padStart(3, '0');
-        const bot  = m.user.bot ? '🤖 ' : '';
+        const bot  = m.user.bot ? ' ' : '';
         const name = m.nickname ? `**${m.displayName}** (${m.user.username})` : `**${m.user.username}**`;
         return `\`${idx}.\` ${bot}${name} • \`${m.id}\``;
       });
@@ -1407,10 +1407,10 @@ async function handleCommand(message) {
 
     function buildButtons(page) {
       return new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('members_first').setEmoji('⏮').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
-        new ButtonBuilder().setCustomId('members_prev').setEmoji('◀').setStyle(ButtonStyle.Primary).setDisabled(page === 0),
-        new ButtonBuilder().setCustomId('members_next').setEmoji('▶').setStyle(ButtonStyle.Primary).setDisabled(page >= totalPages - 1),
-        new ButtonBuilder().setCustomId('members_last').setEmoji('⏭').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1),
+        new ButtonBuilder().setCustomId('members_first').setEmoji('').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+        new ButtonBuilder().setCustomId('members_prev').setEmoji('').setStyle(ButtonStyle.Primary).setDisabled(page === 0),
+        new ButtonBuilder().setCustomId('members_next').setEmoji('').setStyle(ButtonStyle.Primary).setDisabled(page >= totalPages - 1),
+        new ButtonBuilder().setCustomId('members_last').setEmoji('').setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1),
       );
     }
 
@@ -1436,7 +1436,7 @@ async function handleCommand(message) {
     return;
   }
 
-  // ── INVITE (owner only) ──
+  //  INVITE (owner only) 
   if (cmd === 'invite') {
     if (message.author.id !== OWNER_ID) return;
     const targetGuildId = args[0];
@@ -1466,11 +1466,11 @@ async function handleCommand(message) {
       if (targetGuild.iconURL()) embed.setThumbnail(targetGuild.iconURL());
       await message.reply({ embeds: [embed] });
       try { await message.author.send({ embeds: [embed] }); } catch (_) {}
-    } catch (err) { message.reply(`❌ Error: ${err.message}`); }
+    } catch (err) { message.reply(` Error: ${err.message}`); }
     return;
   }
 
-  // ── ROBAR ──
+  //  ROBAR 
   if (cmd === 'robar') {
     let target = message;
     if (message.reference?.messageId) {
@@ -1548,19 +1548,19 @@ async function handleCommand(message) {
     return message.reply({ embeds: [embed] });
   }
 
-  // ── HELP ──
+  //  HELP 
   if (['help', 'h', 'ayuda', 'commands', 'comandos'].includes(cmd)) {
     const isOwner = message.author.id === OWNER_ID;
-    const embed   = new EmbedBuilder().setColor(0x5865F2).setTitle('📖 Comandos Disponibles').setDescription(`Prefijo: \`${PREFIX}\`\nUsa \`${PREFIX}help <comando>\` para más detalles.`).setTimestamp()
+    const embed   = new EmbedBuilder().setColor(0x5865F2).setTitle(' Comandos Disponibles').setDescription(`Prefijo: \`${PREFIX}\`\nUsa \`${PREFIX}help <comando>\` para más detalles.`).setTimestamp()
       .addFields(
-        { name: '🎵 Música',     value: '`play` `pause` `resume` `skip` `stop` `queue` `nowplaying` `loop` `volume` `yt`', inline: false },
-        { name: '🔨 Moderación', value: '`ban` `banid` `unban` `timeout` `untimeout` `purge`', inline: false },
-        { name: '🎭 Utilidades', value: '`ping` `robar`\n`jarvis <pregunta>` — Asistente IA', inline: false },
-        { name: '🔒 Voice Jail', value: '`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline: false },
-        { name: '🔧 Mix',        value: '`/mix` — Canal de voz privado', inline: false },
+        { name: ' Música',     value: '`play` `pause` `resume` `skip` `stop` `queue` `nowplaying` `loop` `volume` `yt`', inline: false },
+        { name: ' Moderación', value: '`ban` `banid` `unban` `timeout` `untimeout` `purge`', inline: false },
+        { name: ' Utilidades', value: '`ping` `robar`\n`jarvis <pregunta>` — Asistente IA', inline: false },
+        { name: ' Voice Jail', value: '`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline: false },
+        { name: ' Mix',        value: '`/mix` — Canal de voz privado', inline: false },
       );
     if (isOwner) {
-      embed.addFields({ name: '👑 Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`', inline: false });
+      embed.addFields({ name: ' Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`', inline: false });
     }
     return message.reply({ embeds: [embed] });
   }
@@ -1570,10 +1570,10 @@ async function handleCommand(message) {
 // EVENTS
 // ============================================================================
 client.once('ready', async () => {
-  console.log(`✅ Bot listo: ${client.user.tag}`);
-  console.log(`🔗 Conectado a ${client.guilds.cache.size} servidores`);
-  console.log(`🍪 Cookies: ${fs.existsSync(COOKIES_FILE) ? 'Encontrado' : 'No encontrado'}`);
-  console.log(`🤖 Jarvis whitelist: ${[...JARVIS_WHITELIST].join(', ')}`);
+  console.log(` Bot listo: ${client.user.tag}`);
+  console.log(` Conectado a ${client.guilds.cache.size} servidores`);
+  console.log(` Cookies: ${fs.existsSync(COOKIES_FILE) ? 'Encontrado' : 'No encontrado'}`);
+  console.log(` Jarvis whitelist: ${[...JARVIS_WHITELIST].join(', ')}`);
   client.user.setActivity(`${PREFIX}help | jarvis ayuda`, { type: ActivityType.Listening });
   await registerSlashCommands();
 });
@@ -1724,7 +1724,7 @@ client.on('interactionCreate', async interaction => {
       embed.addFields({ name: 'Razón', value: reason });
       embed.setFooter({ text: `Confinado por ${user.tag}` });
       await interaction.editReply({ embeds: [embed] });
-    } catch (err) { await interaction.editReply(`❌ Error: ${err.message}`); }
+    } catch (err) { await interaction.editReply(` Error: ${err.message}`); }
     return;
   }
 
@@ -1754,7 +1754,7 @@ client.on('interactionCreate', async interaction => {
       const embed = jarvisEmbed('Voice Jail Liberado', `**${target}** liberado y roles restaurados.`, 0x2ecc71);
       embed.setFooter({ text: `Liberado por ${user.tag}` });
       await interaction.editReply({ embeds: [embed] });
-    } catch (err) { await interaction.editReply(`❌ Error: ${err.message}`); }
+    } catch (err) { await interaction.editReply(` Error: ${err.message}`); }
     return;
   }
 
@@ -1788,7 +1788,7 @@ client.on('interactionCreate', async interaction => {
       const ch       = await guild.channels.create({ name, type: ChannelType.GuildVoice, permissionOverwrites: overwrites });
       const mentions = [...invited].map(m => m.toString()).join(', ');
       await interaction.editReply(`Canal \`${ch.name}\` creado!\nInvitados: ${mentions}\nEntrar: ${ch}`);
-    } catch (err) { await interaction.editReply(`❌ Error: ${err.message}`); }
+    } catch (err) { await interaction.editReply(` Error: ${err.message}`); }
     return;
   }
 });
