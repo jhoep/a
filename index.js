@@ -130,7 +130,8 @@ async function getAudioUrl(url, retries = 3) {
 // FFMPEG
 // ============================================================================
 function createFFmpegResource(url, volume = 1.0) {
-  const proc = spawn(ffmpegPath, [
+  const ffmpegCmd = ffmpegPath || 'ffmpeg';
+  const proc = spawn(ffmpegCmd, [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-reconnect_on_network_error', '1', '-i', url,
     '-analyzeduration', '0', '-loglevel', '0', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1',
