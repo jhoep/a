@@ -1,8 +1,14 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "python311", "python311Packages.pip", "ffmpeg"]
+nixPkgs = [
+  "nodejs_20",
+  "python311",
+  "python311Packages.pip",
+  "ffmpeg",
+  "yt-dlp"
+]
 
 [phases.install]
-cmds = ["npm install --omit=dev", "python3.11 -m pip install -U yt-dlp --break-system-packages"]
+cmds = ["npm install --omit=dev"]
 
 [start]
 cmd = "node --dns-result-order=ipv4first index.js"
