@@ -1,4 +1,4 @@
-app = "discord-bot"
+app = "MB"
 primary_region = "mia"
 
 [build]
