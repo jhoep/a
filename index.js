@@ -1572,7 +1572,7 @@ async function handleCommand(message) {
 // ============================================================================
 // EVENTS
 // ============================================================================
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(` Bot listo: ${client.user.tag}`);
   console.log(` Conectado a ${client.guilds.cache.size} servidores`);
   console.log(` Cookies: ${fs.existsSync(COOKIES_FILE) ? 'Encontrado' : 'No encontrado'}`);
