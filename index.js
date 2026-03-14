@@ -19,7 +19,7 @@ const fetch = require('node-fetch');
 const DISCORD_TOKEN    = process.env.DISCORD_TOKEN;
 const GROQ_API_KEY     = process.env.GROQ_API_KEY;
 const OWNER_ID         = process.env.OWNER_ID || '596764844791824417';
-const PREFIX           = '>>';
+const PREFIX           = '&';
 const CANAL_AVISOS_ID  = '1382547512543543386';
 const MEMBERS_PER_PAGE = 20;
 
@@ -38,6 +38,13 @@ const MODLOG_FILE = path.join(DATA_DIR, 'modlog_channels.json');
 const WARNS_FILE  = path.join(DATA_DIR, 'warnings.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// ============================================================================
+// STICKY VOICE CHANNEL — el bot se queda fijo en un canal de voz
+// stickyVC[guildId] = { channelId, enabled }
+// ============================================================================
+const STICKY_FILE = path.join(DATA_DIR, 'sticky_vc.json');
+let stickyVC      = loadJSON(STICKY_FILE, {});
 
 function loadJSON(file, def = {}) {
   try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : def; }
@@ -641,14 +648,90 @@ const JARVIS_CONV = {
 };
 
 // ============================================================================
+// SMART INTENT PARSER
+// Normaliza el texto de entrada para que los patrones funcionen con lenguaje
+// natural variado: "cambiale el nombre a @user a tonta" -> detecta usuario y nick
+// ============================================================================
+
+// Extrae el primer mention o ID de usuario del texto
+function extractMentionOrId(text) {
+  const m = text.match(/<@!?(\d+)>/) || text.match(/\b(\d{17,20})\b/);
+  return m ? m[0] : null;
+}
+
+// Extrae todos los mentions del texto
+function extractAllMentions(text) {
+  return [...text.matchAll(/<@!?(\d+)>/g)].map(m => m[0]);
+}
+
+// Normaliza variantes comunes de palabras clave para facilitar el match
+function normalizeText(t) {
+  return t
+    .replace(/cámbia|cambiá/gi, 'cambia')
+    .replace(/ponél[eo]|ponle|dale|dál[eo]/gi, 'ponle')
+    .replace(/quíta|quitá/gi, 'quita')
+    .replace(/sáca|sacá/gi, 'saca')
+    .replace(/échal[oa]|echal[oa]/gi, 'echa')
+    .replace(/bótal[oa]|botal[oa]/gi, 'bota')
+    .replace(/bánea|baneá/gi, 'banea')
+    .replace(/kíck|kik/gi, 'kick')
+    .replace(/expúlsa|expulzá/gi, 'expulsa')
+    .replace(/sílencia|silenciá/gi, 'silencia')
+    .replace(/múte|mutéa/gi, 'mutea')
+    .replace(/adviérte|advertí/gi, 'advierte')
+    .replace(/désbane|desbané/gi, 'desbanea')
+    .replace(/désmu[te]+|desmuté/gi, 'desmutea')
+    .replace(/apód[oa]|apod[oa]/gi, 'apodo')
+    .replace(/nícke?|níck/gi, 'nick')
+    .replace(/\bpon\s+el\s+nick\b/gi, 'cambia el nick')
+    .replace(/\bcambi[ao]\s+(?:el\s+)?(?:nombre|nick|apodo)\s+de\b/gi, 'cambia el nick de')
+    .replace(/\bcambi[ao]le\s+(?:el\s+)?(?:nombre|nick|apodo)\b/gi, 'cambia el nick de')
+    .replace(/\bponle\s+(?:de\s+)?(?:nombre|nick|apodo)\b/gi, 'cambia el nick de')
+    .replace(/\bponle\s+(?:el\s+)?(?:nombre|nick|apodo)\b/gi, 'cambia el nick de')
+    .replace(/\bsus?\s+(?:nombre|nick|apodo)\s+(?:va\s+a\s+ser|sera|es)\b/gi, 'cambia el nick de')
+    .replace(/\brenombra\s+(?:a\s+)?/gi, 'cambia el nick de ')
+    .replace(/\bque\s+se\s+llame\b/gi, 'cambia el nick a')
+    .trim();
+}
+
+// Parser inteligente para nick: soporta todos estos formatos:
+//   jarvis cambiale el nombre a @user a tonta
+//   jarvis cambia el nick de @user a tonta
+//   jarvis ponle el apodo tonta a @user
+//   jarvis cambia el nick de @user por tonta absoluta
+//   jarvis renombra @user a tonta
+function parseNickCommand(text) {
+  // Formato: "... @user ... a|por|como <nick>"
+  // Primero buscamos el mention
+  const mentionMatch = text.match(/<@!?(\d+)>/);
+  if (mentionMatch) {
+    const mention = mentionMatch[0];
+    // Todo lo que venga despues del mention, buscar "a|por|como <nick>"
+    const after = text.slice(text.indexOf(mention) + mention.length).trim();
+    const nickMatch = after.match(/^(?:a|por|como|se\s*llame|que\s*se\s*llame)\s+(.+)/i);
+    if (nickMatch) return { userStr: mention, nick: nickMatch[1].trim() };
+    // Quizas el nick esta antes del mention: "ponle tonta a @user"
+    const before = text.slice(0, text.indexOf(mention)).trim();
+    const beforeNick = before.match(/(?:nick|nombre|apodo|nickname)?\s*(?:de\s+)?(?:a\s+)?(.+?)(?:\s+a\s*)?$/i);
+    if (beforeNick && beforeNick[1] && !/<@/.test(beforeNick[1])) {
+      const n = beforeNick[1].replace(/^(?:el|la|un|una|de|a)\s+/i, '').trim();
+      if (n.length > 0) return { userStr: mention, nick: n };
+    }
+    if (after.length > 0) return { userStr: mention, nick: after };
+  }
+  return null;
+}
+
+// ============================================================================
 // JARVIS COMMAND HANDLER (prefix)
 // ============================================================================
 async function handleJarvisCommands(message, text, guild) {
   const me     = guild.members.me;
   const author = message.author;
+  const norm   = normalizeText(text);
 
   // MEMBERS COUNT
-  if (/cuantos\s*miembros|cuanta\s*gente|cuantos\s*(somos|hay|estan)|total\s*de\s*miembros|cuantos\s*usuarios|poblacion/i.test(text)) {
+  if (/cuantos\s*miembros|cuanta\s*gente|cuantos\s*(somos|hay|estan)|total\s*de\s*miembros|cuantos\s*usuarios|poblacion/i.test(norm)) {
     await guild.members.fetch().catch(() => {});
     const total  = guild.memberCount;
     const humans = guild.members.cache.filter(m => !m.user.bot).size;
@@ -661,7 +744,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // SERVER INFO
-  if (/info(rmacion)?\s*(del\s*)?server|datos?\s*(del\s*)?server|server\s*info|nombre\s*del\s*servidor/i.test(text)) {
+  if (/info(rmacion)?\s*(del\s*)?server|datos?\s*(del\s*)?server|server\s*info|nombre\s*del\s*servidor/i.test(norm)) {
     const g     = guild;
     const embed = simpleEmbed(`Informacion de ${g.name}`, '\u200b');
     if (g.iconURL()) embed.setThumbnail(g.iconURL());
@@ -680,7 +763,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // HELP
-  if (/ayuda|help|que\s*(puedes|sabes)\s*hacer|comandos|capacidades|funciones/i.test(text)) {
+  if (/ayuda|help|que\s*(puedes|sabes)\s*hacer|comandos|capacidades|funciones/i.test(norm)) {
     const embed = simpleEmbed('Mis Capacidades', 'Mira, te cuento todo lo que puedo hacer:', 0xf1c40f);
     embed.addFields(
       { name: 'Moderacion',    value: '`jarvis banea a @user [razon]`\n`jarvis expulsa a @user`\n`jarvis silencia a @user 10m`\n`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis advierte a @user [razon]`', inline: false },
@@ -698,8 +781,8 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // BAN
-  const banM = text.match(/(?:banea?(?:le)?|prohibe|veta|ban\s+al?)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|razon|ya\s*que)\s+(.+))?/i);
-  if (banM) {
+  const banM = norm.match(/(?:banea?(?:le)?|prohibe|veta|ban\s+(?:a[l]?\s+)?|expulsa\s+permanentemente\s+(?:a[l]?\s+)?)(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|razon|ya\s*que)\s+(.+))?/i);
+  if (banM && !/kick|expulsa(?!.*permanen)|timeout|silenci|mute|warn|adviert/.test(norm)) {
     const member = await resolveGuildMember(guild, banM[1]);
     const reason = banM[2] || 'Orden de Jarvis';
     if (!member) { await message.reply(notFound(banM[1])); return true; }
@@ -720,8 +803,8 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // KICK
-  const kickM = text.match(/(?:kickea?|kick|expulsa[r]?|sac[ao](?:\s*a)?|echa[r]?(?:\s*a)?|bota[r]?(?:\s*a)?|que\s*se\s*vaya)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque)\s+(.+))?/i);
-  if (kickM) {
+  const kickM = norm.match(/(?:kickea?|kick|expulsa[r]?|sac[ao](?:\s*a)?|echa[r]?(?:\s*a)?|bota[r]?(?:\s*a)?|que\s*se\s*vaya)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque)\s+(.+))?/i);
+  if (kickM && !/permanen/.test(norm)) {
     const member = await resolveGuildMember(guild, kickM[1]);
     const reason = kickM[2] || 'Orden de Jarvis';
     if (!member) { await message.reply(notFound(kickM[1])); return true; }
@@ -740,7 +823,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // TIMEOUT
-  const toM = text.match(/(?:silencia[r]?|timeout|mutea?(?:le)?|calla[r]?(?:lo)?|ponle\s*(?:mute|timeout|silencio)|que\s*(?:no\s*hable|se\s*calle))\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:por\s+|durante\s+)?(\S+)(?:\s+(?:por|porque|razon)\s+(.+))?/i);
+  const toM = norm.match(/(?:silencia[r]?|timeout|mutea?(?:le)?|calla[r]?(?:lo)?|ponle\s*(?:mute|timeout|silencio)|que\s*(?:no\s*hable|se\s*calle)|callate\s+(?:a\s+)?|pon\s+en\s+timeout)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:por\s+|durante\s+)?(\S+)(?:\s+(?:por|porque|razon)\s+(.+))?/i);
   if (toM) {
     const member = await resolveGuildMember(guild, toM[1]);
     const secs   = parseNaturalDuration(toM[2]);
@@ -766,7 +849,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // UNTIMEOUT
-  const utoM = text.match(/(?:desmutea[r]?|unmute|untimeout|dessilencia[r]?|quita\s*el\s*(?:mute|timeout|silencio)|permite\s*hablar\s*a)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)/i);
+  const utoM = norm.match(/(?:desmutea[r]?|unmute|untimeout|dessilencia[r]?|quita\s*el\s*(?:mute|timeout|silencio)|permite\s*hablar\s*(?:a\s+)?|ya\s*puede\s*hablar)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)/i);
   if (utoM) {
     const member = await resolveGuildMember(guild, utoM[1]);
     if (!member) { await message.reply(notFound(utoM[1])); return true; }
@@ -779,7 +862,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // UNBAN
-  const ubanM = text.match(/(?:desbanea[r]?|unban|quita\s*el\s*ban|revoca\s*el\s*ban)\s+(?:a[l]?\s+)?(\d{17,20})/i);
+  const ubanM = norm.match(/(?:desbanea[r]?|unban|quita\s*(?:el\s*)?ban|revoca\s*(?:el\s*)?ban|anula\s*(?:el\s*)?ban|perdona\s*(?:a\s+)?)\s*(?:a[l]?\s+)?(\d{17,20})/i);
   if (ubanM) {
     try {
       await guild.bans.remove(ubanM[1], `[Jarvis] por ${author.tag}`);
@@ -792,7 +875,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // WARN
-  const warnM = text.match(/(?:advierte|warn|amonesta|sanciona)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|razon)?\s+(.+))?/i);
+  const warnM = norm.match(/(?:advierte|warn|amonesta|sanciona|ponle\s*(?:una\s*)?advertencia|dale\s*(?:una\s*)?advertencia|reporta)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|razon|ya\s*que)?\s+(.+))?/i);
   if (warnM) {
     const member = await resolveGuildMember(guild, warnM[1]);
     const reason = warnM[2] || 'Sin razon especificada';
@@ -808,7 +891,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // PURGE
-  const purgeM = text.match(/(?:borra[r]?|elimina[r]?|purga[r]?|limpia[r]?)\s+(\d+)\s*(?:mensajes?|msgs?)?/i);
+  const purgeM = norm.match(/(?:borra[r]?|elimina[r]?|purga[r]?|limpia[r]?|borra\s*los?|elimina\s*los?)\s+(\d+)\s*(?:mensajes?|msgs?|ultimos?)?/i);
   if (purgeM) {
     const amount = Math.min(parseInt(purgeM[1]), 500);
     try {
@@ -821,8 +904,8 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // SLOWMODE ON
-  const slowM = text.match(/(?:pon|activa|configura|set|habilita)\s*(?:el\s*)?(?:slowmode|modo\s*lento|cooldown)[^\d]*(\d+)\s*([smh])?/i);
-  if (slowM && !/quita|desactiva|remueve|apaga|saca|para|off/i.test(text)) {
+  const slowM = norm.match(/(?:pon|activa|configura|set|habilita|sube)\s*(?:el\s*)?(?:slowmode|modo\s*lento|cooldown|slow)[^\d]*(\d+)\s*([smh])?/i);
+  if (slowM && !/quita|desactiva|remueve|apaga|saca|para|off|baja/i.test(norm)) {
     const mult  = { s: 1, m: 60, h: 3600 }[(slowM[2] || 's').toLowerCase()] || 1;
     const total = Math.min(parseInt(slowM[1]) * mult, 21600);
     try {
@@ -833,7 +916,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // SLOWMODE OFF
-  if (/(?:quita|desactiva|remueve|apaga|saca|para)\s*(?:el\s*)?(?:slowmode|modo\s*lento|cooldown)|slowmode\s*off/i.test(text)) {
+  if (/(?:quita|desactiva|remueve|apaga|saca|para)\s*(?:el\s*)?(?:slowmode|modo\s*lento|cooldown)|slowmode\s*off/i.test(norm)) {
     try {
       await message.channel.edit({ rateLimitPerUser: 0 });
       await message.reply({ embeds: [simpleEmbed('Slowmode Desactivado', 'Slowmode removido de este canal.', 0x2ecc71)] });
@@ -842,7 +925,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // LOCK
-  if (/(?:^|\s)(?:bloquea[r]?|lock|cierra|lockea[r]?|tranca[r]?)\b/i.test(text) && !/desbloquea|unlock/i.test(text)) {
+  if (/(?:^|\s)(?:bloquea[r]?|lock|cierra|lockea[r]?|tranca[r]?|pon\s*en\s*modo\s*solo\s*lectura)\b/i.test(norm) && !/desbloquea|unlock|abre/i.test(norm)) {
     try {
       await message.channel.permissionOverwrites.edit(guild.id, { SendMessages: false }, { reason: `[Jarvis] por ${author.tag}` });
       await message.reply({ embeds: [simpleEmbed('Canal Bloqueado', `${message.channel} ha sido bloqueado.`, 0xe74c3c)] });
@@ -851,7 +934,7 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // UNLOCK
-  if (/(?:desbloquea[r]?|unlock|abre[r]?|unlockea[r]?|destranca[r]?)/i.test(text)) {
+  if (/(?:desbloquea[r]?|unlock|abre[r]?|unlockea[r]?|destranca[r]?|quita\s*(?:el\s*)?bloqueo)/i.test(norm)) {
     try {
       await message.channel.permissionOverwrites.edit(guild.id, { SendMessages: null }, { reason: `[Jarvis] por ${author.tag}` });
       await message.reply({ embeds: [simpleEmbed('Canal Desbloqueado', `${message.channel} ha sido desbloqueado.`, 0x2ecc71)] });
@@ -860,17 +943,17 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // ROLES LIST
-  if (/(?:muestra|lista|ver|cuales\s+son|todos\s*los)\s+(?:los\s+)?roles?|(?:los\s+)?roles?\s+(?:del?\s*server(idor)?)?$/i.test(text)) {
+  if (/(?:muestra|lista|ver|cuales\s+son|todos\s*los|dame\s*los?)\s+(?:los\s+)?roles?|(?:los\s+)?roles?\s+(?:del?\s*server(idor)?)?$|que\s*roles?\s*(hay|existen|tiene)/i.test(norm)) {
     const roles = [...guild.roles.cache.values()].filter(r => r.name !== '@everyone').sort((a, b) => b.position - a.position);
     const lines = roles.slice(0, 30).map(r => `${r} — \`${r.id}\``);
     await message.reply({ embeds: [simpleEmbed(`Roles del servidor (${roles.length})`, lines.join('\n') || 'No hay roles.')] });
     return true;
   }
 
-  // ROLE REMOVE
-  const roleRemM = text.match(/(?:quita[r]?|remueve[r]?|elimina[r]?|saca[r]?)\s+(?:el\s+)?rol\s+(.+?)(?:\s+(?:a[l]?\s+|de\s+)(<@!?\d+>|\d{17,20}|\S+))?$/i);
-  if (roleRemM) {
-    const roleName = roleRemM[1].replace(/\b(?:el|la|los|las|de|del|a|al)\b/gi, '').trim();
+  // ROLE REMOVE — soporta: "quita el rol X a @user", "quita el rol X de @user", "quita X a @user"
+  const roleRemM = norm.match(/(?:quita[r]?|remueve[r]?|elimina[r]?|saca[r]?|borra[r]?)\s+(?:el\s+)?(?:rol\s+)?(.+?)(?:\s+(?:a[l]?\s+|de\s+)(<@!?\d+>|\d{17,20}|\S+))?$/i);
+  if (roleRemM && /rol|role/i.test(norm)) {
+    const roleName = roleRemM[1].replace(/\b(?:el|la|los|las|de|del|a|al|rol|role)\b/gi, '').trim();
     const role     = resolveRole(guild, roleName);
     const member   = roleRemM[2] ? await resolveGuildMember(guild, roleRemM[2]) : message.member;
     if (!role)   { await message.reply(`No encontre el rol \`${roleName}\`.`); return true; }
@@ -883,12 +966,13 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ROLE ADD
-  const roleAddM = text.match(/(?:dame?|anade|asigna[r]?|ponle|dale|otorga[r]?)\s+(?:el\s+)?rol\s+(.+?)(?:\s+a[l]?\s+(<@!?\d+>|\d{17,20}|\S+))?$/i);
-  if (roleAddM) {
-    const role   = resolveRole(guild, roleAddM[1].trim());
-    const member = roleAddM[2] ? await resolveGuildMember(guild, roleAddM[2]) : message.member;
-    if (!role)   { await message.reply(`No encontre el rol \`${roleAddM[1].trim()}\`.`); return true; }
+  // ROLE ADD — soporta: "dame el rol X", "dale el rol X a @user", "asigna el rol X a @user"
+  const roleAddM = norm.match(/(?:dame?|anade|asigna[r]?|ponle|dale|otorga[r]?|da[r]?)\s+(?:el\s+)?(?:rol\s+)?(.+?)(?:\s+a[l]?\s+(<@!?\d+>|\d{17,20}|\S+))?$/i);
+  if (roleAddM && /rol|role/i.test(norm)) {
+    const roleName = roleAddM[1].replace(/\b(?:el|la|los|las|rol|role)\b/gi, '').trim();
+    const role     = resolveRole(guild, roleName);
+    const member   = roleAddM[2] ? await resolveGuildMember(guild, roleAddM[2]) : message.member;
+    if (!role)   { await message.reply(`No encontre el rol \`${roleName}\`.`); return true; }
     if (!member) { await message.reply('No encontre al usuario.'); return true; }
     try {
       await member.roles.add(role, `[Jarvis] Asignado por ${author.tag}`);
@@ -897,17 +981,25 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // NICK
-  const nickM = text.match(/(?:cambia[r]?|ponle|set|deja[r]?)\s*(?:el\s*)?(?:nick|nombre|apodo|nickname)\s*(?:de\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:a\s+|por\s+|como\s+)?(.+)/i);
-  if (nickM) {
-    const member = await resolveGuildMember(guild, nickM[1]);
-    const nick   = nickM[2].trim().slice(0, 32);
-    if (!member) { await message.reply('No encontre al usuario.'); return true; }
-    try {
-      await member.setNickname(nick, `[Jarvis] por ${author.tag}`);
-      await message.reply({ embeds: [simpleEmbed('Apodo Cambiado', `El apodo de ${member} ahora es **${nick}**.`)] });
-    } catch (e) { await message.reply(`Error: ${e.message}`); }
-    return true;
+  // NICK — parser inteligente, soporta todos los formatos naturales:
+  //   "cambiale el nombre a @user a tonta"
+  //   "cambia el nick de @user a tonta"
+  //   "ponle el apodo tonta a @user"
+  //   "cambia el nombre de @user por tonta absoluta"
+  //   "renombra @user a tonta"
+  //   "que se llame @user tonta"
+  if (/nick|nombre|apodo|nickname|renombra|llame/i.test(norm)) {
+    const parsed = parseNickCommand(norm);
+    if (parsed) {
+      const member = await resolveGuildMember(guild, parsed.userStr);
+      const nick   = parsed.nick.slice(0, 32);
+      if (!member) { await message.reply('No encontre al usuario.'); return true; }
+      try {
+        await member.setNickname(nick, `[Jarvis] por ${author.tag}`);
+        await message.reply({ embeds: [simpleEmbed('Apodo Cambiado', `El apodo de ${member} ahora es **${nick}**.`)] });
+      } catch (e) { await message.reply(`Error: ${e.message}`); }
+      return true;
+    }
   }
 
   // SAY
@@ -1470,6 +1562,36 @@ client.on('messageCreate', async message => {
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const guild     = oldState.guild || newState.guild;
+  const botId     = client.user?.id;
+
+  // ── STICKY VC: si el bot fue expulsado del canal fijo, volver ──
+  if (oldState.id === botId && !newState.channelId) {
+    const sticky = stickyVC[guild.id];
+    if (sticky?.enabled) {
+      const ch = guild.channels.cache.get(sticky.channelId);
+      if (ch) {
+        // Esperar un momento y volver
+        setTimeout(async () => {
+          try {
+            const { joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
+            const conn = joinVoiceChannel({
+              channelId:      ch.id,
+              guildId:        guild.id,
+              adapterCreator: guild.voiceAdapterCreator,
+              selfDeaf:       true,
+              selfMute:       true,
+            });
+            await entersState(conn, VoiceConnectionStatus.Ready, 15_000);
+            console.log(`[StickyVC] Reconectado a ${ch.name} en ${guild.name}`);
+          } catch (e) {
+            console.error(`[StickyVC] No pude reconectarme: ${e.message}`);
+          }
+        }, 2000);
+      }
+    }
+  }
+
+  // ── VOICE JAIL: impedir escape ──
   const jailEntry = getJailEntry(guild.id, newState.id);
   if (jailEntry && !jailEntry.isExpired() && jailEntry.isActive) {
     if (newState.channelId && newState.channelId !== jailEntry.channelId) {
@@ -1606,6 +1728,16 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('voicejailclear').setDescription('Liberar a todos los usuarios del voice jail'),
+
+  // --- STICKY VC ---
+  new SlashCommandBuilder()
+    .setName('quedar_canal_vc')
+    .setDescription('El bot se queda fijo en un canal de voz y vuelve si lo sacan (solo owner)')
+    .addChannelOption(o => o.setName('canal').setDescription('Canal de voz donde quedarse').setRequired(true)),
+
+  new SlashCommandBuilder()
+    .setName('desactivar_canal_vc')
+    .setDescription('Desactiva el canal fijo de voz y desconecta al bot (solo owner)'),
 
   // --- MIX ---
   new SlashCommandBuilder()
@@ -1923,6 +2055,76 @@ client.on('interactionCreate', async interaction => {
       await interaction.editReply(`Canal \`${ch.name}\` creado!\nInvitados: ${mentions}\nEntrar: ${ch}`);
     } catch (err) { await interaction.editReply(`Error: ${err.message}`); }
     return;
+  }
+
+  // ── QUEDAR_CANAL_VC ──
+  if (commandName === 'quedar_canal_vc') {
+    if (user.id !== OWNER_ID)
+      return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', ephemeral: true });
+
+    const ch = interaction.options.getChannel('canal');
+    if (!ch?.isVoiceBased())
+      return interaction.reply({ content: 'El canal debe ser de voz.', ephemeral: true });
+
+    await interaction.deferReply({ ephemeral: true });
+
+    // Verificar que @discordjs/voice este disponible
+    let joinVoiceChannel, entersState, VoiceConnectionStatus;
+    try {
+      ({ joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice'));
+    } catch {
+      return interaction.editReply('Falta el paquete `@discordjs/voice`. Instalalo con `npm i @discordjs/voice`.');
+    }
+
+    try {
+      const conn = joinVoiceChannel({
+        channelId:      ch.id,
+        guildId:        guild.id,
+        adapterCreator: guild.voiceAdapterCreator,
+        selfDeaf:       true,
+        selfMute:       true,
+      });
+      await entersState(conn, VoiceConnectionStatus.Ready, 15_000);
+
+      stickyVC[guild.id] = { channelId: ch.id, enabled: true };
+      saveJSON(STICKY_FILE, stickyVC);
+
+      await interaction.editReply(
+        `Listo. El bot se quedo en **${ch.name}** y volvera automaticamente si lo sacan.\nUsa \`/desactivar_canal_vc\` para desconectarlo.`
+      );
+    } catch (err) {
+      await interaction.editReply(`No pude conectarme: ${err.message}`);
+    }
+    return;
+  }
+
+  // ── DESACTIVAR_CANAL_VC ──
+  if (commandName === 'desactivar_canal_vc') {
+    if (user.id !== OWNER_ID)
+      return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', ephemeral: true });
+
+    const sticky = stickyVC[guild.id];
+    if (!sticky?.enabled)
+      return interaction.reply({ content: 'No hay ningun canal fijo de voz activo en este servidor.', ephemeral: true });
+
+    // Desactivar antes de intentar desconectar para que voiceStateUpdate no reconecte
+    stickyVC[guild.id] = { channelId: null, enabled: false };
+    saveJSON(STICKY_FILE, stickyVC);
+
+    // Intentar desconectar usando @discordjs/voice si esta disponible
+    try {
+      const { getVoiceConnection } = require('@discordjs/voice');
+      const conn = getVoiceConnection(guild.id);
+      if (conn) conn.destroy();
+    } catch {
+      // Si no esta disponible, mover al bot fuera del canal via Discord API
+      try {
+        const botMember = guild.members.me;
+        if (botMember?.voice?.channel) await botMember.voice.disconnect();
+      } catch (_) {}
+    }
+
+    return interaction.reply({ content: 'Canal fijo desactivado. El bot se ha desconectado y no volvera automaticamente.', ephemeral: true });
   }
 });
 
