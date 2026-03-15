@@ -19,7 +19,7 @@ const fetch = require('node-fetch');
 const DISCORD_TOKEN    = process.env.DISCORD_TOKEN;
 const GROQ_API_KEY     = process.env.GROQ_API_KEY;
 const OWNER_ID         = process.env.OWNER_ID || '596764844791824417';
-const PREFIX           = '&';
+const PREFIX           = '>>';
 const CANAL_AVISOS_ID  = '1382547512543543386';
 const MEMBERS_PER_PAGE = 20;
 
