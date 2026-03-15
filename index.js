@@ -2155,6 +2155,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     try {
+      console.log(`[VC] Intentando conectar a canal ${ch.id} en guild ${guild.id}`);
       const conn = joinVoiceChannel({
         channelId:      ch.id,
         guildId:        guild.id,
@@ -2163,7 +2164,14 @@ client.on('interactionCreate', async interaction => {
         selfMute:       false,
       });
 
+      conn.on('stateChange', (oldState, newState) => {
+        console.log(`[VC] Estado: ${oldState.status} -> ${newState.status}`);
+      });
+      conn.on('error', e => console.error(`[VC] Error de conexion: ${e.message}`));
+
+      console.log(`[VC] Esperando estado Ready...`);
       await entersState(conn, VoiceConnectionStatus.Ready, 20_000);
+      console.log(`[VC] Conectado exitosamente!`);
 
       // Silence player para mantener la conexion viva
       const { Readable } = require('stream');
