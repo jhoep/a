@@ -2154,6 +2154,19 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply('Falta el paquete `@discordjs/voice`. Instalalo con `npm i @discordjs/voice`.');
     }
 
+    // Verificar encriptacion disponible
+    try {
+      const sodium = (() => {
+        try { return require('sodium-native'); } catch {}
+        try { return require('libsodium-wrappers'); } catch {}
+        try { return require('tweetnacl'); } catch {}
+        return null;
+      })();
+      console.log(`[VC] Encriptador disponible: ${sodium ? sodium.constructor?.name || 'OK' : 'NINGUNO - esto causara fallo'}`);
+    } catch (e) {
+      console.error(`[VC] Error verificando encriptacion: ${e.message}`);
+    }
+
     try {
       console.log(`[VC] Intentando conectar a canal ${ch.id} en guild ${guild.id}`);
       const conn = joinVoiceChannel({
