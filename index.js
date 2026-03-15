@@ -19,7 +19,7 @@ const fetch = require('node-fetch');
 const DISCORD_TOKEN    = process.env.DISCORD_TOKEN;
 const GROQ_API_KEY     = process.env.GROQ_API_KEY;
 const OWNER_ID         = process.env.OWNER_ID || '596764844791824417';
-const PREFIX           = '>>';
+const PREFIX           = '&';
 const CANAL_AVISOS_ID  = '1382547512543543386';
 const MEMBERS_PER_PAGE = 20;
 
@@ -274,6 +274,9 @@ function modLogEmbed(action, target, moderator, reason, color = 0xe74c3c, extra 
 // ============================================================================
 // WARNINGS SYSTEM
 // ============================================================================
+const WARN_MUTE_THRESHOLD = 3;    // warns para auto-mute
+const WARN_MUTE_SECS      = 600;  // 10 minutos en segundos
+
 function addWarning(guildId, userId, reason, moderatorId) {
   if (!warningsData[guildId]) warningsData[guildId] = {};
   if (!warningsData[guildId][userId]) warningsData[guildId][userId] = [];
@@ -287,6 +290,130 @@ function getWarnings(guildId, userId)  { return warningsData[guildId]?.[userId] 
 function clearWarnings(guildId, userId) {
   if (warningsData[guildId]) delete warningsData[guildId][userId];
   saveJSON(WARNS_FILE, warningsData);
+}
+
+// Devuelve true si un rol tiene algun permiso elevado que pueda interferir con el timeout
+function roleHasModPerms(role) {
+  const modPerms = [
+    PermissionFlagsBits.Administrator,
+    PermissionFlagsBits.ModerateMembers,
+    PermissionFlagsBits.BanMembers,
+    PermissionFlagsBits.KickMembers,
+    PermissionFlagsBits.ManageMessages,
+    PermissionFlagsBits.ManageChannels,
+    PermissionFlagsBits.ManageGuild,
+    PermissionFlagsBits.ManageRoles,
+    PermissionFlagsBits.MuteMembers,
+    PermissionFlagsBits.DeafenMembers,
+    PermissionFlagsBits.MoveMembers,
+  ];
+  return modPerms.some(p => role.permissions.has(p));
+}
+
+// Aplica el castigo automatico cuando se llega al umbral de warns
+// Guarda los roles quitados para devolverlos cuando expira el timeout
+async function applyWarnPunishment(member, guild, total, textChannel) {
+  if (total < WARN_MUTE_THRESHOLD) return;
+  // Solo actua exactamente en multiplos del umbral (3, 6, 9...)
+  if (total % WARN_MUTE_THRESHOLD !== 0) return;
+
+  const me = guild.members.me;
+  // El bot necesita poder moderar a este miembro
+  if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) return;
+
+  const muteDuration = WARN_MUTE_SECS * 1000;
+  const expireAt     = Math.floor((Date.now() + muteDuration) / 1000);
+
+  // Detectar roles con permisos mod/admin que impidan el timeout de Discord
+  const rolesToRemove = member.roles.cache.filter(r =>
+    r.name !== '@everyone' && roleHasModPerms(r),
+  );
+
+  const removedRoleIds = [];
+
+  // Quitar roles con permisos elevados antes de aplicar el timeout
+  if (rolesToRemove.size > 0) {
+    for (const [, role] of rolesToRemove) {
+      try {
+        await member.roles.remove(role, `[AutoWarn] Quitado temporalmente por 3 advertencias`);
+        removedRoleIds.push(role.id);
+      } catch (_) {}
+    }
+  }
+
+  // Aplicar timeout nativo de Discord (aislar)
+  try {
+    await member.timeout(muteDuration, `[AutoWarn] ${total} advertencias acumuladas`);
+  } catch (e) {
+    console.error(`[AutoWarn] No pude aplicar timeout a ${member.user.tag}: ${e.message}`);
+    // Si fallo el timeout, devolver roles ya
+    for (const id of removedRoleIds) {
+      const role = guild.roles.cache.get(id);
+      if (role) await member.roles.add(role).catch(() => {});
+    }
+    return;
+  }
+
+  // Notificar al usuario por DM
+  try {
+    await member.send(
+      `Has sido aislado en **${guild.name}** por 10 minutos.\n` +
+      `Razon: acumulaste **${total} advertencias**.\n` +
+      `Expira: <t:${expireAt}:R>`,
+    );
+  } catch (_) {}
+
+  // Notificar en el canal de texto si se tiene referencia
+  if (textChannel) {
+    const embed = simpleEmbed(
+      'Auto-aislamiento por advertencias',
+      `${member} ha sido aislado automaticamente por acumular **${total} advertencias**.\n` +
+      `Duracion: **10 minutos** (expira <t:${expireAt}:R>)` +
+      (removedRoleIds.length ? `\nRoles temporalmente removidos: ${removedRoleIds.map(id => `<@&${id}>`).join(', ')}` : ''),
+      0xe74c3c,
+    );
+    textChannel.send({ embeds: [embed] }).catch(() => {});
+  }
+
+  // Enviar al mod log
+  await sendModLog(guild.id, modLogEmbed(
+    'AUTO-MUTE (3 warns)',
+    member.user,
+    client.user,
+    `${total} advertencias acumuladas`,
+    0xe74c3c,
+    { 'Duracion': '10 minutos', 'Expira': `<t:${expireAt}:R>`, 'Roles quitados': removedRoleIds.length ? removedRoleIds.map(id => `<@&${id}>`).join(', ') : 'Ninguno' },
+  ));
+
+  // Programar devolucion de roles cuando expire el timeout
+  if (removedRoleIds.length > 0) {
+    setTimeout(async () => {
+      // Verificar que el timeout ya haya expirado antes de devolver
+      try {
+        const fresh = await guild.members.fetch(member.id);
+        if (fresh.isCommunicationDisabled()) {
+          // Aun en timeout, esperar a que acabe
+          const remaining = fresh.communicationDisabledUntilTimestamp - Date.now();
+          if (remaining > 0) {
+            await new Promise(r => setTimeout(r, remaining + 1000));
+          }
+        }
+        for (const id of removedRoleIds) {
+          const role = guild.roles.cache.get(id);
+          if (role) await fresh.roles.add(role, '[AutoWarn] Rol devuelto al expirar el aislamiento').catch(() => {});
+        }
+        // Notificar por DM que los roles fueron devueltos
+        try {
+          await fresh.send(
+            `Tu aislamiento en **${guild.name}** ha expirado.\n` +
+            `Los siguientes roles te han sido devueltos: ${removedRoleIds.map(id => `<@&${id}>`).join(', ')}`,
+          );
+        } catch (_) {}
+      } catch (e) {
+        console.error(`[AutoWarn] Error devolviendo roles a ${member.id}: ${e.message}`);
+      }
+    }, muteDuration + 2000);
+  }
 }
 
 // ============================================================================
@@ -887,6 +1014,7 @@ async function handleJarvisCommands(message, text, guild) {
     embed.setFooter({ text: `Por ${author.tag}` });
     await message.reply({ embeds: [embed] });
     await sendModLog(guild.id, modLogEmbed('WARN', member.user, author, reason, 0xf39c12, { 'Total warns': String(total) }));
+    await applyWarnPunishment(member, guild, total, message.channel);
     return true;
   }
 
@@ -1287,6 +1415,7 @@ async function handleCommand(message) {
     try { await target.send(`Advertencia en **${message.guild.name}**.\nRazon: ${reason}\nTotal: **${total}**`); } catch (_) {}
     await message.reply({ embeds: [simpleEmbed('Advertencia', `${target} advertido. Total: **${total}**`, 0xf39c12)] });
     await sendModLog(message.guild.id, modLogEmbed('WARN', target.user, message.author, reason, 0xf39c12, { 'Total warns': String(total) }));
+    await applyWarnPunishment(target, message.guild, total, message.channel);
     return;
   }
 
@@ -1926,6 +2055,7 @@ client.on('interactionCreate', async interaction => {
     try { await target.send(`Advertencia en **${guild.name}**.\nRazon: ${reason}\nTotal: **${total}**`); } catch (_) {}
     await interaction.reply({ embeds: [simpleEmbed('Advertencia', `${target} advertido. Total acumuladas: **${total}**`, 0xf39c12)] });
     await sendModLog(guild.id, modLogEmbed('WARN', target.user, interaction.member.user, reason, 0xf39c12, { 'Total warns': String(total) }));
+    await applyWarnPunishment(target, guild, total, interaction.channel);
     return;
   }
 
