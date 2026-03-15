@@ -502,11 +502,6 @@ async function monitorVoiceJail(entry) {
     voiceJailTasks.delete(jailKey(entry.guildId, entry.userId));
     const cur = getJailEntry(entry.guildId, entry.userId);
     if (!cur || !cur.isActive) return;
-    const guild  = client.guilds.cache.get(entry.guildId);
-    const member = guild?.members.cache.get(entry.userId) || await guild?.members.fetch(entry.userId).catch(() => null);
-    if (member && entry.originalRoles.length) {
-      try { await member.roles.set(entry.originalRoles, '[VoiceJail] Roles restaurados al expirar'); } catch (_) {}
-    }
     removeJailEntry(entry.guildId, entry.userId);
   }, entry.remainingSeconds() * 1000);
   voiceJailTasks.set(jailKey(entry.guildId, entry.userId), task);
@@ -1651,20 +1646,20 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   // Si ya está en el canal correcto, no hacer nada
   if (newState.channelId === entry.channelId) return;
 
-  // Se desconectó (newState.channelId es null) o se movió a otro canal
-  const member = guild.members.cache.get(userId) || await guild.members.fetch(userId).catch(() => null);
+  // Se conectó a otro canal, se movió, o se reconectó — regresarlo al jail
+  // newState.channelId === null significa que se desconectó completamente,
+  // en ese caso no podemos moverlo hasta que vuelva a conectarse
+  if (!newState.channelId) return;
+
+  const member = newState.member || guild.members.cache.get(userId) || await guild.members.fetch(userId).catch(() => null);
   if (!member) return;
 
-  // Pequeño delay para evitar race conditions con Discord
   setTimeout(async () => {
     try {
-      // Verificar que sigue jailado y que el entry sigue activo
       const cur = getJailEntry(guild.id, userId);
       if (!cur || !cur.isActive || cur.isExpired()) return;
       await member.voice.setChannel(jailChannel, '[VoiceJail] Retornado al canal de confinamiento');
-    } catch (_) {
-      // Si falla (por ejemplo se desconectó completamente), no hacer nada
-    }
+    } catch (_) {}
   }, 500);
 });
 
@@ -2009,6 +2004,7 @@ client.on('interactionCreate', async interaction => {
 
   // ── VOICEJAIL ──
   if (commandName === 'voicejail') {
+    if (user.id !== OWNER_ID) return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', flags: MessageFlags.Ephemeral });
     const target  = interaction.options.getMember('usuario');
     const channel = interaction.options.getChannel('canal');
     const durStr  = interaction.options.getString('duracion');
@@ -2024,15 +2020,17 @@ client.on('interactionCreate', async interaction => {
     await interaction.deferReply();
     try {
       const entry = new VoiceJailEntry(target.id, guild.id, channel.id, secs, user.id);
-      entry.originalRoles = target.roles.cache.filter(r => r.name !== '@everyone').map(r => r);
+      entry.originalRoles = [];
 
       // Registrar la entry ANTES de mover para que voiceStateUpdate ya la encuentre
       addJailEntry(entry);
       await monitorVoiceJail(entry);
 
-      // Mover al canal jail si ya está en voz
+      // Mover al canal jail si ya está en voz, si no avisar
       if (target.voice?.channel) {
         await target.voice.setChannel(channel, `[VoiceJail] por ${user.tag}`).catch(() => {});
+      } else {
+        embed.addFields({ name: 'Aviso', value: 'El usuario no está en voz ahora. Cuando se conecte será movido automáticamente.' });
       }
 
       const embed = simpleEmbed('Voice Jail Activado',
@@ -2063,17 +2061,14 @@ client.on('interactionCreate', async interaction => {
 
   // ── VOICEJAILREMOVE ──
   if (commandName === 'voicejailremove') {
+    if (user.id !== OWNER_ID) return interaction.reply({ content: 'Solo el owner del bot puede liberar a alguien del voice jail.', flags: MessageFlags.Ephemeral });
     const target = interaction.options.getMember('usuario');
     const entry  = getJailEntry(guild.id, target.id);
     if (!entry) return interaction.reply({ content: `${target} no esta en voice jail.`, flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     try {
-      // Primero remover la entry para que voiceStateUpdate no lo regrese
       removeJailEntry(guild.id, target.id);
-      if (entry.originalRoles.length) {
-        try { await target.roles.set(entry.originalRoles, '[VoiceJail] Roles restaurados al liberar'); } catch (_) {}
-      }
-      const embed = simpleEmbed('Voice Jail Liberado', `**${target}** ha sido liberado del voice jail y sus roles han sido restaurados.`, 0x2ecc71);
+      const embed = simpleEmbed('Voice Jail Liberado', `**${target}** ha sido liberado del voice jail.`, 0x2ecc71);
       embed.setFooter({ text: `Liberado por ${user.tag}` });
       await interaction.editReply({ embeds: [embed] });
     } catch (err) { await interaction.editReply(`Error: ${err.message}`); }
@@ -2082,6 +2077,7 @@ client.on('interactionCreate', async interaction => {
 
   // ── VOICEJAILCLEAR ──
   if (commandName === 'voicejailclear') {
+    if (user.id !== OWNER_ID) return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', flags: MessageFlags.Ephemeral });
     const entries = [...voiceJailTracker.values()].filter(e => e.guildId === guild.id && e.isActive);
     if (!entries.length) return interaction.reply({ content: 'No hay usuarios en voice jail.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
