@@ -1652,15 +1652,23 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
       if (ch) {
         setTimeout(async () => {
           try {
-            const { joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
+            const { joinVoiceChannel, entersState, VoiceConnectionStatus, createAudioPlayer, createAudioResource, NoSubscriberBehavior, StreamType } = require('@discordjs/voice');
+            const { Readable } = require('stream');
             const conn = joinVoiceChannel({
               channelId:      ch.id,
               guildId:        guild.id,
               adapterCreator: guild.voiceAdapterCreator,
               selfDeaf:       true,
-              selfMute:       true,
+              selfMute:       false,
             });
-            await entersState(conn, VoiceConnectionStatus.Ready, 15_000);
+            await entersState(conn, VoiceConnectionStatus.Ready, 20_000);
+            const silenceStream = new Readable({ read() {} });
+            silenceStream.push(Buffer.alloc(3840));
+            silenceStream.push(null);
+            const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+            const resource = createAudioResource(silenceStream, { inputType: StreamType.Raw });
+            conn.subscribe(player);
+            player.play(resource);
             console.log(`[StickyVC] Reconectado a ${ch.name} en ${guild.name}`);
           } catch (e) {
             console.error(`[StickyVC] No pude reconectarme: ${e.message}`);
@@ -2139,9 +2147,9 @@ client.on('interactionCreate', async interaction => {
 
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    let joinVoiceChannel, entersState, VoiceConnectionStatus;
+    let joinVoiceChannel, entersState, VoiceConnectionStatus, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior, StreamType;
     try {
-      ({ joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice'));
+      ({ joinVoiceChannel, entersState, VoiceConnectionStatus, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior, StreamType } = require('@discordjs/voice'));
     } catch {
       return interaction.editReply('Falta el paquete `@discordjs/voice`. Instalalo con `npm i @discordjs/voice`.');
     }
@@ -2152,9 +2160,21 @@ client.on('interactionCreate', async interaction => {
         guildId:        guild.id,
         adapterCreator: guild.voiceAdapterCreator,
         selfDeaf:       true,
-        selfMute:       true,
+        selfMute:       false,
       });
-      await entersState(conn, VoiceConnectionStatus.Ready, 15_000);
+
+      await entersState(conn, VoiceConnectionStatus.Ready, 20_000);
+
+      // Silence player para mantener la conexion viva
+      const { Readable } = require('stream');
+      const silenceStream = new Readable({ read() {} });
+      silenceStream.push(Buffer.alloc(3840));
+      silenceStream.push(null);
+
+      const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+      const resource = createAudioResource(silenceStream, { inputType: StreamType.Raw });
+      conn.subscribe(player);
+      player.play(resource);
 
       stickyVC[guild.id] = { channelId: ch.id, enabled: true };
       saveJSON(STICKY_FILE, stickyVC);
