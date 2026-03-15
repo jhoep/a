@@ -1071,6 +1071,23 @@ async function handleJarvisCommands(message, text, guild) {
     }
   }
 
+  // JOIN SERVER
+  if (/^(?:join|entra|vuelve|regresa)\b/i.test(norm)) {
+    const targetGuild = args?.[0] ? client.guilds.cache.get(args[0]) : guild;
+    if (!targetGuild) { await message.reply('No encuentro ese servidor.'); return true; }
+    // El bot ya está en el servidor si puede recibir el mensaje
+    await message.reply({ embeds: [simpleEmbed('Ya estoy aquí', `Ya estoy en **${targetGuild.name}**. Si me salí, necesitas invitarme de nuevo con el link de invitación.`, 0x3498db)] });
+    return true;
+  }
+
+  // LEAVE SERVER
+  if (/^(?:leave|sal|vete|salte|abandona)\b/i.test(norm)) {
+    if (message.author.id !== OWNER_ID) { await message.reply('Solo el owner puede hacer eso.'); return true; }
+    await message.reply({ embeds: [simpleEmbed('Saliendo...', `Me salgo de **${guild.name}**. Hasta luego!`, 0xe74c3c)] });
+    setTimeout(() => guild.leave().catch(() => {}), 1500);
+    return true;
+  }
+
   // SAY
   const sayM = text.match(/^(?:di|escribe|envia|manda|say|repite|anuncia|habla)\s+(.+)/i);
   if (sayM) {
