@@ -311,7 +311,6 @@ function roleHasModPerms(role) {
 }
 
 // Aplica el castigo automatico cuando se llega al umbral de warns
-// Guarda los roles quitados para devolverlos cuando expira el timeout
 async function applyWarnPunishment(member, guild, total, textChannel) {
   if (total < WARN_MUTE_THRESHOLD) return;
   // Solo actua exactamente en multiplos del umbral (3, 6, 9...)
@@ -362,18 +361,6 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
       `Expira: <t:${expireAt}:R>`,
     );
   } catch (_) {}
-
-  // Notificar en el canal de texto si se tiene referencia
-  if (textChannel) {
-    const embed = simpleEmbed(
-      'Auto-aislamiento por advertencias',
-      `${member} ha sido aislado automaticamente por acumular **${total} advertencias**.\n` +
-      `Duracion: **10 minutos** (expira <t:${expireAt}:R>)` +
-      (removedRoleIds.length ? `\nRoles temporalmente removidos: ${removedRoleIds.map(id => `<@&${id}>`).join(', ')}` : ''),
-      0xe74c3c,
-    );
-    textChannel.send({ embeds: [embed] }).catch(() => {});
-  }
 
   // Enviar al mod log
   await sendModLog(guild.id, modLogEmbed(
@@ -776,22 +763,16 @@ const JARVIS_CONV = {
 
 // ============================================================================
 // SMART INTENT PARSER
-// Normaliza el texto de entrada para que los patrones funcionen con lenguaje
-// natural variado: "cambiale el nombre a @user a tonta" -> detecta usuario y nick
 // ============================================================================
-
-// Extrae el primer mention o ID de usuario del texto
 function extractMentionOrId(text) {
   const m = text.match(/<@!?(\d+)>/) || text.match(/\b(\d{17,20})\b/);
   return m ? m[0] : null;
 }
 
-// Extrae todos los mentions del texto
 function extractAllMentions(text) {
   return [...text.matchAll(/<@!?(\d+)>/g)].map(m => m[0]);
 }
 
-// Normaliza variantes comunes de palabras clave para facilitar el match
 function normalizeText(t) {
   return t
     .replace(/cámbia|cambiá/gi, 'cambia')
@@ -821,23 +802,13 @@ function normalizeText(t) {
     .trim();
 }
 
-// Parser inteligente para nick: soporta todos estos formatos:
-//   jarvis cambiale el nombre a @user a tonta
-//   jarvis cambia el nick de @user a tonta
-//   jarvis ponle el apodo tonta a @user
-//   jarvis cambia el nick de @user por tonta absoluta
-//   jarvis renombra @user a tonta
 function parseNickCommand(text) {
-  // Formato: "... @user ... a|por|como <nick>"
-  // Primero buscamos el mention
   const mentionMatch = text.match(/<@!?(\d+)>/);
   if (mentionMatch) {
     const mention = mentionMatch[0];
-    // Todo lo que venga despues del mention, buscar "a|por|como <nick>"
     const after = text.slice(text.indexOf(mention) + mention.length).trim();
     const nickMatch = after.match(/^(?:a|por|como|se\s*llame|que\s*se\s*llame)\s+(.+)/i);
     if (nickMatch) return { userStr: mention, nick: nickMatch[1].trim() };
-    // Quizas el nick esta antes del mention: "ponle tonta a @user"
     const before = text.slice(0, text.indexOf(mention)).trim();
     const beforeNick = before.match(/(?:nick|nombre|apodo|nickname)?\s*(?:de\s+)?(?:a\s+)?(.+?)(?:\s+a\s*)?$/i);
     if (beforeNick && beforeNick[1] && !/<@/.test(beforeNick[1])) {
@@ -1078,7 +1049,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ROLE REMOVE — soporta: "quita el rol X a @user", "quita el rol X de @user", "quita X a @user"
+  // ROLE REMOVE
   const roleRemM = norm.match(/(?:quita[r]?|remueve[r]?|elimina[r]?|saca[r]?|borra[r]?)\s+(?:el\s+)?(?:rol\s+)?(.+?)(?:\s+(?:a[l]?\s+|de\s+)(<@!?\d+>|\d{17,20}|\S+))?$/i);
   if (roleRemM && /rol|role/i.test(norm)) {
     const roleName = roleRemM[1].replace(/\b(?:el|la|los|las|de|del|a|al|rol|role)\b/gi, '').trim();
@@ -1094,7 +1065,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ROLE ADD — soporta: "dame el rol X", "dale el rol X a @user", "asigna el rol X a @user"
+  // ROLE ADD
   const roleAddM = norm.match(/(?:dame?|anade|asigna[r]?|ponle|dale|otorga[r]?|da[r]?)\s+(?:el\s+)?(?:rol\s+)?(.+?)(?:\s+a[l]?\s+(<@!?\d+>|\d{17,20}|\S+))?$/i);
   if (roleAddM && /rol|role/i.test(norm)) {
     const roleName = roleAddM[1].replace(/\b(?:el|la|los|las|rol|role)\b/gi, '').trim();
@@ -1109,13 +1080,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // NICK — parser inteligente, soporta todos los formatos naturales:
-  //   "cambiale el nombre a @user a tonta"
-  //   "cambia el nick de @user a tonta"
-  //   "ponle el apodo tonta a @user"
-  //   "cambia el nombre de @user por tonta absoluta"
-  //   "renombra @user a tonta"
-  //   "que se llame @user tonta"
+  // NICK
   if (/nick|nombre|apodo|nickname|renombra|llame/i.test(norm)) {
     const parsed = parseNickCommand(norm);
     if (parsed) {
@@ -1312,7 +1277,7 @@ async function handleJarvis(message) {
 }
 
 // ============================================================================
-// PREFIX COMMAND HANDLER (solo comandos de owner / moderacion tradicional)
+// PREFIX COMMAND HANDLER
 // ============================================================================
 async function handleCommand(message) {
   if (!message.content.startsWith(PREFIX) || message.author.bot) return;
@@ -1699,7 +1664,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     if (sticky?.enabled) {
       const ch = guild.channels.cache.get(sticky.channelId);
       if (ch) {
-        // Esperar un momento y volver
         setTimeout(async () => {
           try {
             const { joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
@@ -1773,7 +1737,6 @@ client.on('error', err => console.error('[Client Error]', err));
 // SLASH COMMANDS DEFINITION
 // ============================================================================
 const slashCommands = [
-  // --- XP / NIVELES ---
   new SlashCommandBuilder()
     .setName('rank').setDescription('Ver tu nivel y XP')
     .addUserOption(o => o.setName('usuario').setDescription('Usuario (opcional)')),
@@ -1781,7 +1744,6 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('leaderboard').setDescription('Top 10 de XP del servidor'),
 
-  // --- ENCUESTAS ---
   new SlashCommandBuilder()
     .setName('poll').setDescription('Crear una encuesta con reacciones')
     .addStringOption(o => o.setName('pregunta').setDescription('Pregunta de la encuesta').setRequired(true))
@@ -1792,7 +1754,6 @@ const slashCommands = [
     .addStringOption(o => o.setName('opcion5').setDescription('Opcion 5'))
     .addStringOption(o => o.setName('duracion').setDescription('Duracion (ej: 5m, 1h). Por defecto 5 minutos')),
 
-  // --- GIVEAWAYS ---
   new SlashCommandBuilder()
     .setName('giveaway').setDescription('Crear un giveaway')
     .addStringOption(o => o.setName('duracion').setDescription('Duracion (ej: 10m, 1h)').setRequired(true))
@@ -1807,7 +1768,6 @@ const slashCommands = [
     .setName('greroll').setDescription('Elegir un nuevo ganador de un giveaway')
     .addStringOption(o => o.setName('mensaje_id').setDescription('ID del mensaje del giveaway').setRequired(true)),
 
-  // --- RECORDATORIOS ---
   new SlashCommandBuilder()
     .setName('remind').setDescription('Crear un recordatorio personal')
     .addStringOption(o => o.setName('duracion').setDescription('Cuando avisarte (ej: 30m, 2h, 1d)').setRequired(true))
@@ -1820,7 +1780,6 @@ const slashCommands = [
     .setName('remindcancel').setDescription('Cancelar un recordatorio')
     .addStringOption(o => o.setName('id').setDescription('ID del recordatorio (ultimos 8 caracteres de /reminders)').setRequired(true)),
 
-  // --- ADVERTENCIAS ---
   new SlashCommandBuilder()
     .setName('warn').setDescription('Advertir a un usuario')
     .addUserOption(o => o.setName('usuario').setDescription('Usuario').setRequired(true))
@@ -1834,12 +1793,10 @@ const slashCommands = [
     .setName('clearwarns').setDescription('Limpiar todas las advertencias de un usuario')
     .addUserOption(o => o.setName('usuario').setDescription('Usuario').setRequired(true)),
 
-  // --- MOD LOG ---
   new SlashCommandBuilder()
     .setName('setmodlog').setDescription('Configurar el canal de logs de moderacion')
     .addChannelOption(o => o.setName('canal').setDescription('Canal donde se enviaran los logs').setRequired(true)),
 
-  // --- VOICE JAIL ---
   new SlashCommandBuilder()
     .setName('voicejail').setDescription('Confinar a un usuario en un canal de voz')
     .addUserOption(o => o.setName('usuario').setDescription('Usuario a confinar').setRequired(true))
@@ -1858,7 +1815,6 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('voicejailclear').setDescription('Liberar a todos los usuarios del voice jail'),
 
-  // --- STICKY VC ---
   new SlashCommandBuilder()
     .setName('quedar_canal_vc')
     .setDescription('El bot se queda fijo en un canal de voz y vuelve si lo sacan (solo owner)')
@@ -1868,7 +1824,6 @@ const slashCommands = [
     .setName('desactivar_canal_vc')
     .setDescription('Desactiva el canal fijo de voz y desconecta al bot (solo owner)'),
 
-  // --- MIX ---
   new SlashCommandBuilder()
     .setName('mix').setDescription('Crear un canal de voz privado')
     .addUserOption(o => o.setName('user1').setDescription('Miembro 1'))
@@ -2198,7 +2153,6 @@ client.on('interactionCreate', async interaction => {
 
     await interaction.deferReply({ ephemeral: true });
 
-    // Verificar que @discordjs/voice este disponible
     let joinVoiceChannel, entersState, VoiceConnectionStatus;
     try {
       ({ joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice'));
@@ -2237,17 +2191,14 @@ client.on('interactionCreate', async interaction => {
     if (!sticky?.enabled)
       return interaction.reply({ content: 'No hay ningun canal fijo de voz activo en este servidor.', ephemeral: true });
 
-    // Desactivar antes de intentar desconectar para que voiceStateUpdate no reconecte
     stickyVC[guild.id] = { channelId: null, enabled: false };
     saveJSON(STICKY_FILE, stickyVC);
 
-    // Intentar desconectar usando @discordjs/voice si esta disponible
     try {
       const { getVoiceConnection } = require('@discordjs/voice');
       const conn = getVoiceConnection(guild.id);
       if (conn) conn.destroy();
     } catch {
-      // Si no esta disponible, mover al bot fuera del canal via Discord API
       try {
         const botMember = guild.members.me;
         if (botMember?.voice?.channel) await botMember.voice.disconnect();
