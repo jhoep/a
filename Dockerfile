@@ -7,6 +7,9 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     build-essential \
     curl \
+    libtool \
+    autoconf \
+    automake \
     && pip3 install yt-dlp --break-system-packages \
     && rm -rf /var/lib/apt/lists/*
 
