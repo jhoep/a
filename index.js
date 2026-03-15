@@ -40,11 +40,6 @@ const WARNS_FILE  = path.join(DATA_DIR, 'warnings.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ============================================================================
-// STICKY VOICE CHANNEL
-// ============================================================================
-const STICKY_FILE = path.join(DATA_DIR, 'sticky_vc.json');
-let stickyVC      = loadJSON(STICKY_FILE, {});
 
 function loadJSON(file, def = {}) {
   try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : def; }
@@ -1643,51 +1638,6 @@ client.on('messageCreate', async message => {
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const guild     = oldState.guild || newState.guild;
   const botId     = client.user?.id;
-
-  // ── STICKY VC ──
-  if (oldState.id === botId && !newState.channelId) {
-    const sticky = stickyVC[guild.id];
-    if (sticky?.enabled) {
-      const ch = guild.channels.cache.get(sticky.channelId);
-      if (ch) {
-        setTimeout(async () => {
-          try {
-            const { joinVoiceChannel, entersState, VoiceConnectionStatus, createAudioPlayer, createAudioResource, NoSubscriberBehavior, StreamType } = require('@discordjs/voice');
-            const { Readable } = require('stream');
-            const conn = joinVoiceChannel({
-              channelId:      ch.id,
-              guildId:        guild.id,
-              adapterCreator: guild.voiceAdapterCreator,
-              selfDeaf:       true,
-              selfMute:       false,
-            });
-            await entersState(conn, VoiceConnectionStatus.Ready, 20_000);
-            const silenceStream = new Readable({ read() {} });
-            silenceStream.push(Buffer.alloc(3840));
-            silenceStream.push(null);
-            const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
-            const resource = createAudioResource(silenceStream, { inputType: StreamType.Raw });
-            conn.subscribe(player);
-            player.play(resource);
-            console.log(`[StickyVC] Reconectado a ${ch.name} en ${guild.name}`);
-          } catch (e) {
-            console.error(`[StickyVC] No pude reconectarme: ${e.message}`);
-          }
-        }, 2000);
-      }
-    }
-  }
-
-  // ── VOICE JAIL ──
-  const jailEntry = getJailEntry(guild.id, newState.id);
-  if (jailEntry && !jailEntry.isExpired() && jailEntry.isActive) {
-    if (newState.channelId && newState.channelId !== jailEntry.channelId) {
-      const jailChannel = guild.channels.cache.get(jailEntry.channelId);
-      if (jailChannel) {
-        try { await newState.member.voice.setChannel(jailChannel, 'Voice jail - intento de escape'); } catch (_) {}
-      }
-    }
-  }
 });
 
 client.on('guildMemberUpdate', async (before, after) => {
@@ -1808,16 +1758,6 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('voicejailclear').setDescription('Liberar a todos los usuarios del voice jail'),
-
-  new SlashCommandBuilder()
-    .setName('quedar_canal_vc')
-    .setDescription('El bot se queda fijo en un canal de voz y vuelve si lo sacan (solo owner)')
-    .addChannelOption(o => o.setName('canal').setDescription('Canal de voz donde quedarse').setRequired(true)),
-
-  new SlashCommandBuilder()
-    .setName('desactivar_canal_vc')
-    .setDescription('Desactiva el canal fijo de voz y desconecta al bot (solo owner)'),
-
   new SlashCommandBuilder()
     .setName('mix').setDescription('Crear un canal de voz privado')
     .addUserOption(o => o.setName('user1').setDescription('Miembro 1'))
@@ -2136,104 +2076,6 @@ client.on('interactionCreate', async interaction => {
     return;
   }
 
-  // ── QUEDAR_CANAL_VC ──
-  if (commandName === 'quedar_canal_vc') {
-    if (user.id !== OWNER_ID)
-      return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', flags: MessageFlags.Ephemeral });
-
-    const ch = interaction.options.getChannel('canal');
-    if (!ch?.isVoiceBased())
-      return interaction.reply({ content: 'El canal debe ser de voz.', flags: MessageFlags.Ephemeral });
-
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-    let joinVoiceChannel, entersState, VoiceConnectionStatus, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior, StreamType;
-    try {
-      ({ joinVoiceChannel, entersState, VoiceConnectionStatus, createAudioPlayer, createAudioResource, AudioPlayerStatus, NoSubscriberBehavior, StreamType } = require('@discordjs/voice'));
-    } catch {
-      return interaction.editReply('Falta el paquete `@discordjs/voice`. Instalalo con `npm i @discordjs/voice`.');
-    }
-
-    // Verificar encriptacion disponible
-    try {
-      const sodium = (() => {
-        try { return require('sodium-native'); } catch {}
-        try { return require('libsodium-wrappers'); } catch {}
-        try { return require('tweetnacl'); } catch {}
-        return null;
-      })();
-      console.log(`[VC] Encriptador disponible: ${sodium ? sodium.constructor?.name || 'OK' : 'NINGUNO - esto causara fallo'}`);
-    } catch (e) {
-      console.error(`[VC] Error verificando encriptacion: ${e.message}`);
-    }
-
-    try {
-      console.log(`[VC] Intentando conectar a canal ${ch.id} en guild ${guild.id}`);
-      const conn = joinVoiceChannel({
-        channelId:      ch.id,
-        guildId:        guild.id,
-        adapterCreator: guild.voiceAdapterCreator,
-        selfDeaf:       true,
-        selfMute:       false,
-      });
-
-      conn.on('stateChange', (oldState, newState) => {
-        console.log(`[VC] Estado: ${oldState.status} -> ${newState.status}`);
-      });
-      conn.on('error', e => console.error(`[VC] Error de conexion: ${e.message}`));
-
-      console.log(`[VC] Esperando estado Ready...`);
-      await entersState(conn, VoiceConnectionStatus.Ready, 20_000);
-      console.log(`[VC] Conectado exitosamente!`);
-
-      // Silence player para mantener la conexion viva
-      const { Readable } = require('stream');
-      const silenceStream = new Readable({ read() {} });
-      silenceStream.push(Buffer.alloc(3840));
-      silenceStream.push(null);
-
-      const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
-      const resource = createAudioResource(silenceStream, { inputType: StreamType.Raw });
-      conn.subscribe(player);
-      player.play(resource);
-
-      stickyVC[guild.id] = { channelId: ch.id, enabled: true };
-      saveJSON(STICKY_FILE, stickyVC);
-
-      await interaction.editReply(
-        `Listo. El bot se quedo en **${ch.name}** y volvera automaticamente si lo sacan.\nUsa \`/desactivar_canal_vc\` para desconectarlo.`
-      );
-    } catch (err) {
-      await interaction.editReply(`No pude conectarme: ${err.message}`);
-    }
-    return;
-  }
-
-  // ── DESACTIVAR_CANAL_VC ──
-  if (commandName === 'desactivar_canal_vc') {
-    if (user.id !== OWNER_ID)
-      return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', flags: MessageFlags.Ephemeral });
-
-    const sticky = stickyVC[guild.id];
-    if (!sticky?.enabled)
-      return interaction.reply({ content: 'No hay ningun canal fijo de voz activo en este servidor.', flags: MessageFlags.Ephemeral });
-
-    stickyVC[guild.id] = { channelId: null, enabled: false };
-    saveJSON(STICKY_FILE, stickyVC);
-
-    try {
-      const { getVoiceConnection } = require('@discordjs/voice');
-      const conn = getVoiceConnection(guild.id);
-      if (conn) conn.destroy();
-    } catch {
-      try {
-        const botMember = guild.members.me;
-        if (botMember?.voice?.channel) await botMember.voice.disconnect();
-      } catch (_) {}
-    }
-
-    return interaction.reply({ content: 'Canal fijo desactivado. El bot se ha desconectado y no volvera automaticamente.', flags: MessageFlags.Ephemeral });
-  }
 });
 
 // ============================================================================
