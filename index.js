@@ -7,6 +7,7 @@ const {
   Client, GatewayIntentBits, EmbedBuilder, PermissionFlagsBits,
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ActivityType, REST, Routes, SlashCommandBuilder, ChannelType,
+  MessageFlags,
 } = require('discord.js');
 const path  = require('path');
 const fs    = require('fs');
@@ -40,8 +41,7 @@ const WARNS_FILE  = path.join(DATA_DIR, 'warnings.json');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ============================================================================
-// STICKY VOICE CHANNEL — el bot se queda fijo en un canal de voz
-// stickyVC[guildId] = { channelId, enabled }
+// STICKY VOICE CHANNEL
 // ============================================================================
 const STICKY_FILE = path.join(DATA_DIR, 'sticky_vc.json');
 let stickyVC      = loadJSON(STICKY_FILE, {});
@@ -274,8 +274,8 @@ function modLogEmbed(action, target, moderator, reason, color = 0xe74c3c, extra 
 // ============================================================================
 // WARNINGS SYSTEM
 // ============================================================================
-const WARN_MUTE_THRESHOLD = 3;    // warns para auto-mute
-const WARN_MUTE_SECS      = 600;  // 10 minutos en segundos
+const WARN_MUTE_THRESHOLD = 3;
+const WARN_MUTE_SECS      = 600;
 
 function addWarning(guildId, userId, reason, moderatorId) {
   if (!warningsData[guildId]) warningsData[guildId] = {};
@@ -292,7 +292,6 @@ function clearWarnings(guildId, userId) {
   saveJSON(WARNS_FILE, warningsData);
 }
 
-// Devuelve true si un rol tiene algun permiso elevado que pueda interferir con el timeout
 function roleHasModPerms(role) {
   const modPerms = [
     PermissionFlagsBits.Administrator,
@@ -310,27 +309,22 @@ function roleHasModPerms(role) {
   return modPerms.some(p => role.permissions.has(p));
 }
 
-// Aplica el castigo automatico cuando se llega al umbral de warns
 async function applyWarnPunishment(member, guild, total, textChannel) {
   if (total < WARN_MUTE_THRESHOLD) return;
-  // Solo actua exactamente en multiplos del umbral (3, 6, 9...)
   if (total % WARN_MUTE_THRESHOLD !== 0) return;
 
   const me = guild.members.me;
-  // El bot necesita poder moderar a este miembro
   if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) return;
 
   const muteDuration = WARN_MUTE_SECS * 1000;
   const expireAt     = Math.floor((Date.now() + muteDuration) / 1000);
 
-  // Detectar roles con permisos mod/admin que impidan el timeout de Discord
   const rolesToRemove = member.roles.cache.filter(r =>
     r.name !== '@everyone' && roleHasModPerms(r),
   );
 
   const removedRoleIds = [];
 
-  // Quitar roles con permisos elevados antes de aplicar el timeout
   if (rolesToRemove.size > 0) {
     for (const [, role] of rolesToRemove) {
       try {
@@ -340,12 +334,10 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
     }
   }
 
-  // Aplicar timeout nativo de Discord (aislar)
   try {
     await member.timeout(muteDuration, `[AutoWarn] ${total} advertencias acumuladas`);
   } catch (e) {
     console.error(`[AutoWarn] No pude aplicar timeout a ${member.user.tag}: ${e.message}`);
-    // Si fallo el timeout, devolver roles ya
     for (const id of removedRoleIds) {
       const role = guild.roles.cache.get(id);
       if (role) await member.roles.add(role).catch(() => {});
@@ -353,7 +345,6 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
     return;
   }
 
-  // Notificar al usuario por DM
   try {
     await member.send(
       `Has sido aislado en **${guild.name}** por 10 minutos.\n` +
@@ -362,7 +353,6 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
     );
   } catch (_) {}
 
-  // Enviar al mod log
   await sendModLog(guild.id, modLogEmbed(
     'AUTO-MUTE (3 warns)',
     member.user,
@@ -372,14 +362,11 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
     { 'Duracion': '10 minutos', 'Expira': `<t:${expireAt}:R>`, 'Roles quitados': removedRoleIds.length ? removedRoleIds.map(id => `<@&${id}>`).join(', ') : 'Ninguno' },
   ));
 
-  // Programar devolucion de roles cuando expire el timeout
   if (removedRoleIds.length > 0) {
     setTimeout(async () => {
-      // Verificar que el timeout ya haya expirado antes de devolver
       try {
         const fresh = await guild.members.fetch(member.id);
         if (fresh.isCommunicationDisabled()) {
-          // Aun en timeout, esperar a que acabe
           const remaining = fresh.communicationDisabledUntilTimestamp - Date.now();
           if (remaining > 0) {
             await new Promise(r => setTimeout(r, remaining + 1000));
@@ -389,7 +376,6 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
           const role = guild.roles.cache.get(id);
           if (role) await fresh.roles.add(role, '[AutoWarn] Rol devuelto al expirar el aislamiento').catch(() => {});
         }
-        // Notificar por DM que los roles fueron devueltos
         try {
           await fresh.send(
             `Tu aislamiento en **${guild.name}** ha expirado.\n` +
@@ -1560,7 +1546,7 @@ async function handleCommand(message) {
     if (totalPages <= 1) return;
     const collector = statusMsg.createMessageComponentCollector({ time: 120_000 });
     collector.on('collect', async interaction => {
-      if (interaction.user.id !== message.author.id) return interaction.reply({ content: 'Solo quien invoco el comando puede navegar.', ephemeral: true });
+      if (interaction.user.id !== message.author.id) return interaction.reply({ content: 'Solo quien invoco el comando puede navegar.', flags: MessageFlags.Ephemeral });
       if (interaction.customId === 'members_first')      currentPage = 0;
       else if (interaction.customId === 'members_prev')  currentPage = Math.max(0, currentPage - 1);
       else if (interaction.customId === 'members_next')  currentPage = Math.min(totalPages - 1, currentPage + 1);
@@ -1658,7 +1644,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   const guild     = oldState.guild || newState.guild;
   const botId     = client.user?.id;
 
-  // ── STICKY VC: si el bot fue expulsado del canal fijo, volver ──
+  // ── STICKY VC ──
   if (oldState.id === botId && !newState.channelId) {
     const sticky = stickyVC[guild.id];
     if (sticky?.enabled) {
@@ -1684,7 +1670,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     }
   }
 
-  // ── VOICE JAIL: impedir escape ──
+  // ── VOICE JAIL ──
   const jailEntry = getJailEntry(guild.id, newState.id);
   if (jailEntry && !jailEntry.isExpired() && jailEntry.isActive) {
     if (newState.channelId && newState.channelId !== jailEntry.channelId) {
@@ -1886,7 +1872,7 @@ client.on('interactionCreate', async interaction => {
     const gid    = guild.id;
     const data   = xpData[gid] || {};
     const sorted = Object.entries(data).sort((a, b) => b[1].xp - a[1].xp).slice(0, 10);
-    if (!sorted.length) return interaction.reply({ content: 'Nadie tiene XP todavia.', ephemeral: true });
+    if (!sorted.length) return interaction.reply({ content: 'Nadie tiene XP todavia.', flags: MessageFlags.Ephemeral });
     const medals = ['[1]', '[2]', '[3]'];
     const lines  = sorted.map(([uid, d], i) => {
       const lvl = levelFromXp(d.xp);
@@ -1904,7 +1890,7 @@ client.on('interactionCreate', async interaction => {
     const durStr   = interaction.options.getString('duracion') || '5m';
     const duration = (parseDuration(durStr) || 300) * 1000;
 
-    if (options.length < 2) return interaction.reply({ content: 'Necesitas al menos 2 opciones.', ephemeral: true });
+    if (options.length < 2) return interaction.reply({ content: 'Necesitas al menos 2 opciones.', flags: MessageFlags.Ephemeral });
 
     await interaction.deferReply();
     await createPoll({ channel: interaction.channel, question, options, duration, authorId: user.id });
@@ -1918,7 +1904,7 @@ client.on('interactionCreate', async interaction => {
     const winnersCount = interaction.options.getInteger('ganadores');
     const prize        = interaction.options.getString('premio');
     const duration     = parseDuration(durStr);
-    if (!duration || duration < 10) return interaction.reply({ content: 'Duracion invalida. Minimo 10s.', ephemeral: true });
+    if (!duration || duration < 10) return interaction.reply({ content: 'Duracion invalida. Minimo 10s.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     await createGiveaway({ channel: interaction.channel, duration: duration * 1000, prize, winnersCount, hostedBy: user.tag });
     await interaction.editReply('Giveaway creado!');
@@ -1929,8 +1915,8 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'gend') {
     const gwId = interaction.options.getString('mensaje_id');
     const gw   = giveaways[gwId];
-    if (!gw)       return interaction.reply({ content: 'No encontre ese giveaway.', ephemeral: true });
-    if (gw.ended)  return interaction.reply({ content: 'Ese giveaway ya termino.', ephemeral: true });
+    if (!gw)       return interaction.reply({ content: 'No encontre ese giveaway.', flags: MessageFlags.Ephemeral });
+    if (gw.ended)  return interaction.reply({ content: 'Ese giveaway ya termino.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     await endGiveaway(gwId);
     await interaction.editReply('Giveaway terminado manualmente.');
@@ -1941,7 +1927,7 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'greroll') {
     const gwId = interaction.options.getString('mensaje_id');
     const gw   = giveaways[gwId];
-    if (!gw) return interaction.reply({ content: 'No encontre ese giveaway.', ephemeral: true });
+    if (!gw) return interaction.reply({ content: 'No encontre ese giveaway.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     let msg;
     try { msg = await interaction.channel.messages.fetch(gwId); } catch { return interaction.editReply('No pude obtener el mensaje del giveaway.'); }
@@ -1963,8 +1949,8 @@ client.on('interactionCreate', async interaction => {
     const durStr = interaction.options.getString('duracion');
     const text   = interaction.options.getString('texto');
     const secs   = parseDuration(durStr);
-    if (!secs || secs < 10)          return interaction.reply({ content: 'Duracion minima: 10 segundos.', ephemeral: true });
-    if (secs > 30 * 24 * 3600)       return interaction.reply({ content: 'Maximo 30 dias.', ephemeral: true });
+    if (!secs || secs < 10)          return interaction.reply({ content: 'Duracion minima: 10 segundos.', flags: MessageFlags.Ephemeral });
+    if (secs > 30 * 24 * 3600)       return interaction.reply({ content: 'Maximo 30 dias.', flags: MessageFlags.Ephemeral });
 
     const entry = {
       id:      `${user.id}-${Date.now()}`,
@@ -1978,34 +1964,34 @@ client.on('interactionCreate', async interaction => {
 
     const embed = simpleEmbed('Recordatorio Creado',
       `Te recordare: **${text}**\nEn: **${formatDuration(secs)}** (<t:${Math.floor(entry.endTime/1000)}:R>)`);
-    return interaction.reply({ embeds: [embed], ephemeral: true });
+    return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
   }
 
   // ── REMINDERS ──
   if (commandName === 'reminders') {
     const mine = reminders.filter(r => r.userId === user.id && r.endTime > Date.now());
-    if (!mine.length) return interaction.reply({ content: 'No tienes recordatorios activos.', ephemeral: true });
+    if (!mine.length) return interaction.reply({ content: 'No tienes recordatorios activos.', flags: MessageFlags.Ephemeral });
     const lines = mine.map(r => `- **ID:** \`${r.id.slice(-8)}\` - ${r.text} (<t:${Math.floor(r.endTime/1000)}:R>)`);
-    return interaction.reply({ embeds: [simpleEmbed('Tus Recordatorios', lines.join('\n'))], ephemeral: true });
+    return interaction.reply({ embeds: [simpleEmbed('Tus Recordatorios', lines.join('\n'))], flags: MessageFlags.Ephemeral });
   }
 
   // ── REMINDCANCEL ──
   if (commandName === 'remindcancel') {
     const idFrag = interaction.options.getString('id');
     const idx    = reminders.findIndex(r => r.userId === user.id && r.id.endsWith(idFrag));
-    if (idx === -1) return interaction.reply({ content: 'No encontre ese recordatorio.', ephemeral: true });
+    if (idx === -1) return interaction.reply({ content: 'No encontre ese recordatorio.', flags: MessageFlags.Ephemeral });
     reminders.splice(idx, 1);
     saveJSON(REMIND_FILE, reminders);
-    return interaction.reply({ content: 'Recordatorio cancelado.', ephemeral: true });
+    return interaction.reply({ content: 'Recordatorio cancelado.', flags: MessageFlags.Ephemeral });
   }
 
   // ── WARN ──
   if (commandName === 'warn') {
     if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers))
-      return interaction.reply({ content: 'No tienes permisos.', ephemeral: true });
+      return interaction.reply({ content: 'No tienes permisos.', flags: MessageFlags.Ephemeral });
     const target = interaction.options.getMember('usuario');
     const reason = interaction.options.getString('razon');
-    if (!target) return interaction.reply({ content: 'Usuario no encontrado.', ephemeral: true });
+    if (!target) return interaction.reply({ content: 'Usuario no encontrado.', flags: MessageFlags.Ephemeral });
     const { total } = addWarning(guild.id, target.id, reason, user.id);
     try { await target.send(`Advertencia en **${guild.name}**.\nRazon: ${reason}\nTotal: **${total}**`); } catch (_) {}
     await interaction.reply({ embeds: [simpleEmbed('Advertencia', `${target} advertido. Total acumuladas: **${total}**`, 0xf39c12)] });
@@ -2018,17 +2004,17 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'warns') {
     const target = interaction.options.getMember('usuario');
     const warns  = getWarnings(guild.id, target.id);
-    if (!warns.length) return interaction.reply({ content: `${target} no tiene advertencias.`, ephemeral: true });
+    if (!warns.length) return interaction.reply({ content: `${target} no tiene advertencias.`, flags: MessageFlags.Ephemeral });
     const lines = warns.map((w, i) =>
       `**${i + 1}.** ${w.reason} - <t:${Math.floor(new Date(w.timestamp)/1000)}:R> (por <@${w.moderatorId}>)`
     );
-    return interaction.reply({ embeds: [simpleEmbed(`Warns de ${target.displayName}`, lines.join('\n'), 0xf39c12)], ephemeral: true });
+    return interaction.reply({ embeds: [simpleEmbed(`Warns de ${target.displayName}`, lines.join('\n'), 0xf39c12)], flags: MessageFlags.Ephemeral });
   }
 
   // ── CLEARWARNS ──
   if (commandName === 'clearwarns') {
     if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers))
-      return interaction.reply({ content: 'No tienes permisos.', ephemeral: true });
+      return interaction.reply({ content: 'No tienes permisos.', flags: MessageFlags.Ephemeral });
     const target = interaction.options.getMember('usuario');
     clearWarnings(guild.id, target.id);
     return interaction.reply({ embeds: [simpleEmbed('Advertencias Limpiadas', `Se borraron todas las advertencias de ${target}.`, 0x2ecc71)] });
@@ -2037,7 +2023,7 @@ client.on('interactionCreate', async interaction => {
   // ── SETMODLOG ──
   if (commandName === 'setmodlog') {
     if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
-      return interaction.reply({ content: 'Necesitas el permiso Manage Server.', ephemeral: true });
+      return interaction.reply({ content: 'Necesitas el permiso Manage Server.', flags: MessageFlags.Ephemeral });
     const ch = interaction.options.getChannel('canal');
     modlogMap[guild.id] = ch.id;
     saveJSON(MODLOG_FILE, modlogMap);
@@ -2051,12 +2037,12 @@ client.on('interactionCreate', async interaction => {
     const durStr  = interaction.options.getString('duracion');
     const reason  = interaction.options.getString('razon') || 'Orden de Jarvis';
     const secs    = parseDuration(durStr);
-    if (!secs || secs <= 0 || secs > 86400) return interaction.reply({ content: 'Duracion invalida (1s - 24h).', ephemeral: true });
-    if (!channel.isVoiceBased())            return interaction.reply({ content: 'Selecciona un canal de voz.', ephemeral: true });
-    if (target.id === user.id || target.id === client.user.id) return interaction.reply({ content: 'No puedes hacer eso.', ephemeral: true });
+    if (!secs || secs <= 0 || secs > 86400) return interaction.reply({ content: 'Duracion invalida (1s - 24h).', flags: MessageFlags.Ephemeral });
+    if (!channel.isVoiceBased())            return interaction.reply({ content: 'Selecciona un canal de voz.', flags: MessageFlags.Ephemeral });
+    if (target.id === user.id || target.id === client.user.id) return interaction.reply({ content: 'No puedes hacer eso.', flags: MessageFlags.Ephemeral });
     const me = guild.members.me;
     if (me && me.roles.highest.comparePositionTo(target.roles.highest) <= 0 && user.id !== guild.ownerId)
-      return interaction.reply({ content: 'No puedes jailear a alguien con rol igual o superior.', ephemeral: true });
+      return interaction.reply({ content: 'No puedes jailear a alguien con rol igual o superior.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     try {
       const entry = new VoiceJailEntry(target.id, guild.id, channel.id, secs, user.id);
@@ -2095,7 +2081,7 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'voicejailremove') {
     const target = interaction.options.getMember('usuario');
     const entry  = getJailEntry(guild.id, target.id);
-    if (!entry) return interaction.reply({ content: `${target} no esta en voice jail.`, ephemeral: true });
+    if (!entry) return interaction.reply({ content: `${target} no esta en voice jail.`, flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     try {
       if (entry.originalRoles.length) await target.roles.set(entry.originalRoles, 'Liberado de voice jail').catch(() => {});
@@ -2110,7 +2096,7 @@ client.on('interactionCreate', async interaction => {
   // ── VOICEJAILCLEAR ──
   if (commandName === 'voicejailclear') {
     const entries = [...voiceJailTracker.values()].filter(e => e.guildId === guild.id && e.isActive);
-    if (!entries.length) return interaction.reply({ content: 'No hay usuarios en voice jail.', ephemeral: true });
+    if (!entries.length) return interaction.reply({ content: 'No hay usuarios en voice jail.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     for (const e of entries) removeJailEntry(guild.id, e.userId);
     await interaction.editReply({ embeds: [simpleEmbed('Voice Jail Limpiado', `Se liberaron **${entries.length}** usuario(s).`, 0x2ecc71)] });
@@ -2124,7 +2110,7 @@ client.on('interactionCreate', async interaction => {
     const invited = new Set([author, ...users]);
     const botM    = guild.members.me;
     if (!botM?.permissions.has(PermissionFlagsBits.ManageChannels))
-      return interaction.reply({ content: 'No tengo permisos de Manage Channels.', ephemeral: true });
+      return interaction.reply({ content: 'No tengo permisos de Manage Channels.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     const overwrites = [
       { id: guild.id, deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect] },
@@ -2145,13 +2131,13 @@ client.on('interactionCreate', async interaction => {
   // ── QUEDAR_CANAL_VC ──
   if (commandName === 'quedar_canal_vc') {
     if (user.id !== OWNER_ID)
-      return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', ephemeral: true });
+      return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', flags: MessageFlags.Ephemeral });
 
     const ch = interaction.options.getChannel('canal');
     if (!ch?.isVoiceBased())
-      return interaction.reply({ content: 'El canal debe ser de voz.', ephemeral: true });
+      return interaction.reply({ content: 'El canal debe ser de voz.', flags: MessageFlags.Ephemeral });
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     let joinVoiceChannel, entersState, VoiceConnectionStatus;
     try {
@@ -2185,11 +2171,11 @@ client.on('interactionCreate', async interaction => {
   // ── DESACTIVAR_CANAL_VC ──
   if (commandName === 'desactivar_canal_vc') {
     if (user.id !== OWNER_ID)
-      return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', ephemeral: true });
+      return interaction.reply({ content: 'Solo el owner del bot puede usar este comando.', flags: MessageFlags.Ephemeral });
 
     const sticky = stickyVC[guild.id];
     if (!sticky?.enabled)
-      return interaction.reply({ content: 'No hay ningun canal fijo de voz activo en este servidor.', ephemeral: true });
+      return interaction.reply({ content: 'No hay ningun canal fijo de voz activo en este servidor.', flags: MessageFlags.Ephemeral });
 
     stickyVC[guild.id] = { channelId: null, enabled: false };
     saveJSON(STICKY_FILE, stickyVC);
@@ -2205,7 +2191,7 @@ client.on('interactionCreate', async interaction => {
       } catch (_) {}
     }
 
-    return interaction.reply({ content: 'Canal fijo desactivado. El bot se ha desconectado y no volvera automaticamente.', ephemeral: true });
+    return interaction.reply({ content: 'Canal fijo desactivado. El bot se ha desconectado y no volvera automaticamente.', flags: MessageFlags.Ephemeral });
   }
 });
 
