@@ -40,7 +40,6 @@ const WARNS_FILE  = path.join(DATA_DIR, 'warnings.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-
 function loadJSON(file, def = {}) {
   try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : def; }
   catch { return def; }
@@ -497,15 +496,16 @@ function removeJailEntry(gId, uId)  {
   const t = voiceJailTasks.get(key);
   if (t) { clearTimeout(t); voiceJailTasks.delete(key); }
 }
+
 async function monitorVoiceJail(entry) {
   const task = setTimeout(async () => {
     voiceJailTasks.delete(jailKey(entry.guildId, entry.userId));
     const cur = getJailEntry(entry.guildId, entry.userId);
     if (!cur || !cur.isActive) return;
     const guild  = client.guilds.cache.get(entry.guildId);
-    const member = guild?.members.cache.get(entry.userId);
+    const member = guild?.members.cache.get(entry.userId) || await guild?.members.fetch(entry.userId).catch(() => null);
     if (member && entry.originalRoles.length) {
-      try { await member.roles.set(entry.originalRoles, 'Voice jail expirado'); } catch (_) {}
+      try { await member.roles.set(entry.originalRoles, '[VoiceJail] Roles restaurados al expirar'); } catch (_) {}
     }
     removeJailEntry(entry.guildId, entry.userId);
   }, entry.remainingSeconds() * 1000);
@@ -1635,9 +1635,37 @@ client.on('messageCreate', async message => {
   } catch (err) { console.error('[messageCreate]', err); }
 });
 
+// ============================================================================
+// VOICE STATE UPDATE — VOICE JAIL ENFORCEMENT
+// ============================================================================
 client.on('voiceStateUpdate', async (oldState, newState) => {
-  const guild     = oldState.guild || newState.guild;
-  const botId     = client.user?.id;
+  const guild  = oldState.guild || newState.guild;
+  const userId = newState.id || oldState.id;
+
+  const entry = getJailEntry(guild.id, userId);
+  if (!entry || !entry.isActive || entry.isExpired()) return;
+
+  const jailChannel = guild.channels.cache.get(entry.channelId);
+  if (!jailChannel) return;
+
+  // Si ya está en el canal correcto, no hacer nada
+  if (newState.channelId === entry.channelId) return;
+
+  // Se desconectó (newState.channelId es null) o se movió a otro canal
+  const member = guild.members.cache.get(userId) || await guild.members.fetch(userId).catch(() => null);
+  if (!member) return;
+
+  // Pequeño delay para evitar race conditions con Discord
+  setTimeout(async () => {
+    try {
+      // Verificar que sigue jailado y que el entry sigue activo
+      const cur = getJailEntry(guild.id, userId);
+      if (!cur || !cur.isActive || cur.isExpired()) return;
+      await member.voice.setChannel(jailChannel, '[VoiceJail] Retornado al canal de confinamiento');
+    } catch (_) {
+      // Si falla (por ejemplo se desconectó completamente), no hacer nada
+    }
+  }, 500);
 });
 
 client.on('guildMemberUpdate', async (before, after) => {
@@ -1758,6 +1786,7 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('voicejailclear').setDescription('Liberar a todos los usuarios del voice jail'),
+
   new SlashCommandBuilder()
     .setName('mix').setDescription('Crear un canal de voz privado')
     .addUserOption(o => o.setName('user1').setDescription('Miembro 1'))
@@ -1991,14 +2020,21 @@ client.on('interactionCreate', async interaction => {
     const me = guild.members.me;
     if (me && me.roles.highest.comparePositionTo(target.roles.highest) <= 0 && user.id !== guild.ownerId)
       return interaction.reply({ content: 'No puedes jailear a alguien con rol igual o superior.', flags: MessageFlags.Ephemeral });
+
     await interaction.deferReply();
     try {
       const entry = new VoiceJailEntry(target.id, guild.id, channel.id, secs, user.id);
       entry.originalRoles = target.roles.cache.filter(r => r.name !== '@everyone').map(r => r);
-      try { await target.roles.set([], `Voice jail por ${user.tag}`); } catch (_) {}
-      if (target.voice?.channel) await target.voice.setChannel(channel, `Voice jail por ${user.tag}`).catch(() => {});
+
+      // Registrar la entry ANTES de mover para que voiceStateUpdate ya la encuentre
       addJailEntry(entry);
       await monitorVoiceJail(entry);
+
+      // Mover al canal jail si ya está en voz
+      if (target.voice?.channel) {
+        await target.voice.setChannel(channel, `[VoiceJail] por ${user.tag}`).catch(() => {});
+      }
+
       const embed = simpleEmbed('Voice Jail Activado',
         `**Usuario:** ${target}\n**Canal:** ${channel}\n**Duracion:** ${durStr}\n**Expira:** <t:${Math.floor(entry.endTime/1000)}:R>`,
         0xe74c3c);
@@ -2032,9 +2068,12 @@ client.on('interactionCreate', async interaction => {
     if (!entry) return interaction.reply({ content: `${target} no esta en voice jail.`, flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     try {
-      if (entry.originalRoles.length) await target.roles.set(entry.originalRoles, 'Liberado de voice jail').catch(() => {});
+      // Primero remover la entry para que voiceStateUpdate no lo regrese
       removeJailEntry(guild.id, target.id);
-      const embed = simpleEmbed('Voice Jail Liberado', `**${target}** liberado y roles restaurados.`, 0x2ecc71);
+      if (entry.originalRoles.length) {
+        try { await target.roles.set(entry.originalRoles, '[VoiceJail] Roles restaurados al liberar'); } catch (_) {}
+      }
+      const embed = simpleEmbed('Voice Jail Liberado', `**${target}** ha sido liberado del voice jail y sus roles han sido restaurados.`, 0x2ecc71);
       embed.setFooter({ text: `Liberado por ${user.tag}` });
       await interaction.editReply({ embeds: [embed] });
     } catch (err) { await interaction.editReply(`Error: ${err.message}`); }
