@@ -31,12 +31,13 @@ const JARVIS_WHITELIST = new Set(
 // ============================================================================
 // PERSISTENCE
 // ============================================================================
-const DATA_DIR    = path.join(__dirname, 'data');
-const XP_FILE     = path.join(DATA_DIR, 'xp.json');
-const GW_FILE     = path.join(DATA_DIR, 'giveaways.json');
-const REMIND_FILE = path.join(DATA_DIR, 'reminders.json');
-const MODLOG_FILE = path.join(DATA_DIR, 'modlog_channels.json');
-const WARNS_FILE  = path.join(DATA_DIR, 'warnings.json');
+const DATA_DIR        = path.join(__dirname, 'data');
+const XP_FILE         = path.join(DATA_DIR, 'xp.json');
+const GW_FILE         = path.join(DATA_DIR, 'giveaways.json');
+const REMIND_FILE     = path.join(DATA_DIR, 'reminders.json');
+const MODLOG_FILE     = path.join(DATA_DIR, 'modlog_channels.json');
+const WARNS_FILE      = path.join(DATA_DIR, 'warnings.json');
+const XPCHANNELS_FILE = path.join(DATA_DIR, 'xp_channels.json');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -54,6 +55,7 @@ let giveaways    = loadJSON(GW_FILE, {});
 let reminders    = loadJSON(REMIND_FILE, []);
 let modlogMap    = loadJSON(MODLOG_FILE, {});
 let warningsData = loadJSON(WARNS_FILE, {});
+let xpChannels   = loadJSON(XPCHANNELS_FILE, {}); // { guildId: channelId | 'all' }
 
 // ============================================================================
 // AUTO-RESPONSES
@@ -97,8 +99,15 @@ function getXpUser(guildId, userId) {
 
 async function addXp(message) {
   if (message.author.bot || !message.guild) return;
-  const uid = message.author.id;
   const gid = message.guild.id;
+
+  // Si no hay canal configurado, el XP está desactivado en todo el servidor
+  const activatedChannel = xpChannels[gid];
+  if (!activatedChannel) return;
+  // Si hay canal configurado, solo funciona en ese canal (salvo que sea 'all')
+  if (activatedChannel !== 'all' && message.channel.id !== activatedChannel) return;
+
+  const uid = message.author.id;
   const key = `${gid}-${uid}`;
   const now = Date.now();
   if (XP_COOLDOWN_MAP.has(key) && now - XP_COOLDOWN_MAP.get(key) < XP_COOLDOWN_MS) return;
@@ -844,7 +853,7 @@ async function handleJarvisCommands(message, text, guild) {
       { name: 'Encuestas',     value: '`/poll` — Crear encuesta con botones', inline: false },
       { name: 'Giveaways',     value: '`/giveaway` `/gend` `/greroll`', inline: false },
       { name: 'Recordatorios', value: '`/remind` `/reminders` `/remindcancel`', inline: false },
-      { name: 'Niveles / XP',  value: '`/rank` `/leaderboard`', inline: false },
+      { name: 'Niveles / XP',  value: '`/rank` `/leaderboard` `/setxpchannel`\n`>>nivel @user <nivel>` — Asignar nivel (solo owner)', inline: false },
       { name: 'Mod Log',       value: '`/setmodlog` `/warns` `/clearwarns`', inline: false },
       { name: 'Canal',         value: '`jarvis borra 50 mensajes`\n`jarvis pon slowmode 5s`\n`jarvis bloquea el canal`', inline: false },
       { name: 'Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`', inline: false },
@@ -1073,10 +1082,7 @@ async function handleJarvisCommands(message, text, guild) {
 
   // JOIN SERVER
   if (/^(?:join|entra|vuelve|regresa)\b/i.test(norm)) {
-    const targetGuild = args?.[0] ? client.guilds.cache.get(args[0]) : guild;
-    if (!targetGuild) { await message.reply('No encuentro ese servidor.'); return true; }
-    // El bot ya está en el servidor si puede recibir el mensaje
-    await message.reply({ embeds: [simpleEmbed('Ya estoy aquí', `Ya estoy en **${targetGuild.name}**. Si me salí, necesitas invitarme de nuevo con el link de invitación.`, 0x3498db)] });
+    await message.reply({ embeds: [simpleEmbed('Ya estoy aqui', `Ya estoy en **${guild.name}**. Si me sali, necesitas invitarme de nuevo con el link de invitacion.`, 0x3498db)] });
     return true;
   }
 
@@ -1276,6 +1282,30 @@ async function handleCommand(message) {
   if (!message.content.startsWith(PREFIX) || message.author.bot) return;
   const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
   const cmd  = args.shift().toLowerCase();
+
+  // ── NIVEL (owner only) ──
+  if (cmd === 'nivel') {
+    if (message.author.id !== OWNER_ID) return message.reply('Solo el owner puede usar este comando.');
+    const target   = message.mentions.members.first();
+    const newLevel = parseInt(args[1]);
+    if (!target) return message.reply('Menciona al usuario. Ej: `>>nivel @usuario 5`');
+    if (isNaN(newLevel) || newLevel < 0 || newLevel > 500)
+      return message.reply('Nivel invalido. Usa un numero entre 0 y 500.');
+    const gid      = message.guild.id;
+    const userData = getXpUser(gid, target.id);
+    const oldLevel = userData.level;
+    userData.xp    = xpForLevel(newLevel);
+    userData.level = newLevel;
+    saveJSON(XP_FILE, xpData);
+    const embed = simpleEmbed(
+      'Nivel Asignado',
+      `**${target.displayName}** ahora es nivel **${newLevel}** (antes: ${oldLevel}).\nXP establecido a \`${userData.xp}\`.`,
+      0xf1c40f,
+    );
+    embed.setThumbnail(target.displayAvatarURL());
+    embed.setFooter({ text: `Asignado por ${message.author.tag}` });
+    return message.reply({ embeds: [embed] });
+  }
 
   // PING
   if (cmd === 'ping') {
@@ -1600,9 +1630,9 @@ async function handleCommand(message) {
       .addFields(
         { name: 'Moderacion',    value: '`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline: false },
         { name: 'Utilidades',    value: '`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline: false },
-        { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/mix`', inline: false },
+        { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/mix`', inline: false },
       );
-    if (isOwner) embed.addFields({ name: 'Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`', inline: false });
+    if (isOwner) embed.addFields({ name: 'Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente', inline: false });
     return message.reply({ embeds: [embed] });
   }
 }
@@ -1660,12 +1690,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   const jailChannel = guild.channels.cache.get(entry.channelId);
   if (!jailChannel) return;
 
-  // Si ya está en el canal correcto, no hacer nada
   if (newState.channelId === entry.channelId) return;
-
-  // Se conectó a otro canal, se movió, o se reconectó — regresarlo al jail
-  // newState.channelId === null significa que se desconectó completamente,
-  // en ese caso no podemos moverlo hasta que vuelva a conectarse
   if (!newState.channelId) return;
 
   const member = newState.member || guild.members.cache.get(userId) || await guild.members.fetch(userId).catch(() => null);
@@ -1727,6 +1752,11 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('leaderboard').setDescription('Top 10 de XP del servidor'),
+
+  new SlashCommandBuilder()
+    .setName('setxpchannel').setDescription('Configurar el canal donde se gana XP (requiere Manage Server)')
+    .addChannelOption(o => o.setName('canal').setDescription('Canal de texto donde se gana XP (omitir = todos los canales)'))
+    .addBooleanOption(o => o.setName('desactivar').setDescription('Desactivar el sistema de XP completamente')),
 
   new SlashCommandBuilder()
     .setName('poll').setDescription('Crear una encuesta con reacciones')
@@ -1841,6 +1871,11 @@ client.on('interactionCreate', async interaction => {
     const sorted   = Object.entries(xpData[gid] || {}).sort((a, b) => b[1].xp - a[1].xp);
     const rank     = sorted.findIndex(([id]) => id === target.id) + 1;
 
+    // Estado del sistema XP en este servidor
+    const xpStatus = xpChannels[gid]
+      ? xpChannels[gid] === 'all' ? 'Activo en todos los canales' : `Activo en <#${xpChannels[gid]}>`
+      : 'Desactivado';
+
     const embed = new EmbedBuilder()
       .setColor(0xf1c40f)
       .setTitle(`Nivel de ${target.displayName}`)
@@ -1850,6 +1885,7 @@ client.on('interactionCreate', async interaction => {
         { name: 'Nivel',          value: `${level}`, inline: true },
         { name: 'XP Total',       value: `${userData.xp}`, inline: true },
         { name: 'Mensajes',       value: `${userData.messages}`, inline: true },
+        { name: 'Sistema XP',     value: xpStatus, inline: true },
         { name: `Progreso al nivel ${level + 1}`, value: `\`${bar}\` ${prog}/${need} XP`, inline: false },
       )
       .setTimestamp();
@@ -1869,6 +1905,52 @@ client.on('interactionCreate', async interaction => {
     });
     return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xf1c40f)
       .setTitle(`Leaderboard - ${guild.name}`).setDescription(lines.join('\n')).setTimestamp()] });
+  }
+
+  // ── SETXPCHANNEL ──
+  if (commandName === 'setxpchannel') {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return interaction.reply({ content: 'Necesitas el permiso **Manage Server** para usar este comando.', flags: MessageFlags.Ephemeral });
+
+    const desactivar = interaction.options.getBoolean('desactivar');
+    const canal      = interaction.options.getChannel('canal');
+
+    if (desactivar) {
+      delete xpChannels[guild.id];
+      saveJSON(XPCHANNELS_FILE, xpChannels);
+      return interaction.reply({
+        embeds: [simpleEmbed(
+          'Sistema XP Desactivado',
+          'El sistema de niveles y XP ha sido **desactivado** en este servidor.\nNadie ganara XP hasta que se vuelva a activar con `/setxpchannel`.',
+          0xe74c3c,
+        )],
+      });
+    }
+
+    if (canal) {
+      if (canal.type !== ChannelType.GuildText)
+        return interaction.reply({ content: 'Selecciona un canal de **texto**.', flags: MessageFlags.Ephemeral });
+      xpChannels[guild.id] = canal.id;
+      saveJSON(XPCHANNELS_FILE, xpChannels);
+      return interaction.reply({
+        embeds: [simpleEmbed(
+          'Canal XP Configurado',
+          `Los mensajes en ${canal} daran XP a los usuarios.\nEn cualquier otro canal **no** se acumulara experiencia.`,
+          0x2ecc71,
+        )],
+      });
+    }
+
+    // Sin opciones = activar en todos los canales
+    xpChannels[guild.id] = 'all';
+    saveJSON(XPCHANNELS_FILE, xpChannels);
+    return interaction.reply({
+      embeds: [simpleEmbed(
+        'XP Activado en Todos los Canales',
+        'Los mensajes en **cualquier canal** del servidor daran XP.\nPuedes restringirlo a un canal especifico usando `/setxpchannel canal:#nombre`.',
+        0x2ecc71,
+      )],
+    });
   }
 
   // ── POLL ──
@@ -2039,22 +2121,21 @@ client.on('interactionCreate', async interaction => {
       const entry = new VoiceJailEntry(target.id, guild.id, channel.id, secs, user.id);
       entry.originalRoles = [];
 
-      // Registrar la entry ANTES de mover para que voiceStateUpdate ya la encuentre
       addJailEntry(entry);
       await monitorVoiceJail(entry);
-
-      // Mover al canal jail si ya está en voz, si no avisar
-      if (target.voice?.channel) {
-        await target.voice.setChannel(channel, `[VoiceJail] por ${user.tag}`).catch(() => {});
-      } else {
-        embed.addFields({ name: 'Aviso', value: 'El usuario no está en voz ahora. Cuando se conecte será movido automáticamente.' });
-      }
 
       const embed = simpleEmbed('Voice Jail Activado',
         `**Usuario:** ${target}\n**Canal:** ${channel}\n**Duracion:** ${durStr}\n**Expira:** <t:${Math.floor(entry.endTime/1000)}:R>`,
         0xe74c3c);
       embed.addFields({ name: 'Razon', value: reason });
       embed.setFooter({ text: `Confinado por ${user.tag}` });
+
+      if (target.voice?.channel) {
+        await target.voice.setChannel(channel, `[VoiceJail] por ${user.tag}`).catch(() => {});
+      } else {
+        embed.addFields({ name: 'Aviso', value: 'El usuario no esta en voz ahora. Cuando se conecte sera movido automaticamente.' });
+      }
+
       await interaction.editReply({ embeds: [embed] });
     } catch (err) { await interaction.editReply(`Error: ${err.message}`); }
     return;
