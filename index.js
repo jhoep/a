@@ -101,10 +101,8 @@ async function addXp(message) {
   if (message.author.bot || !message.guild) return;
   const gid = message.guild.id;
 
-  // Si no hay canal configurado, el XP está desactivado en todo el servidor
   const activatedChannel = xpChannels[gid];
   if (!activatedChannel) return;
-  // Si hay canal configurado, solo funciona en ese canal (salvo que sea 'all')
   if (activatedChannel !== 'all' && message.channel.id !== activatedChannel) return;
 
   const uid = message.author.id;
@@ -527,6 +525,7 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildPresences,
   ],
 });
 
@@ -569,33 +568,92 @@ function simpleEmbed(title, description, color = 0x3498db) {
 }
 
 // ============================================================================
-// MEMBER / ROLE RESOLVER
+// NORMALIZAR TEXTO (quita tildes y caracteres especiales para comparación)
+// ============================================================================
+function normalizeForCompare(str) {
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')  // quita tildes
+    .replace(/[^a-z0-9_\s]/g, '')
+    .trim();
+}
+
+// Similitud de cadenas (Levenshtein simplificado)
+function stringSimilarity(a, b) {
+  a = normalizeForCompare(a);
+  b = normalizeForCompare(b);
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return 0.9;
+  const longer  = a.length > b.length ? a : b;
+  const shorter = a.length > b.length ? b : a;
+  if (longer.length === 0) return 1;
+  // Caracteres coincidentes
+  let matches = 0;
+  for (const ch of shorter) if (longer.includes(ch)) matches++;
+  return matches / longer.length;
+}
+
+// ============================================================================
+// MEMBER / ROLE RESOLVER — MEJORADO
 // ============================================================================
 async function resolveGuildMember(guild, text) {
   if (!text) return null;
+  text = text.trim();
+
+  // 1. Por mención directa <@123>
   const mentionMatch = text.match(/<@!?(\d+)>/);
   if (mentionMatch) {
     const uid = mentionMatch[1];
     return guild.members.cache.get(uid) || await guild.members.fetch(uid).catch(() => null);
   }
-  const idMatch = text.match(/\b(\d{17,20})\b/);
+
+  // 2. Por ID numérico puro
+  const idMatch = text.match(/^\d{17,20}$/);
   if (idMatch) {
-    const uid = idMatch[1];
-    return guild.members.cache.get(uid) || await guild.members.fetch(uid).catch(() => null);
+    return guild.members.cache.get(text) || await guild.members.fetch(text).catch(() => null);
   }
-  const words = text.split(/\s+/);
-  for (const word of words) {
-    const clean = word.replace(/[^\w]/g, '').toLowerCase();
-    if (clean.length < 2) continue;
-    const exact  = guild.members.cache.find(m => m.displayName.toLowerCase() === clean || m.user.username.toLowerCase() === clean);
-    if (exact) return exact;
-    const starts = guild.members.cache.find(m => m.displayName.toLowerCase().startsWith(clean) || m.user.username.toLowerCase().startsWith(clean));
-    if (starts) return starts;
+
+  // Asegurarse de que el caché esté actualizado
+  if (guild.members.cache.size < 2) {
+    await guild.members.fetch().catch(() => {});
   }
-  const lower = text.toLowerCase();
-  return guild.members.cache.find(m =>
-    lower.includes(m.displayName.toLowerCase()) || lower.includes(m.user.username.toLowerCase()),
-  ) || null;
+
+  const normText = normalizeForCompare(text);
+
+  // 3. Coincidencia exacta (nombre o displayName)
+  for (const member of guild.members.cache.values()) {
+    if (
+      normalizeForCompare(member.user.username) === normText ||
+      normalizeForCompare(member.displayName)   === normText
+    ) return member;
+  }
+
+  // 4. Starts-with match
+  for (const member of guild.members.cache.values()) {
+    if (
+      normalizeForCompare(member.user.username).startsWith(normText) ||
+      normalizeForCompare(member.displayName).startsWith(normText)
+    ) return member;
+  }
+
+  // 5. Contains match
+  for (const member of guild.members.cache.values()) {
+    if (
+      normalizeForCompare(member.user.username).includes(normText) ||
+      normalizeForCompare(member.displayName).includes(normText)
+    ) return member;
+  }
+
+  // 6. Fuzzy match — el más parecido con score >= 0.5
+  let best = null, bestScore = 0;
+  for (const member of guild.members.cache.values()) {
+    const scoreUser    = stringSimilarity(normText, member.user.username);
+    const scoreDisplay = stringSimilarity(normText, member.displayName);
+    const score        = Math.max(scoreUser, scoreDisplay);
+    if (score > bestScore) { bestScore = score; best = member; }
+  }
+  return bestScore >= 0.5 ? best : null;
 }
 
 function resolveRole(guild, roleName) {
@@ -787,21 +845,49 @@ function normalizeText(t) {
     .trim();
 }
 
+// ============================================================================
+// PARSE NICK COMMAND — MEJORADO
+// Casos soportados:
+//   jarvis cambiale el nombre a @mention NuevoNick
+//   jarvis cambia el nick de @mention a NuevoNick
+//   jarvis ponle de apodo @mention NuevoNick
+//   jarvis cambia el nick de NombreUsuario a NuevoNick
+// ============================================================================
 function parseNickCommand(text) {
+  // Caso 1: hay mención en el texto
   const mentionMatch = text.match(/<@!?(\d+)>/);
   if (mentionMatch) {
-    const mention = mentionMatch[0];
-    const after = text.slice(text.indexOf(mention) + mention.length).trim();
-    const nickMatch = after.match(/^(?:a|por|como|se\s*llame|que\s*se\s*llame)\s+(.+)/i);
-    if (nickMatch) return { userStr: mention, nick: nickMatch[1].trim() };
-    const before = text.slice(0, text.indexOf(mention)).trim();
-    const beforeNick = before.match(/(?:nick|nombre|apodo|nickname)?\s*(?:de\s+)?(?:a\s+)?(.+?)(?:\s+a\s*)?$/i);
-    if (beforeNick && beforeNick[1] && !/<@/.test(beforeNick[1])) {
-      const n = beforeNick[1].replace(/^(?:el|la|un|una|de|a)\s+/i, '').trim();
-      if (n.length > 0) return { userStr: mention, nick: n };
+    const mention    = mentionMatch[0];
+    const mentionIdx = text.indexOf(mention);
+    const before     = text.slice(0, mentionIdx).trim();
+    const after      = text.slice(mentionIdx + mention.length).trim();
+
+    // El nick está después de la mención (posiblemente con "a", "por", ":", etc.)
+    if (after.length > 0) {
+      const nickRaw = after.replace(/^(?:a|por|como|se\s*llame|que\s*se\s*llame|:|\s)+/i, '').trim();
+      if (nickRaw.length > 0) return { userStr: mention, nick: nickRaw };
     }
-    if (after.length > 0) return { userStr: mention, nick: after };
+
+    // El nick está antes de la mención (raro pero posible)
+    if (before.length > 0) {
+      const nickRaw = before
+        .replace(/^.*(?:nick|nombre|apodo|nickname)\s+(?:de\s+)?(?:a\s+)?/i, '')
+        .replace(/\s+(?:a|por|como)\s*$/i, '')
+        .trim();
+      if (nickRaw.length > 0 && !/<@/.test(nickRaw)) return { userStr: mention, nick: nickRaw };
+    }
+
+    return null;
   }
+
+  // Caso 2: sin mención — intenta extraer "cambia el nick de NOMBRE a NEWNICK"
+  const noMentionMatch = text.match(
+    /(?:cambia\s+(?:el\s+)?(?:nick|nombre|apodo)(?:\s+de)?\s+)(.+?)\s+(?:a|por|como)\s+(.+)/i,
+  );
+  if (noMentionMatch) {
+    return { userStr: noMentionMatch[1].trim(), nick: noMentionMatch[2].trim() };
+  }
+
   return null;
 }
 
@@ -813,7 +899,7 @@ async function handleJarvisCommands(message, text, guild) {
   const author = message.author;
   const norm   = normalizeText(text);
 
-  // MEMBERS COUNT
+  // ── MEMBERS COUNT ──
   if (/cuantos\s*miembros|cuanta\s*gente|cuantos\s*(somos|hay|estan)|total\s*de\s*miembros|cuantos\s*usuarios|poblacion/i.test(norm)) {
     await guild.members.fetch().catch(() => {});
     const total  = guild.memberCount;
@@ -826,7 +912,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // SERVER INFO
+  // ── SERVER INFO ──
   if (/info(rmacion)?\s*(del\s*)?server|datos?\s*(del\s*)?server|server\s*info|nombre\s*del\s*servidor/i.test(norm)) {
     const g     = guild;
     const embed = simpleEmbed(`Informacion de ${g.name}`, '\u200b');
@@ -845,25 +931,26 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // HELP
+  // ── HELP ──
   if (/ayuda|help|que\s*(puedes|sabes)\s*hacer|comandos|capacidades|funciones/i.test(norm)) {
     const embed = simpleEmbed('Mis Capacidades', 'Mira, te cuento todo lo que puedo hacer:', 0xf1c40f);
     embed.addFields(
       { name: 'Moderacion',    value: '`jarvis banea a @user [razon]`\n`jarvis expulsa a @user`\n`jarvis silencia a @user 10m`\n`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis advierte a @user [razon]`', inline: false },
+      { name: 'Voz',           value: '`jarvis desconecta a @user`\n`jarvis mueve a @user a #canal-voz`', inline: false },
       { name: 'Encuestas',     value: '`/poll` — Crear encuesta con botones', inline: false },
       { name: 'Giveaways',     value: '`/giveaway` `/gend` `/greroll`', inline: false },
       { name: 'Recordatorios', value: '`/remind` `/reminders` `/remindcancel`', inline: false },
       { name: 'Niveles / XP',  value: '`/rank` `/leaderboard` `/setxpchannel`\n`>>nivel @user <nivel>` — Asignar nivel (solo owner)', inline: false },
       { name: 'Mod Log',       value: '`/setmodlog` `/warns` `/clearwarns`', inline: false },
       { name: 'Canal',         value: '`jarvis borra 50 mensajes`\n`jarvis pon slowmode 5s`\n`jarvis bloquea el canal`', inline: false },
-      { name: 'Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`', inline: false },
+      { name: 'Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`\n`jarvis cambia el nick de @user a NuevoNick`', inline: false },
       { name: 'Voice Jail',    value: '`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline: false },
     );
     await message.reply({ embeds: [embed] });
     return true;
   }
 
-  // BAN
+  // ── BAN ──
   const banM = norm.match(/(?:banea?(?:le)?|prohibe|veta|ban\s+(?:a[l]?\s+)?|expulsa\s+permanentemente\s+(?:a[l]?\s+)?)(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|razon|ya\s*que)\s+(.+))?/i);
   if (banM && !/kick|expulsa(?!.*permanen)|timeout|silenci|mute|warn|adviert/.test(norm)) {
     const member = await resolveGuildMember(guild, banM[1]);
@@ -885,7 +972,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // KICK
+  // ── KICK ──
   const kickM = norm.match(/(?:kickea?|kick|expulsa[r]?|sac[ao](?:\s*a)?|echa[r]?(?:\s*a)?|bota[r]?(?:\s*a)?|que\s*se\s*vaya)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque)\s+(.+))?/i);
   if (kickM && !/permanen/.test(norm)) {
     const member = await resolveGuildMember(guild, kickM[1]);
@@ -905,7 +992,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // TIMEOUT
+  // ── TIMEOUT ──
   const toM = norm.match(/(?:silencia[r]?|timeout|mutea?(?:le)?|calla[r]?(?:lo)?|ponle\s*(?:mute|timeout|silencio)|que\s*(?:no\s*hable|se\s*calle)|callate\s+(?:a\s+)?|pon\s+en\s+timeout)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:por\s+|durante\s+)?(\S+)(?:\s+(?:por|porque|razon)\s+(.+))?/i);
   if (toM) {
     const member = await resolveGuildMember(guild, toM[1]);
@@ -931,7 +1018,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // UNTIMEOUT
+  // ── UNTIMEOUT ──
   const utoM = norm.match(/(?:desmutea[r]?|unmute|untimeout|dessilencia[r]?|quita\s*el\s*(?:mute|timeout|silencio)|permite\s*hablar\s*(?:a\s+)?|ya\s*puede\s*hablar)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)/i);
   if (utoM) {
     const member = await resolveGuildMember(guild, utoM[1]);
@@ -944,7 +1031,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // UNBAN
+  // ── UNBAN ──
   const ubanM = norm.match(/(?:desbanea[r]?|unban|quita\s*(?:el\s*)?ban|revoca\s*(?:el\s*)?ban|anula\s*(?:el\s*)?ban|perdona\s*(?:a\s+)?)\s*(?:a[l]?\s+)?(\d{17,20})/i);
   if (ubanM) {
     try {
@@ -957,7 +1044,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // WARN
+  // ── WARN ──
   const warnM = norm.match(/(?:advierte|warn|amonesta|sanciona|ponle\s*(?:una\s*)?advertencia|dale\s*(?:una\s*)?advertencia|reporta)\s+(?:a[l]?\s+)?(<@!?\d+>|\d{17,20}|\S+)(?:\s+(?:por|porque|razon|ya\s*que)?\s+(.+))?/i);
   if (warnM) {
     const member = await resolveGuildMember(guild, warnM[1]);
@@ -974,7 +1061,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // PURGE
+  // ── PURGE ──
   const purgeM = norm.match(/(?:borra[r]?|elimina[r]?|purga[r]?|limpia[r]?|borra\s*los?|elimina\s*los?)\s+(\d+)\s*(?:mensajes?|msgs?|ultimos?)?/i);
   if (purgeM) {
     const amount = Math.min(parseInt(purgeM[1]), 500);
@@ -987,7 +1074,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // SLOWMODE ON
+  // ── SLOWMODE ON ──
   const slowM = norm.match(/(?:pon|activa|configura|set|habilita|sube)\s*(?:el\s*)?(?:slowmode|modo\s*lento|cooldown|slow)[^\d]*(\d+)\s*([smh])?/i);
   if (slowM && !/quita|desactiva|remueve|apaga|saca|para|off|baja/i.test(norm)) {
     const mult  = { s: 1, m: 60, h: 3600 }[(slowM[2] || 's').toLowerCase()] || 1;
@@ -999,7 +1086,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // SLOWMODE OFF
+  // ── SLOWMODE OFF ──
   if (/(?:quita|desactiva|remueve|apaga|saca|para)\s*(?:el\s*)?(?:slowmode|modo\s*lento|cooldown)|slowmode\s*off/i.test(norm)) {
     try {
       await message.channel.edit({ rateLimitPerUser: 0 });
@@ -1008,7 +1095,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // LOCK
+  // ── LOCK ──
   if (/(?:^|\s)(?:bloquea[r]?|lock|cierra|lockea[r]?|tranca[r]?|pon\s*en\s*modo\s*solo\s*lectura)\b/i.test(norm) && !/desbloquea|unlock|abre/i.test(norm)) {
     try {
       await message.channel.permissionOverwrites.edit(guild.id, { SendMessages: false }, { reason: `[Jarvis] por ${author.tag}` });
@@ -1017,7 +1104,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // UNLOCK
+  // ── UNLOCK ──
   if (/(?:desbloquea[r]?|unlock|abre[r]?|unlockea[r]?|destranca[r]?|quita\s*(?:el\s*)?bloqueo)/i.test(norm)) {
     try {
       await message.channel.permissionOverwrites.edit(guild.id, { SendMessages: null }, { reason: `[Jarvis] por ${author.tag}` });
@@ -1026,7 +1113,68 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ROLES LIST
+  // ── DESCONECTAR DE VOZ ──
+  // "jarvis desconecta a @user" | "jarvis saca a @user del canal"
+  const voiceDisconnectM = text.match(
+    /(?:desconecta[r]?|saca[r]?\s*(?:de\s*(?:la\s*)?voz|del?\s*canal\s*de\s*voz)|kickea?\s*de\s*voz|mueve\s*(?:de\s*voz)?|expulsa\s*de\s*voz)\s+(?:a[l]?\s+)?(.+)/i,
+  );
+  if (voiceDisconnectM) {
+    const memberRaw = voiceDisconnectM[1].trim();
+    const member    = await resolveGuildMember(guild, memberRaw);
+    if (!member) { await message.reply(notFound(memberRaw)); return true; }
+    if (!member.voice?.channel) {
+      await message.reply(`${member} no está en ningún canal de voz.`);
+      return true;
+    }
+    try {
+      await member.voice.disconnect(`[Jarvis] Desconectado por ${author.tag}`);
+      await message.reply({ embeds: [simpleEmbed('Desconectado de Voz', `**${member.displayName}** fue expulsado del canal de voz.`, 0xe67e22)] });
+      await sendModLog(guild.id, modLogEmbed('VOICE DISCONNECT', member.user, author, 'Desconectado de voz', 0xe67e22));
+    } catch (e) { await message.reply(`Error: ${e.message}`); }
+    return true;
+  }
+
+  // ── MOVER DE CANAL DE VOZ ──
+  // "jarvis mueve a @user a #canal" | "jarvis mueve a @user al canal General"
+  const voiceMoveM = text.match(
+    /(?:mueve[r]?|pasa[r]?|manda[r]?|pon)\s+(?:a[l]?\s+)?(.+?)\s+(?:a[l]?\s+(?:canal\s+(?:de\s+voz\s+)?)?|para\s+)(<#\d+>|[^\s].+)/i,
+  );
+  if (voiceMoveM) {
+    const memberStr    = voiceMoveM[1].trim();
+    const channelStr   = voiceMoveM[2].trim();
+    const member       = await resolveGuildMember(guild, memberStr);
+
+    // Resolver canal de voz
+    let targetChannel = null;
+    const chanMentionM = channelStr.match(/<#(\d+)>/);
+    if (chanMentionM) {
+      targetChannel = guild.channels.cache.get(chanMentionM[1]);
+    } else {
+      const normChan = normalizeForCompare(channelStr);
+      targetChannel = guild.channels.cache.find(c =>
+        c.isVoiceBased() && normalizeForCompare(c.name).includes(normChan),
+      ) || guild.channels.cache.find(c =>
+        c.isVoiceBased() && normalizeForCompare(c.name).startsWith(normChan),
+      );
+    }
+
+    if (!member) { await message.reply(notFound(memberStr)); return true; }
+    if (!targetChannel || !targetChannel.isVoiceBased()) {
+      await message.reply(`No encontré el canal de voz \`${channelStr}\`.`);
+      return true;
+    }
+    if (!member.voice?.channel) {
+      await message.reply(`${member} no está en ningún canal de voz ahora mismo.`);
+      return true;
+    }
+    try {
+      await member.voice.setChannel(targetChannel, `[Jarvis] Movido por ${author.tag}`);
+      await message.reply({ embeds: [simpleEmbed('Movido de Canal', `**${member.displayName}** fue movido a **${targetChannel.name}**.`, 0x3498db)] });
+    } catch (e) { await message.reply(`Error: ${e.message}`); }
+    return true;
+  }
+
+  // ── ROLES LIST ──
   if (/(?:muestra|lista|ver|cuales\s+son|todos\s*los|dame\s*los?)\s+(?:los\s+)?roles?|(?:los\s+)?roles?\s+(?:del?\s*server(idor)?)?$|que\s*roles?\s*(hay|existen|tiene)/i.test(norm)) {
     const roles = [...guild.roles.cache.values()].filter(r => r.name !== '@everyone').sort((a, b) => b.position - a.position);
     const lines = roles.slice(0, 30).map(r => `${r} — \`${r.id}\``);
@@ -1034,7 +1182,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ROLE REMOVE
+  // ── ROLE REMOVE ──
   const roleRemM = norm.match(/(?:quita[r]?|remueve[r]?|elimina[r]?|saca[r]?|borra[r]?)\s+(?:el\s+)?(?:rol\s+)?(.+?)(?:\s+(?:a[l]?\s+|de\s+)(<@!?\d+>|\d{17,20}|\S+))?$/i);
   if (roleRemM && /rol|role/i.test(norm)) {
     const roleName = roleRemM[1].replace(/\b(?:el|la|los|las|de|del|a|al|rol|role)\b/gi, '').trim();
@@ -1050,7 +1198,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ROLE ADD
+  // ── ROLE ADD ──
   const roleAddM = norm.match(/(?:dame?|anade|asigna[r]?|ponle|dale|otorga[r]?|da[r]?)\s+(?:el\s+)?(?:rol\s+)?(.+?)(?:\s+a[l]?\s+(<@!?\d+>|\d{17,20}|\S+))?$/i);
   if (roleAddM && /rol|role/i.test(norm)) {
     const roleName = roleAddM[1].replace(/\b(?:el|la|los|las|rol|role)\b/gi, '').trim();
@@ -1065,13 +1213,13 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // NICK
-  if (/nick|nombre|apodo|nickname|renombra|llame/i.test(norm)) {
+  // ── NICK / CAMBIAR NOMBRE ──
+  if (/nick|nombre|apodo|nickname|renombra|llame|cambiale|cambiar/i.test(norm)) {
     const parsed = parseNickCommand(norm);
     if (parsed) {
       const member = await resolveGuildMember(guild, parsed.userStr);
       const nick   = parsed.nick.slice(0, 32);
-      if (!member) { await message.reply('No encontre al usuario.'); return true; }
+      if (!member) { await message.reply(notFound(parsed.userStr)); return true; }
       try {
         await member.setNickname(nick, `[Jarvis] por ${author.tag}`);
         await message.reply({ embeds: [simpleEmbed('Apodo Cambiado', `El apodo de ${member} ahora es **${nick}**.`)] });
@@ -1080,13 +1228,13 @@ async function handleJarvisCommands(message, text, guild) {
     }
   }
 
-  // JOIN SERVER
+  // ── JOIN SERVER ──
   if (/^(?:join|entra|vuelve|regresa)\b/i.test(norm)) {
     await message.reply({ embeds: [simpleEmbed('Ya estoy aqui', `Ya estoy en **${guild.name}**. Si me sali, necesitas invitarme de nuevo con el link de invitacion.`, 0x3498db)] });
     return true;
   }
 
-  // LEAVE SERVER
+  // ── LEAVE SERVER ──
   if (/^(?:leave|sal|vete|salte|abandona)\b/i.test(norm)) {
     if (message.author.id !== OWNER_ID) { await message.reply('Solo el owner puede hacer eso.'); return true; }
     await message.reply({ embeds: [simpleEmbed('Saliendo...', `Me salgo de **${guild.name}**. Hasta luego!`, 0xe74c3c)] });
@@ -1094,7 +1242,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // SAY
+  // ── SAY ──
   const sayM = text.match(/^(?:di|escribe|envia|manda|say|repite|anuncia|habla)\s+(.+)/i);
   if (sayM) {
     await message.delete().catch(() => {});
@@ -1102,7 +1250,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // DM
+  // ── DM ──
   const dmM = text.match(/(?:enviacle|mandale|escribe\s*le|(?:un\s+)?(?:dm|md|mensaje\s*(?:privado|directo)|privado))\s+(?:a\s+)?(<@!?\d+>|\d{17,20}|\S+)\s+(?:(?:diciendo|que\s*diga|el\s*mensaje)\s+)?(.+)/i);
   if (dmM) {
     const member = await resolveGuildMember(guild, dmM[1]);
@@ -1114,7 +1262,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // AVATAR
+  // ── AVATAR ──
   const avatarM = text.match(/(?:muestra|ensena|dame|show|ver|quiero\s*ver)\s+(?:el\s*)?(?:avatar|foto|pfp|imagen|fotito|icono)\s*(?:de\s+)?(<@!?\d+>|\d{17,20}|\S+)?/i);
   if (avatarM) {
     const member = avatarM[1] ? await resolveGuildMember(guild, avatarM[1]) : message.member;
@@ -1125,7 +1273,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // USERINFO
+  // ── USERINFO ──
   const infoM = text.match(/(?:info(rmacion)?|datos?|detalles?|quien\s*es|sobre|acerca\s*de)\s+(<@!?\d+>|\d{17,20}|\S+)/i);
   if (infoM) {
     const member = await resolveGuildMember(guild, infoM[2]);
@@ -1151,7 +1299,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // WHITELIST ADD
+  // ── WHITELIST ADD ──
   const wlAddM = text.match(/(?:anade|agrega|autoriza|add|incluye|mete|pon)\s+(?:a\s+)?(<@!?\d+>|\d{17,20})\s+(?:a\s+)?(?:la\s+)?(?:whitelist|lista\s*blanca)/i);
   if (wlAddM) {
     const uid = (wlAddM[1].match(/\d+/) || [])[0];
@@ -1162,7 +1310,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // WHITELIST REMOVE
+  // ── WHITELIST REMOVE ──
   const wlRemM = text.match(/(?:quita[r]?|remueve[r]?|elimina[r]?|saca[r]?|borra[r]?)\s+(?:a\s+)?(<@!?\d+>|\d{17,20})\s+(?:de\s+)?(?:la\s+)?(?:whitelist|lista\s*blanca)/i);
   if (wlRemM) {
     const uid = (wlRemM[1].match(/\d+/) || [])[0];
@@ -1172,7 +1320,7 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // WHITELIST SHOW
+  // ── WHITELIST SHOW ──
   if (/(?:muestra|lista|show|ver|ensena|dime|quienes\s*estan\s*en\s*la)\s*(?:la\s+)?(?:whitelist|lista\s*blanca)/i.test(text)) {
     if (!JARVIS_WHITELIST.size) { await message.reply('La whitelist de Jarvis esta vacia.'); return true; }
     const users = [...JARVIS_WHITELIST].map(id => `<@${id}> (\`${id}\`)`);
@@ -1871,7 +2019,6 @@ client.on('interactionCreate', async interaction => {
     const sorted   = Object.entries(xpData[gid] || {}).sort((a, b) => b[1].xp - a[1].xp);
     const rank     = sorted.findIndex(([id]) => id === target.id) + 1;
 
-    // Estado del sistema XP en este servidor
     const xpStatus = xpChannels[gid]
       ? xpChannels[gid] === 'all' ? 'Activo en todos los canales' : `Activo en <#${xpChannels[gid]}>`
       : 'Desactivado';
@@ -1941,7 +2088,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // Sin opciones = activar en todos los canales
     xpChannels[guild.id] = 'all';
     saveJSON(XPCHANNELS_FILE, xpChannels);
     return interaction.reply({
