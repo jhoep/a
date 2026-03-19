@@ -19,7 +19,7 @@
 			<token name="ComputerMovementMode">0</token>
 			<token name="ControlMode">1</token>
 			<string name="DefaultCameraID"></string>
-			<int name="FramerateCap">240</int>
+			<int name="FramerateCap">9999</int>
 			<bool name="Fullscreen">false</bool>
 			<float name="GamepadCameraSensitivity">1</float>
 			<token name="GraphicsOptimizationMode">1</token>
