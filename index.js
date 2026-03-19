@@ -568,18 +568,17 @@ function simpleEmbed(title, description, color = 0x3498db) {
 }
 
 // ============================================================================
-// NORMALIZAR TEXTO (quita tildes y caracteres especiales para comparación)
+// NORMALIZAR TEXTO
 // ============================================================================
 function normalizeForCompare(str) {
   return str
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')  // quita tildes
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9_\s]/g, '')
     .trim();
 }
 
-// Similitud de cadenas (Levenshtein simplificado)
 function stringSimilarity(a, b) {
   a = normalizeForCompare(a);
   b = normalizeForCompare(b);
@@ -588,40 +587,35 @@ function stringSimilarity(a, b) {
   const longer  = a.length > b.length ? a : b;
   const shorter = a.length > b.length ? b : a;
   if (longer.length === 0) return 1;
-  // Caracteres coincidentes
   let matches = 0;
   for (const ch of shorter) if (longer.includes(ch)) matches++;
   return matches / longer.length;
 }
 
 // ============================================================================
-// MEMBER / ROLE RESOLVER — MEJORADO
+// MEMBER / ROLE RESOLVER
 // ============================================================================
 async function resolveGuildMember(guild, text) {
   if (!text) return null;
   text = text.trim();
 
-  // 1. Por mención directa <@123>
   const mentionMatch = text.match(/<@!?(\d+)>/);
   if (mentionMatch) {
     const uid = mentionMatch[1];
     return guild.members.cache.get(uid) || await guild.members.fetch(uid).catch(() => null);
   }
 
-  // 2. Por ID numérico puro
   const idMatch = text.match(/^\d{17,20}$/);
   if (idMatch) {
     return guild.members.cache.get(text) || await guild.members.fetch(text).catch(() => null);
   }
 
-  // Asegurarse de que el caché esté actualizado
   if (guild.members.cache.size < 2) {
     await guild.members.fetch().catch(() => {});
   }
 
   const normText = normalizeForCompare(text);
 
-  // 3. Coincidencia exacta (nombre o displayName)
   for (const member of guild.members.cache.values()) {
     if (
       normalizeForCompare(member.user.username) === normText ||
@@ -629,7 +623,6 @@ async function resolveGuildMember(guild, text) {
     ) return member;
   }
 
-  // 4. Starts-with match
   for (const member of guild.members.cache.values()) {
     if (
       normalizeForCompare(member.user.username).startsWith(normText) ||
@@ -637,7 +630,6 @@ async function resolveGuildMember(guild, text) {
     ) return member;
   }
 
-  // 5. Contains match
   for (const member of guild.members.cache.values()) {
     if (
       normalizeForCompare(member.user.username).includes(normText) ||
@@ -645,7 +637,6 @@ async function resolveGuildMember(guild, text) {
     ) return member;
   }
 
-  // 6. Fuzzy match — el más parecido con score >= 0.5
   let best = null, bestScore = 0;
   for (const member of guild.members.cache.values()) {
     const scoreUser    = stringSimilarity(normText, member.user.username);
@@ -656,29 +647,48 @@ async function resolveGuildMember(guild, text) {
   return bestScore >= 0.5 ? best : null;
 }
 
+// ============================================================================
+// RESOLVE ROLE — mejorado: soporta ID, mención, nombre exacto, parcial y fuzzy
+// ============================================================================
 function resolveRole(guild, roleName) {
   if (!roleName) return null;
-  const m = roleName.match(/<@&(\d+)>/);
-  if (m) return guild.roles.cache.get(m[1]);
-  if (/^\d+$/.test(roleName)) return guild.roles.cache.get(roleName);
-  const lower    = roleName.toLowerCase().trim();
-  const exact    = guild.roles.cache.find(r => r.name.toLowerCase() === lower);
+  roleName = roleName.trim();
+
+  // Mención <@&ID>
+  const mentionM = roleName.match(/<@&(\d+)>/);
+  if (mentionM) return guild.roles.cache.get(mentionM[1]) || null;
+
+  // ID puro (17-20 dígitos)
+  if (/^\d{17,20}$/.test(roleName)) return guild.roles.cache.get(roleName) || null;
+
+  const lower = normalizeForCompare(roleName);
+
+  // Exacto
+  const exact = guild.roles.cache.find(r => normalizeForCompare(r.name) === lower);
   if (exact) return exact;
-  const contains = guild.roles.cache.find(r => r.name.toLowerCase().includes(lower));
-  if (contains) return contains;
-  const rev      = guild.roles.cache.find(r => lower.includes(r.name.toLowerCase()) && r.name.length > 2);
-  if (rev) return rev;
-  function strSim(a, b) {
-    a = a.toLowerCase(); b = b.toLowerCase();
-    const matches = [...a].filter(c => b.includes(c)).length;
-    return matches / Math.max(a.length, b.length, 1);
-  }
+
+  // Starts-with
+  const sw = guild.roles.cache.find(r => normalizeForCompare(r.name).startsWith(lower));
+  if (sw) return sw;
+
+  // Contains
+  const cont = guild.roles.cache.find(r => normalizeForCompare(r.name).includes(lower));
+  if (cont) return cont;
+
+  // Contains inverso (el rol está dentro del texto)
+  const inv = guild.roles.cache.find(r => {
+    const rn = normalizeForCompare(r.name);
+    return rn.length > 2 && lower.includes(rn);
+  });
+  if (inv) return inv;
+
+  // Fuzzy
   let best = null, bestScore = 0;
   for (const role of guild.roles.cache.values()) {
-    const score = strSim(lower, role.name);
+    const score = stringSimilarity(lower, role.name);
     if (score > bestScore) { bestScore = score; best = role; }
   }
-  return bestScore >= 0.6 ? best : null;
+  return bestScore >= 0.55 ? best : null;
 }
 
 const NOT_FOUND_MSGS = [
@@ -807,15 +817,6 @@ const JARVIS_CONV = {
 // ============================================================================
 // SMART INTENT PARSER
 // ============================================================================
-function extractMentionOrId(text) {
-  const m = text.match(/<@!?(\d+)>/) || text.match(/\b(\d{17,20})\b/);
-  return m ? m[0] : null;
-}
-
-function extractAllMentions(text) {
-  return [...text.matchAll(/<@!?(\d+)>/g)].map(m => m[0]);
-}
-
 function normalizeText(t) {
   return t
     .replace(/cámbia|cambiá/gi, 'cambia')
@@ -845,16 +846,7 @@ function normalizeText(t) {
     .trim();
 }
 
-// ============================================================================
-// PARSE NICK COMMAND — MEJORADO
-// Casos soportados:
-//   jarvis cambiale el nombre a @mention NuevoNick
-//   jarvis cambia el nick de @mention a NuevoNick
-//   jarvis ponle de apodo @mention NuevoNick
-//   jarvis cambia el nick de NombreUsuario a NuevoNick
-// ============================================================================
 function parseNickCommand(text) {
-  // Caso 1: hay mención en el texto
   const mentionMatch = text.match(/<@!?(\d+)>/);
   if (mentionMatch) {
     const mention    = mentionMatch[0];
@@ -862,13 +854,11 @@ function parseNickCommand(text) {
     const before     = text.slice(0, mentionIdx).trim();
     const after      = text.slice(mentionIdx + mention.length).trim();
 
-    // El nick está después de la mención (posiblemente con "a", "por", ":", etc.)
     if (after.length > 0) {
       const nickRaw = after.replace(/^(?:a|por|como|se\s*llame|que\s*se\s*llame|:|\s)+/i, '').trim();
       if (nickRaw.length > 0) return { userStr: mention, nick: nickRaw };
     }
 
-    // El nick está antes de la mención (raro pero posible)
     if (before.length > 0) {
       const nickRaw = before
         .replace(/^.*(?:nick|nombre|apodo|nickname)\s+(?:de\s+)?(?:a\s+)?/i, '')
@@ -880,13 +870,49 @@ function parseNickCommand(text) {
     return null;
   }
 
-  // Caso 2: sin mención — intenta extraer "cambia el nick de NOMBRE a NEWNICK"
   const noMentionMatch = text.match(
     /(?:cambia\s+(?:el\s+)?(?:nick|nombre|apodo)(?:\s+de)?\s+)(.+?)\s+(?:a|por|como)\s+(.+)/i,
   );
   if (noMentionMatch) {
     return { userStr: noMentionMatch[1].trim(), nick: noMentionMatch[2].trim() };
   }
+
+  return null;
+}
+
+// ============================================================================
+// PARSE ROLE REMOVE COMMAND — NUEVO
+// Soporta:
+//   jarvis quitame el rol Admin
+//   jarvis quitame el rol 123456789012345678
+//   jarvis quitame el rol <@&123>
+//   jarvis quitale el rol Admin a @user
+//   jarvis quitale el rol 1234 a NombreUsuario
+//   jarvis quita el rol Admin de @user / de NombreUsuario
+//   jarvis quita el rol Admin a @user
+// Devuelve { roleStr, userStr } — userStr=null significa "al autor del mensaje"
+// ============================================================================
+function parseRoleRemoveCommand(text) {
+  // Variantes con destinatario explícito
+  // "quitale el rol X a Y" | "quita el rol X a Y" | "quita el rol X de Y" | "quita el rol X al usuario Y"
+  const withUserPatterns = [
+    /(?:quita(?:le)?|remueve(?:le)?|saca(?:le)?|elimina(?:le)?)\s+(?:el\s+)?rol\s+(.+?)\s+(?:a(?:l\s+(?:usuario\s+)?)?|de(?:\s+(?:el\s+)?(?:usuario\s+)?)?)\s*(.+)/i,
+    /(?:quita(?:le)?|remueve(?:le)?|saca(?:le)?|elimina(?:le)?)\s+(?:a\s+)?(<@!?\d+>|\d{17,20})\s+(?:el\s+)?rol\s+(.+)/i,
+  ];
+
+  for (let i = 0; i < withUserPatterns.length; i++) {
+    const m = text.match(withUserPatterns[i]);
+    if (m) {
+      if (i === 0) return { roleStr: m[1].trim(), userStr: m[2].trim() };
+      if (i === 1) return { roleStr: m[3].trim(), userStr: m[2].trim() };
+    }
+  }
+
+  // "quitame el rol X" — solo al autor
+  const selfMatch = text.match(
+    /(?:quita(?:me)?|remueve(?:me)?|saca(?:me)?|elimina(?:me)?)\s+(?:el\s+)?(?:mi\s+)?rol\s+(.+)/i,
+  );
+  if (selfMatch) return { roleStr: selfMatch[1].trim(), userStr: null };
 
   return null;
 }
@@ -943,7 +969,7 @@ async function handleJarvisCommands(message, text, guild) {
       { name: 'Niveles / XP',  value: '`/rank` `/leaderboard` `/setxpchannel`\n`>>nivel @user <nivel>` — Asignar nivel (solo owner)', inline: false },
       { name: 'Mod Log',       value: '`/setmodlog` `/warns` `/clearwarns`', inline: false },
       { name: 'Canal',         value: '`jarvis borra 50 mensajes`\n`jarvis pon slowmode 5s`\n`jarvis bloquea el canal`', inline: false },
-      { name: 'Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`\n`jarvis cambia el nick de @user a NuevoNick`', inline: false },
+      { name: 'Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis quitame el rol Admin`\n`jarvis quitale el rol Admin a @user`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`\n`jarvis cambia el nick de @user a NuevoNick`', inline: false },
       { name: 'Voice Jail',    value: '`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline: false },
     );
     await message.reply({ embeds: [embed] });
@@ -1114,7 +1140,6 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // ── DESCONECTAR DE VOZ ──
-  // "jarvis desconecta a @user" | "jarvis saca a @user del canal"
   const voiceDisconnectM = text.match(
     /(?:desconecta[r]?|saca[r]?\s*(?:de\s*(?:la\s*)?voz|del?\s*canal\s*de\s*voz)|kickea?\s*de\s*voz|mueve\s*(?:de\s*voz)?|expulsa\s*de\s*voz)\s+(?:a[l]?\s+)?(.+)/i,
   );
@@ -1135,7 +1160,6 @@ async function handleJarvisCommands(message, text, guild) {
   }
 
   // ── MOVER DE CANAL DE VOZ ──
-  // "jarvis mueve a @user a #canal" | "jarvis mueve a @user al canal General"
   const voiceMoveM = text.match(
     /(?:mueve[r]?|pasa[r]?|manda[r]?|pon)\s+(?:a[l]?\s+)?(.+?)\s+(?:a[l]?\s+(?:canal\s+(?:de\s+voz\s+)?)?|para\s+)(<#\d+>|[^\s].+)/i,
   );
@@ -1144,7 +1168,6 @@ async function handleJarvisCommands(message, text, guild) {
     const channelStr   = voiceMoveM[2].trim();
     const member       = await resolveGuildMember(guild, memberStr);
 
-    // Resolver canal de voz
     let targetChannel = null;
     const chanMentionM = channelStr.match(/<#(\d+)>/);
     if (chanMentionM) {
@@ -1182,19 +1205,62 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── ROLE REMOVE ──
-  const roleRemM = norm.match(/(?:quita[r]?|remueve[r]?|elimina[r]?|saca[r]?|borra[r]?)\s+(?:el\s+)?(?:rol\s+)?(.+?)(?:\s+(?:a[l]?\s+|de\s+)(<@!?\d+>|\d{17,20}|\S+))?$/i);
-  if (roleRemM && /rol|role/i.test(norm)) {
-    const roleName = roleRemM[1].replace(/\b(?:el|la|los|las|de|del|a|al|rol|role)\b/gi, '').trim();
-    const role     = resolveRole(guild, roleName);
-    const member   = roleRemM[2] ? await resolveGuildMember(guild, roleRemM[2]) : message.member;
-    if (!role)   { await message.reply(`No encontre el rol \`${roleName}\`.`); return true; }
-    if (!member) { await message.reply('No encontre al usuario.'); return true; }
-    if (!member.roles.cache.has(role.id)) { await message.reply(`${member} no tiene el rol **${role.name}**.`); return true; }
+  // ── ROLE REMOVE — MEJORADO ──
+  // Detecta: "quitame el rol X", "quitale el rol X a Y", "quita el rol X de Y"
+  // IMPORTANTE: este bloque va ANTES del role add para evitar conflictos con "quita"
+  const roleRemParsed = parseRoleRemoveCommand(norm);
+  if (roleRemParsed) {
+    const { roleStr, userStr } = roleRemParsed;
+
+    // Limpiar palabras de relleno del rol
+    const cleanRoleStr = roleStr
+      .replace(/\b(?:el|la|los|las|de|del|a|al|rol|role|me|le)\b/gi, '')
+      .trim();
+
+    const role = resolveRole(guild, cleanRoleStr);
+    if (!role) {
+      await message.reply(
+        `No encontre el rol \`${cleanRoleStr}\`. Puedes usar el nombre, el ID o mencionarlo con <@&ID>.\n` +
+        `Usa \`jarvis lista roles\` para ver todos los roles disponibles.`,
+      );
+      return true;
+    }
+
+    // Resolver miembro (null = autor del mensaje)
+    let member = message.member;
+    if (userStr) {
+      member = await resolveGuildMember(guild, userStr);
+      if (!member) { await message.reply(notFound(userStr)); return true; }
+    }
+
+    if (!member.roles.cache.has(role.id)) {
+      await message.reply(`${member} no tiene el rol **${role.name}**.`);
+      return true;
+    }
+
+    // Verificar jerarquía si se quita a otro usuario
+    if (userStr && me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) {
+      await message.reply(`Mi rol es inferior al de ${member}, no puedo modificar sus roles.`);
+      return true;
+    }
+
     try {
       await member.roles.remove(role, `[Jarvis] Removido por ${author.tag}`);
-      await message.reply({ embeds: [simpleEmbed('Rol Removido', `Se quito **${role.name}** de ${member}.`, 0xe67e22)] });
-    } catch (e) { await message.reply(`Error: ${e.message}`); }
+      const isSelf = member.id === author.id;
+      const embed  = simpleEmbed(
+        'Rol Removido',
+        isSelf
+          ? `Se te quito el rol **${role.name}**.`
+          : `Se quito **${role.name}** de ${member}.`,
+        0xe67e22,
+      );
+      embed.addFields(
+        { name: 'Rol',    value: `${role} (\`${role.id}\`)`, inline: true },
+        { name: 'Miembro', value: `${member}`, inline: true },
+      );
+      embed.setFooter({ text: `Ejecutado por ${author.tag}` });
+      await message.reply({ embeds: [embed] });
+    } catch (e) { await message.reply(`Error al quitar el rol: ${e.message}`); }
     return true;
   }
 
