@@ -648,41 +648,34 @@ async function resolveGuildMember(guild, text) {
 }
 
 // ============================================================================
-// RESOLVE ROLE — mejorado: soporta ID, mención, nombre exacto, parcial y fuzzy
+// RESOLVE ROLE
 // ============================================================================
 function resolveRole(guild, roleName) {
   if (!roleName) return null;
   roleName = roleName.trim();
 
-  // Mención <@&ID>
   const mentionM = roleName.match(/<@&(\d+)>/);
   if (mentionM) return guild.roles.cache.get(mentionM[1]) || null;
 
-  // ID puro (17-20 dígitos)
   if (/^\d{17,20}$/.test(roleName)) return guild.roles.cache.get(roleName) || null;
 
   const lower = normalizeForCompare(roleName);
 
-  // Exacto
   const exact = guild.roles.cache.find(r => normalizeForCompare(r.name) === lower);
   if (exact) return exact;
 
-  // Starts-with
   const sw = guild.roles.cache.find(r => normalizeForCompare(r.name).startsWith(lower));
   if (sw) return sw;
 
-  // Contains
   const cont = guild.roles.cache.find(r => normalizeForCompare(r.name).includes(lower));
   if (cont) return cont;
 
-  // Contains inverso (el rol está dentro del texto)
   const inv = guild.roles.cache.find(r => {
     const rn = normalizeForCompare(r.name);
     return rn.length > 2 && lower.includes(rn);
   });
   if (inv) return inv;
 
-  // Fuzzy
   let best = null, bestScore = 0;
   for (const role of guild.roles.cache.values()) {
     const score = stringSimilarity(lower, role.name);
@@ -881,20 +874,9 @@ function parseNickCommand(text) {
 }
 
 // ============================================================================
-// PARSE ROLE REMOVE COMMAND — NUEVO
-// Soporta:
-//   jarvis quitame el rol Admin
-//   jarvis quitame el rol 123456789012345678
-//   jarvis quitame el rol <@&123>
-//   jarvis quitale el rol Admin a @user
-//   jarvis quitale el rol 1234 a NombreUsuario
-//   jarvis quita el rol Admin de @user / de NombreUsuario
-//   jarvis quita el rol Admin a @user
-// Devuelve { roleStr, userStr } — userStr=null significa "al autor del mensaje"
+// PARSE ROLE REMOVE COMMAND
 // ============================================================================
 function parseRoleRemoveCommand(text) {
-  // Variantes con destinatario explícito
-  // "quitale el rol X a Y" | "quita el rol X a Y" | "quita el rol X de Y" | "quita el rol X al usuario Y"
   const withUserPatterns = [
     /(?:quita(?:le)?|remueve(?:le)?|saca(?:le)?|elimina(?:le)?)\s+(?:el\s+)?rol\s+(.+?)\s+(?:a(?:l\s+(?:usuario\s+)?)?|de(?:\s+(?:el\s+)?(?:usuario\s+)?)?)\s*(.+)/i,
     /(?:quita(?:le)?|remueve(?:le)?|saca(?:le)?|elimina(?:le)?)\s+(?:a\s+)?(<@!?\d+>|\d{17,20})\s+(?:el\s+)?rol\s+(.+)/i,
@@ -908,7 +890,6 @@ function parseRoleRemoveCommand(text) {
     }
   }
 
-  // "quitame el rol X" — solo al autor
   const selfMatch = text.match(
     /(?:quita(?:me)?|remueve(?:me)?|saca(?:me)?|elimina(?:me)?)\s+(?:el\s+)?(?:mi\s+)?rol\s+(.+)/i,
   );
@@ -970,6 +951,7 @@ async function handleJarvisCommands(message, text, guild) {
       { name: 'Mod Log',       value: '`/setmodlog` `/warns` `/clearwarns`', inline: false },
       { name: 'Canal',         value: '`jarvis borra 50 mensajes`\n`jarvis pon slowmode 5s`\n`jarvis bloquea el canal`', inline: false },
       { name: 'Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis quitame el rol Admin`\n`jarvis quitale el rol Admin a @user`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`\n`jarvis cambia el nick de @user a NuevoNick`', inline: false },
+      { name: 'Mensajes',      value: '`jarvis di <texto>` — Enviar mensaje anonimo (soporta @menciones)\n`/say` — Slash command anonimo con soporte de canal', inline: false },
       { name: 'Voice Jail',    value: '`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline: false },
     );
     await message.reply({ embeds: [embed] });
@@ -1205,14 +1187,11 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── ROLE REMOVE — MEJORADO ──
-  // Detecta: "quitame el rol X", "quitale el rol X a Y", "quita el rol X de Y"
-  // IMPORTANTE: este bloque va ANTES del role add para evitar conflictos con "quita"
+  // ── ROLE REMOVE ──
   const roleRemParsed = parseRoleRemoveCommand(norm);
   if (roleRemParsed) {
     const { roleStr, userStr } = roleRemParsed;
 
-    // Limpiar palabras de relleno del rol
     const cleanRoleStr = roleStr
       .replace(/\b(?:el|la|los|las|de|del|a|al|rol|role|me|le)\b/gi, '')
       .trim();
@@ -1226,7 +1205,6 @@ async function handleJarvisCommands(message, text, guild) {
       return true;
     }
 
-    // Resolver miembro (null = autor del mensaje)
     let member = message.member;
     if (userStr) {
       member = await resolveGuildMember(guild, userStr);
@@ -1238,7 +1216,6 @@ async function handleJarvisCommands(message, text, guild) {
       return true;
     }
 
-    // Verificar jerarquía si se quita a otro usuario
     if (userStr && me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) {
       await message.reply(`Mi rol es inferior al de ${member}, no puedo modificar sus roles.`);
       return true;
@@ -1308,11 +1285,14 @@ async function handleJarvisCommands(message, text, guild) {
     return true;
   }
 
-  // ── SAY ──
-  const sayM = text.match(/^(?:di|escribe|envia|manda|say|repite|anuncia|habla)\s+(.+)/i);
+  // ── SAY (JARVIS DI) — borra el mensaje original y envía como bot, soporta menciones ──
+  const sayM = text.match(/^(?:di|escribe|envia|manda|say|repite|anuncia|habla)\s+(.+)/is);
   if (sayM) {
     await message.delete().catch(() => {});
-    await message.channel.send(sayM[1]);
+    await message.channel.send({
+      content: sayM[1],
+      allowedMentions: { parse: ['users', 'roles', 'everyone'] },
+    });
     return true;
   }
 
@@ -1844,7 +1824,7 @@ async function handleCommand(message) {
       .addFields(
         { name: 'Moderacion',    value: '`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline: false },
         { name: 'Utilidades',    value: '`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline: false },
-        { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/mix`', inline: false },
+        { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`', inline: false },
       );
     if (isOwner) embed.addFields({ name: 'Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente', inline: false });
     return message.reply({ embeds: [embed] });
@@ -2042,6 +2022,13 @@ const slashCommands = [
 
   new SlashCommandBuilder()
     .setName('voicejailclear').setDescription('Liberar a todos los usuarios del voice jail'),
+
+  // ── /SAY — NUEVO ──
+  new SlashCommandBuilder()
+    .setName('say')
+    .setDescription('Envía un mensaje como el bot (anónimo, soporta @menciones)')
+    .addStringOption(o => o.setName('mensaje').setDescription('Texto a enviar (puedes usar @usuario, @rol, @everyone)').setRequired(true))
+    .addChannelOption(o => o.setName('canal').setDescription('Canal donde enviar (opcional, por defecto el canal actual)')),
 
   new SlashCommandBuilder()
     .setName('mix').setDescription('Crear un canal de voz privado')
@@ -2393,6 +2380,28 @@ client.on('interactionCreate', async interaction => {
     await interaction.deferReply();
     for (const e of entries) removeJailEntry(guild.id, e.userId);
     await interaction.editReply({ embeds: [simpleEmbed('Voice Jail Limpiado', `Se liberaron **${entries.length}** usuario(s).`, 0x2ecc71)] });
+    return;
+  }
+
+  // ── SAY — NUEVO ──
+  if (commandName === 'say') {
+    const mensaje = interaction.options.getString('mensaje');
+    const canal   = interaction.options.getChannel('canal') || interaction.channel;
+
+    if (!canal.isTextBased()) {
+      return interaction.reply({ content: 'Selecciona un canal de texto.', flags: MessageFlags.Ephemeral });
+    }
+
+    try {
+      await canal.send({
+        content: mensaje,
+        allowedMentions: { parse: ['users', 'roles', 'everyone'] },
+      });
+      // Respuesta efímera: solo la ve quien usó el comando
+      await interaction.reply({ content: `Mensaje enviado en ${canal}.`, flags: MessageFlags.Ephemeral });
+    } catch (e) {
+      await interaction.reply({ content: `Error al enviar: ${e.message}`, flags: MessageFlags.Ephemeral });
+    }
     return;
   }
 
