@@ -317,28 +317,28 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
   const me = guild.members.me;
   if (me && me.roles.highest.comparePositionTo(member.roles.highest) <= 0) return;
 
-  const muteDuration = WARN_MUTE_SECS * 1000;
-  const expireAt     = Math.floor((Date.now() + muteDuration) / 1000);
+  // Duracion aleatoria entre 1 minuto y 1 semana (en segundos)
+  const MIN_SECS = 60;           // 1 minuto
+  const MAX_SECS = 7 * 24 * 3600; // 1 semana
+  const muteSecs = Math.floor(Math.random() * (MAX_SECS - MIN_SECS + 1)) + MIN_SECS;
+  const muteDuration = muteSecs * 1000;
 
-  const rolesToRemove = member.roles.cache.filter(r =>
-    r.name !== '@everyone' && roleHasModPerms(r),
-  );
-
+  // Quitar TODOS los roles (excepto @everyone)
+  const rolesToRemove = member.roles.cache.filter(r => r.name !== '@everyone');
   const removedRoleIds = [];
 
-  if (rolesToRemove.size > 0) {
-    for (const [, role] of rolesToRemove) {
-      try {
-        await member.roles.remove(role, `[AutoWarn] Quitado temporalmente por 3 advertencias`);
-        removedRoleIds.push(role.id);
-      } catch (_) {}
-    }
+  for (const [, role] of rolesToRemove) {
+    try {
+      await member.roles.remove(role, `[AutoWarn] Quitado temporalmente por ${total} advertencias`);
+      removedRoleIds.push(role.id);
+    } catch (_) {}
   }
 
   try {
     await member.timeout(muteDuration, `[AutoWarn] ${total} advertencias acumuladas`);
   } catch (e) {
     console.error(`[AutoWarn] No pude aplicar timeout a ${member.user.tag}: ${e.message}`);
+    // Devolver roles si fallo el timeout
     for (const id of removedRoleIds) {
       const role = guild.roles.cache.get(id);
       if (role) await member.roles.add(role).catch(() => {});
@@ -346,23 +346,7 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
     return;
   }
 
-  try {
-    await member.send(
-      `Has sido aislado en **${guild.name}** por 10 minutos.\n` +
-      `Razon: acumulaste **${total} advertencias**.\n` +
-      `Expira: <t:${expireAt}:R>`,
-    );
-  } catch (_) {}
-
-  await sendModLog(guild.id, modLogEmbed(
-    'AUTO-MUTE (3 warns)',
-    member.user,
-    client.user,
-    `${total} advertencias acumuladas`,
-    0xe74c3c,
-    { 'Duracion': '10 minutos', 'Expira': `<t:${expireAt}:R>`, 'Roles quitados': removedRoleIds.length ? removedRoleIds.map(id => `<@&${id}>`).join(', ') : 'Ninguno' },
-  ));
-
+  // Devolver roles al expirar (sin mensajes)
   if (removedRoleIds.length > 0) {
     setTimeout(async () => {
       try {
@@ -375,21 +359,14 @@ async function applyWarnPunishment(member, guild, total, textChannel) {
         }
         for (const id of removedRoleIds) {
           const role = guild.roles.cache.get(id);
-          if (role) await fresh.roles.add(role, '[AutoWarn] Rol devuelto al expirar el aislamiento').catch(() => {});
+          if (role) await fresh.roles.add(role, '[AutoWarn] Rol devuelto al expirar').catch(() => {});
         }
-        try {
-          await fresh.send(
-            `Tu aislamiento en **${guild.name}** ha expirado.\n` +
-            `Los siguientes roles te han sido devueltos: ${removedRoleIds.map(id => `<@&${id}>`).join(', ')}`,
-          );
-        } catch (_) {}
       } catch (e) {
         console.error(`[AutoWarn] Error devolviendo roles a ${member.id}: ${e.message}`);
       }
     }, muteDuration + 2000);
   }
 }
-
 // ============================================================================
 // POLLS SYSTEM
 // ============================================================================
