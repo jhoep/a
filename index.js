@@ -1575,12 +1575,23 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isAutocomplete()) {
     if (interaction.commandName !== 'play') return;
     const query = interaction.options.getString('cancion');
-    if (!query || query.length < 2) return interaction.respond([]);
+    if (!query || query.length < 2) return interaction.respond([{ name: '🔍 Escribe el nombre o pega una URL...', value: query || ' ' }]).catch(() => {});
     try {
-      const results = await musicPlayer.search(query, { requestedBy: interaction.user, searchEngine: QueryType.AUTO });
-      const choices = results.tracks.slice(0, 5).map(t => ({ name: `${t.title.slice(0, 80)} — ${t.author}`.slice(0, 100), value: t.url }));
-      await interaction.respond(choices);
-    } catch { await interaction.respond([]); }
+      const results = await musicPlayer.search(query, {
+        requestedBy: interaction.user,
+        searchEngine: QueryType.YOUTUBE_SEARCH,
+      });
+      if (!results || !results.tracks.length) {
+        return interaction.respond([{ name: `🔍 Buscar: ${query}`, value: query }]).catch(() => {});
+      }
+      const choices = results.tracks.slice(0, 5).map(t => ({
+        name: `${t.title.slice(0, 75)} — ${t.author}`.slice(0, 100),
+        value: t.url || query,
+      }));
+      await interaction.respond(choices).catch(() => {});
+    } catch {
+      await interaction.respond([{ name: `🔍 Buscar: ${query}`, value: query }]).catch(() => {});
+    }
     return;
   }
 
@@ -1599,7 +1610,7 @@ client.on('interactionCreate', async interaction => {
       try {
         const { track } = await musicPlayer.play(interaction.member.voice.channel, query, {
           nodeOptions: { metadata: { textChannel: interaction.channel, requestedBy: user }, selfDeaf: true, volume: 80, leaveOnEnd: false, leaveOnStop: true, leaveOnEmpty: true, leaveOnEmptyCooldown: 30_000 },
-          requestedBy: user, searchEngine: QueryType.AUTO,
+          requestedBy: user, searchEngine: QueryType.YOUTUBE_SEARCH,
         });
         await interaction.editReply({ embeds: [new EmbedBuilder().setColor(MUSIC_COLORS.queued).setDescription(`✅ **[${track.title}](${track.url})** añadido.\n🕐 Duración: \`${track.duration}\``).setThumbnail(track.thumbnail).setFooter({ text: `Pedido por ${user.username}` })] });
       } catch (err) { await interaction.editReply({ content: `❌ Error: ${err.message}` }); }
@@ -1614,7 +1625,7 @@ client.on('interactionCreate', async interaction => {
       try {
         const { track } = await musicPlayer.play(interaction.member.voice.channel, query, {
           nodeOptions: { metadata: { textChannel: interaction.channel, requestedBy: user }, selfDeaf: true, volume: musicPlayer.nodes.get(guild.id)?.node?.volume ?? 80, leaveOnEnd: false, leaveOnStop: true, leaveOnEmpty: true, leaveOnEmptyCooldown: 30_000 },
-          requestedBy: user, searchEngine: QueryType.AUTO,
+          requestedBy: user, searchEngine: QueryType.YOUTUBE_SEARCH,
         });
         const q = musicPlayer.nodes.get(guild.id);
         if (q && q.tracks.size > 0) { q.moveTrack(q.tracks.toArray()[q.tracks.size - 1], 0); q.node.skip(); }
