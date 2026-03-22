@@ -16,7 +16,6 @@ const fetch = require('node-fetch');
 
 // Discord Player
 const { Player, QueryType, QueueRepeatMode } = require('discord-player');
-const { DefaultExtractors }                  = require('@discord-player/extractor');
 
 // ============================================================================
 // CONFIG
@@ -815,7 +814,7 @@ async function initMusicPlayer() {
     },
   });
 
-  await musicPlayer.extractors.loadMulti(DefaultExtractors);
+  await musicPlayer.extractors.loadDefault();
 
   musicPlayer.events.on('playerStart', (queue, track) => {
     const channel = queue.metadata?.textChannel;
