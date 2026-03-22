@@ -16,6 +16,7 @@ const fetch = require('node-fetch');
 
 // Discord Player
 const { Player, QueryType, QueueRepeatMode } = require('discord-player');
+const { YoutubeiExtractor, SpotifyExtractor, SoundCloudExtractor } = require('@discord-player/extractor');
 
 // ============================================================================
 // CONFIG
@@ -814,7 +815,13 @@ async function initMusicPlayer() {
     },
   });
 
-  await musicPlayer.extractors.loadDefault();
+  // Registrar extractors
+  await musicPlayer.extractors.register(YoutubeiExtractor, {});
+  if (process.env.SPOTIFY_ID && process.env.SPOTIFY_SECRET) {
+    await musicPlayer.extractors.register(SpotifyExtractor, { clientId: process.env.SPOTIFY_ID, clientSecret: process.env.SPOTIFY_SECRET }).catch(() => {});
+    console.log("[Música] Spotify cargado.");
+  }
+  await musicPlayer.extractors.register(SoundCloudExtractor, {}).catch(() => {});
 
   musicPlayer.events.on('playerStart', (queue, track) => {
     const channel = queue.metadata?.textChannel;
