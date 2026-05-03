@@ -69,8 +69,11 @@ const RESPUESTAS_RRA      = ['eres tu bobo tonto ez ez'];
 const PALABRAS_FT         = ['ft10', 'ft5', 'ft3'];
 const RESPUESTAS_FT       = ['Bro, realmente pidio ft, el malo este'];
 
-const autorespuestaCooldown = new Map();
-const COOLDOWN_TIEMPO       = 0;
+const autorespuestaCooldown    = new Map();
+const COOLDOWN_TIEMPO          = 0;
+// ── estado de autorespuestas por guild (Set de guildIds con autorespuestas OFF) ──
+const autorespuestasDesactivadas = new Set();
+
 const groqCooldown          = new Map();
 const GROQ_COOLDOWN_SECS    = 4;
 
@@ -1454,6 +1457,23 @@ async function handleCommand(message) {
   const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
   const cmd  = args.shift().toLowerCase();
 
+  // ── DESACTIVAR / ACTIVAR AUTORESPUESTAS por guild (owner only) ──
+  if (cmd === 'desactivar') {
+    if (message.author.id !== OWNER_ID) return message.reply('Solo el owner puede usar este comando.');
+    const gid = message.guild.id;
+    if (autorespuestasDesactivadas.has(gid)) {
+      autorespuestasDesactivadas.delete(gid);
+      return message.reply({
+        embeds: [simpleEmbed('Autorespuestas Activadas', 'Las autorespuestas están ahora **activadas** en este servidor.', 0x2ecc71)],
+      });
+    } else {
+      autorespuestasDesactivadas.add(gid);
+      return message.reply({
+        embeds: [simpleEmbed('Autorespuestas Desactivadas', 'Las autorespuestas están ahora **desactivadas** en este servidor.', 0xe74c3c)],
+      });
+    }
+  }
+
   // ── NIVEL (owner only) ──
   if (cmd === 'nivel') {
     if (message.author.id !== OWNER_ID) return message.reply('Solo el owner puede usar este comando.');
@@ -1803,7 +1823,7 @@ async function handleCommand(message) {
         { name: 'Utilidades',    value: '`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline: false },
         { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`', inline: false },
       );
-    if (isOwner) embed.addFields({ name: 'Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente', inline: false });
+    if (isOwner) embed.addFields({ name: 'Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline: false });
     return message.reply({ embeds: [embed] });
   }
 }
@@ -1834,7 +1854,9 @@ client.on('messageCreate', async message => {
     const lower = message.content.toLowerCase().trim();
     const now   = Date.now();
     const last  = autorespuestaCooldown.get(message.guild.id) || 0;
-    if (now - last >= COOLDOWN_TIEMPO) {
+
+    // ── NUEVO: solo responde si las autorespuestas están activas en este guild ──
+    if (!autorespuestasDesactivadas.has(message.guild.id) && now - last >= COOLDOWN_TIEMPO) {
       if (SALUDOS.some(s => lower === s || lower.startsWith(`${s} `) || lower.startsWith(`${s},`))) {
         await message.reply(pick(RESPUESTAS_GREETING)); autorespuestaCooldown.set(message.guild.id, now);
       } else if (PALABRAS_QUE.some(s => lower === s || lower.startsWith(`${s} `))) {
@@ -2000,7 +2022,6 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('voicejailclear').setDescription('Liberar a todos los usuarios del voice jail'),
 
-  // ── /SAY — NUEVO ──
   new SlashCommandBuilder()
     .setName('say')
     .setDescription('Envía un mensaje como el bot (anónimo, soporta @menciones)')
@@ -2360,7 +2381,7 @@ client.on('interactionCreate', async interaction => {
     return;
   }
 
-  // ── SAY — NUEVO ──
+  // ── SAY ──
   if (commandName === 'say') {
     const mensaje = interaction.options.getString('mensaje');
     const canal   = interaction.options.getChannel('canal') || interaction.channel;
@@ -2374,7 +2395,6 @@ client.on('interactionCreate', async interaction => {
         content: mensaje,
         allowedMentions: { parse: ['users', 'roles', 'everyone'] },
       });
-      // Respuesta efímera: solo la ve quien usó el comando
       await interaction.reply({ content: `Mensaje enviado en ${canal}.`, flags: MessageFlags.Ephemeral });
     } catch (e) {
       await interaction.reply({ content: `Error al enviar: ${e.message}`, flags: MessageFlags.Ephemeral });
