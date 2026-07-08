@@ -144,6 +144,230 @@ async function saveServerConfig(guild) {
 }
 
 // ============================================================================
+// SERVER CONFIG RESTORE (/restore)
+// Restaura el servidor EXACTAMENTE como estaba en el backup:
+//  - Roles: actualiza los que coinciden (por ID o por nombre), crea los que
+//    falten, y BORRA los que existan ahora pero no estén en el backup.
+//  - Canales: mismo criterio (actualiza, crea, borra), respetando categorías
+//    y permission overwrites (remapeando IDs de roles cuando corresponde).
+// ============================================================================
+async function restoreServerConfig(guild, backup) {
+  const me = guild.members.me;
+  await guild.roles.fetch().catch(() => {});
+  await guild.channels.fetch().catch(() => {});
+  await guild.members.fetch().catch(() => {});
+
+  const report = {
+    rolesCreated: 0, rolesUpdated: 0, rolesDeleted: 0, rolesSkipped: 0,
+    channelsCreated: 0, channelsUpdated: 0, channelsDeleted: 0,
+    errors: [],
+  };
+
+  const myTopPos = me.roles.highest.position;
+
+  // ---------------------------------------------------------------- ROLES --
+  const roleIdMap = new Map(); // backupRoleId -> Role actual (nuevo o existente)
+  const currentRoles = [...guild.roles.cache.values()].filter(r => r.name !== '@everyone');
+  const usedCurrentRoleIds = new Set();
+
+  // 1) match por ID exacto
+  for (const br of backup.roles) {
+    const existing = guild.roles.cache.get(br.id);
+    if (existing && !existing.managed && existing.name !== '@everyone') {
+      roleIdMap.set(br.id, existing);
+      usedCurrentRoleIds.add(existing.id);
+    }
+  }
+
+  // 2) match por nombre exacto entre lo que quedo sin emparejar
+  const unmatchedCurrentRoles = currentRoles.filter(r => !usedCurrentRoleIds.has(r.id) && !r.managed);
+  for (const br of backup.roles) {
+    if (roleIdMap.has(br.id)) continue;
+    const nameMatch = unmatchedCurrentRoles.find(r => r.name === br.name && !usedCurrentRoleIds.has(r.id));
+    if (nameMatch) {
+      roleIdMap.set(br.id, nameMatch);
+      usedCurrentRoleIds.add(nameMatch.id);
+    }
+  }
+
+  // 3) actualizar coincidencias / crear faltantes
+  for (const br of backup.roles) {
+    let role = roleIdMap.get(br.id);
+    try {
+      if (role) {
+        if (role.position >= myTopPos) { report.rolesSkipped++; continue; }
+        await role.edit({
+          name:        br.name,
+          color:       br.color,
+          hoist:       br.hoist,
+          mentionable: br.mentionable,
+          permissions: BigInt(br.permissions),
+          reason:      '[Restore] Sincronizado con el backup',
+        });
+        report.rolesUpdated++;
+      } else {
+        role = await guild.roles.create({
+          name:        br.name,
+          color:       br.color,
+          hoist:       br.hoist,
+          mentionable: br.mentionable,
+          permissions: BigInt(br.permissions),
+          reason:      '[Restore] Creado desde el backup',
+        });
+        roleIdMap.set(br.id, role);
+        report.rolesCreated++;
+      }
+    } catch (e) {
+      report.errors.push(`Rol "${br.name}": ${e.message}`);
+    }
+  }
+
+  // 4) borrar roles actuales que NO esten en el backup
+  const keptRoleIds = new Set([...roleIdMap.values()].map(r => r.id));
+  for (const role of currentRoles) {
+    if (keptRoleIds.has(role.id)) continue;
+    if (role.managed) continue;
+    if (role.position >= myTopPos) { report.rolesSkipped++; continue; }
+    try {
+      await role.delete('[Restore] Rol no presente en el backup');
+      report.rolesDeleted++;
+    } catch (e) {
+      report.errors.push(`Borrar rol "${role.name}": ${e.message}`);
+    }
+  }
+
+  // 5) reordenar posiciones segun el backup (de mayor a menor, por debajo del bot)
+  try {
+    const orderedIds = backup.roles
+      .map(br => roleIdMap.get(br.id))
+      .filter(r => r && r.position < myTopPos)
+      .map(r => r.id);
+    if (orderedIds.length > 1) {
+      const positions = orderedIds.map((id, idx) => ({ role: id, position: Math.max(1, myTopPos - 1 - idx) }));
+      await guild.roles.setPositions(positions).catch(() => {});
+    }
+  } catch (_) {}
+
+  // -------------------------------------------------------------- CANALES --
+  await guild.channels.fetch().catch(() => {});
+  const channelIdMap = new Map(); // backupChannelId -> Channel actual
+  const currentChannels = [...guild.channels.cache.values()];
+  const usedCurrentChannelIds = new Set();
+
+  for (const bc of backup.channels) {
+    const existing = guild.channels.cache.get(bc.id);
+    if (existing && existing.type === bc.type) {
+      channelIdMap.set(bc.id, existing);
+      usedCurrentChannelIds.add(existing.id);
+    }
+  }
+  const unmatchedChannels = currentChannels.filter(c => !usedCurrentChannelIds.has(c.id));
+  for (const bc of backup.channels) {
+    if (channelIdMap.has(bc.id)) continue;
+    const nameMatch = unmatchedChannels.find(c => c.name === bc.name && c.type === bc.type && !usedCurrentChannelIds.has(c.id));
+    if (nameMatch) {
+      channelIdMap.set(bc.id, nameMatch);
+      usedCurrentChannelIds.add(nameMatch.id);
+    }
+  }
+
+  function mapOverwrites(bc) {
+    return (bc.permissionOverwrites || []).map(o => {
+      let id = null;
+      if (o.type === 0) { // role
+        const mapped = roleIdMap.get(o.id);
+        id = mapped ? mapped.id : (guild.roles.cache.has(o.id) ? o.id : null);
+      } else { // member
+        id = guild.members.cache.has(o.id) ? o.id : null;
+      }
+      if (!id) return null;
+      return { id, type: o.type, allow: BigInt(o.allow), deny: BigInt(o.deny) };
+    }).filter(Boolean);
+  }
+
+  // Pass 1: categorias primero (para poder asignar parentId despues)
+  const categories = backup.channels.filter(c => c.type === ChannelType.GuildCategory);
+  const others     = backup.channels.filter(c => c.type !== ChannelType.GuildCategory);
+
+  for (const bc of categories) {
+    let ch = channelIdMap.get(bc.id);
+    try {
+      if (ch) {
+        await ch.edit({
+          name:                 bc.name,
+          position:             bc.position,
+          permissionOverwrites: mapOverwrites(bc),
+          reason:               '[Restore] Sincronizado con el backup',
+        });
+        report.channelsUpdated++;
+      } else {
+        ch = await guild.channels.create({
+          name:                 bc.name,
+          type:                 ChannelType.GuildCategory,
+          position:             bc.position,
+          permissionOverwrites: mapOverwrites(bc),
+          reason:               '[Restore] Creado desde el backup',
+        });
+        channelIdMap.set(bc.id, ch);
+        report.channelsCreated++;
+      }
+    } catch (e) { report.errors.push(`Categoria "${bc.name}": ${e.message}`); }
+  }
+
+  // Pass 2: el resto de canales (texto, voz, foros, etc.)
+  for (const bc of others) {
+    let ch = channelIdMap.get(bc.id);
+    const parent = bc.parentId ? channelIdMap.get(bc.parentId) : null;
+    const baseOpts = {
+      name:                 bc.name,
+      nsfw:                 bc.nsfw,
+      parent:               parent ? parent.id : null,
+      position:             bc.position,
+      permissionOverwrites: mapOverwrites(bc),
+      reason:               '[Restore] Sincronizado con el backup',
+    };
+    if (bc.topic != null)              baseOpts.topic = bc.topic;
+    if (bc.rateLimitPerUser != null)   baseOpts.rateLimitPerUser = bc.rateLimitPerUser;
+    if (bc.bitrate != null)            baseOpts.bitrate = bc.bitrate;
+    if (bc.userLimit != null)          baseOpts.userLimit = bc.userLimit;
+
+    try {
+      if (ch) {
+        await ch.edit(baseOpts);
+        report.channelsUpdated++;
+      } else {
+        ch = await guild.channels.create({ ...baseOpts, type: bc.type, reason: '[Restore] Creado desde el backup' });
+        channelIdMap.set(bc.id, ch);
+        report.channelsCreated++;
+      }
+    } catch (e) { report.errors.push(`Canal "${bc.name}": ${e.message}`); }
+  }
+
+  // Pass 3: borrar canales que existen ahora pero no estan en el backup
+  const keptChannelIds = new Set([...channelIdMap.values()].map(c => c.id));
+  for (const ch of currentChannels) {
+    if (keptChannelIds.has(ch.id)) continue;
+    try {
+      await ch.delete('[Restore] Canal no presente en el backup');
+      report.channelsDeleted++;
+    } catch (e) { report.errors.push(`Borrar canal "${ch.name}": ${e.message}`); }
+  }
+
+  // --------------------------------------------------------- CONFIG BASICA --
+  try {
+    const updates = {};
+    if (backup.afkTimeout != null) updates.afkTimeout = backup.afkTimeout;
+    if (backup.afkChannelId) {
+      const afk = channelIdMap.get(backup.afkChannelId);
+      if (afk) updates.afkChannel = afk.id;
+    }
+    if (Object.keys(updates).length) await guild.edit(updates).catch(() => {});
+  } catch (_) {}
+
+  return report;
+}
+
+// ============================================================================
 // AUTO-RESPONSES
 // ============================================================================
 const SALUDOS             = ['hola', 'ola', 'holi', 'oli', 'h0la', 'hol'];
@@ -1020,7 +1244,7 @@ async function handleJarvisCommands(message, text, guild) {
       { name: 'Mensajes',      value: '`jarvis di <texto>` — Enviar mensaje anonimo (soporta @menciones)\n`/say` — Slash command anonimo con soporte de canal', inline: false },
       { name: 'Voice Jail',    value: '`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline: false },
       { name: 'Anti-spam',     value: '`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline: false },
-      { name: 'Backups',       value: '`/save` — Guardar la configuracion actual del servidor', inline: false },
+      { name: 'Backups',       value: '`/save` — Guardar la configuracion actual del servidor\n`/restore` — Restaurar el servidor a un backup guardado (sube el archivo .json)', inline: false },
     );
     await message.reply({ embeds: [embed] });
     return true;
@@ -1909,7 +2133,7 @@ async function handleCommand(message) {
       .addFields(
         { name: 'Moderacion',    value: '`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline: false },
         { name: 'Utilidades',    value: '`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline: false },
-        { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`\n`/borrar_mensajes_persona` `/save`', inline: false },
+        { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`', inline: false },
       );
     if (isOwner) embed.addFields({ name: 'Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline: false });
     return message.reply({ embeds: [embed] });
@@ -2140,6 +2364,11 @@ const slashCommands = [
   new SlashCommandBuilder()
     .setName('save')
     .setDescription('Guarda la configuracion actual del servidor (canales, roles, etc.)'),
+
+  new SlashCommandBuilder()
+    .setName('restore')
+    .setDescription('Restaura el servidor exactamente como estaba en un backup de /save (borra lo que sobre)')
+    .addAttachmentOption(o => o.setName('archivo').setDescription('Archivo .json generado por /save').setRequired(true)),
 ].map(cmd => cmd.toJSON());
 
 async function registerSlashCommands() {
@@ -2594,6 +2823,65 @@ client.on('interactionCreate', async interaction => {
       });
     } catch (err) {
       await interaction.editReply(`Error al guardar la configuracion: ${err.message}`);
+    }
+    return;
+  }
+
+  // ── RESTORE ──
+  if (commandName === 'restore') {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator))
+      return interaction.reply({ content: 'Necesitas permisos de **Administrador** para usar este comando.', flags: MessageFlags.Ephemeral });
+
+    const attachment = interaction.options.getAttachment('archivo');
+    if (!attachment || !attachment.name?.toLowerCase().endsWith('.json'))
+      return interaction.reply({ content: 'Debes adjuntar un archivo `.json` valido generado por `/save`.', flags: MessageFlags.Ephemeral });
+
+    const me = guild.members.me;
+    if (!me.permissions.has(PermissionFlagsBits.ManageRoles) || !me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+      return interaction.reply({ content: 'Necesito los permisos **Manage Roles** y **Manage Channels** para poder restaurar.', flags: MessageFlags.Ephemeral });
+    }
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    let backup;
+    try {
+      const res = await fetch(attachment.url);
+      backup    = await res.json();
+    } catch (e) {
+      return interaction.editReply(`No pude leer el archivo adjunto: ${e.message}`);
+    }
+
+    if (!backup || !Array.isArray(backup.roles) || !Array.isArray(backup.channels)) {
+      return interaction.editReply('El archivo no tiene un formato de backup valido (debe ser generado por `/save`).');
+    }
+    if (backup.guildId && backup.guildId !== guild.id) {
+      return interaction.editReply('Este backup pertenece a otro servidor. Por seguridad, la restauracion fue cancelada.');
+    }
+
+    const savedAtMs = backup.savedAt ? new Date(backup.savedAt).getTime() : null;
+    await interaction.editReply(
+      `Restaurando **${backup.guildName || guild.name}** a como estaba` +
+      (savedAtMs ? ` el <t:${Math.floor(savedAtMs / 1000)}:f>` : '') +
+      `...\nEsto va a crear, actualizar y **borrar** roles/canales para que coincidan exactamente con el backup. Puede tardar un poco.`,
+    );
+
+    try {
+      const report = await restoreServerConfig(guild, backup);
+      const embed  = simpleEmbed(
+        'Restauracion Completada',
+        `El servidor fue sincronizado con el backup` + (savedAtMs ? ` guardado <t:${Math.floor(savedAtMs / 1000)}:R>` : '') + `.`,
+        0x2ecc71,
+      );
+      embed.addFields(
+        { name: 'Roles',   value: `Creados: **${report.rolesCreated}**\nActualizados: **${report.rolesUpdated}**\nBorrados: **${report.rolesDeleted}**\nOmitidos: **${report.rolesSkipped}**`, inline: true },
+        { name: 'Canales', value: `Creados: **${report.channelsCreated}**\nActualizados: **${report.channelsUpdated}**\nBorrados: **${report.channelsDeleted}**`, inline: true },
+      );
+      if (report.errors.length) {
+        embed.addFields({ name: `Errores (${report.errors.length})`, value: report.errors.slice(0, 10).join('\n').slice(0, 1024) });
+      }
+      await interaction.editReply({ content: '', embeds: [embed] });
+    } catch (e) {
+      await interaction.editReply(`Error durante la restauracion: ${e.message}`);
     }
     return;
   }
