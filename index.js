@@ -38,8 +38,11 @@ const REMIND_FILE     = path.join(DATA_DIR, 'reminders.json');
 const MODLOG_FILE     = path.join(DATA_DIR, 'modlog_channels.json');
 const WARNS_FILE      = path.join(DATA_DIR, 'warnings.json');
 const XPCHANNELS_FILE = path.join(DATA_DIR, 'xp_channels.json');
+const DELWATCH_FILE   = path.join(DATA_DIR, 'delwatch.json');
+const BACKUP_DIR      = path.join(DATA_DIR, 'backups');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
 
 function loadJSON(file, def = {}) {
   try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : def; }
@@ -56,6 +59,89 @@ let reminders    = loadJSON(REMIND_FILE, []);
 let modlogMap    = loadJSON(MODLOG_FILE, {});
 let warningsData = loadJSON(WARNS_FILE, {});
 let xpChannels   = loadJSON(XPCHANNELS_FILE, {}); // { guildId: channelId | 'all' }
+let delWatchData = loadJSON(DELWATCH_FILE, {});   // { guildId: [userId, ...] }
+
+// ============================================================================
+// AUTO-DELETE WATCH (borrar mensajes de una persona automaticamente)
+// ============================================================================
+function getDelWatchArr(guildId) {
+  if (!delWatchData[guildId]) delWatchData[guildId] = [];
+  return delWatchData[guildId];
+}
+function isWatchedForDeletion(guildId, userId) {
+  return (delWatchData[guildId] || []).includes(userId);
+}
+function addDelWatch(guildId, userId) {
+  const arr = getDelWatchArr(guildId);
+  if (!arr.includes(userId)) arr.push(userId);
+  saveJSON(DELWATCH_FILE, delWatchData);
+}
+function removeDelWatch(guildId, userId) {
+  if (!delWatchData[guildId]) return;
+  delWatchData[guildId] = delWatchData[guildId].filter(id => id !== userId);
+  saveJSON(DELWATCH_FILE, delWatchData);
+}
+
+// ============================================================================
+// SERVER CONFIG BACKUP (/save)
+// ============================================================================
+async function saveServerConfig(guild) {
+  await guild.roles.fetch().catch(() => {});
+  await guild.channels.fetch().catch(() => {});
+
+  const roles = guild.roles.cache
+    .filter(r => r.name !== '@everyone')
+    .sort((a, b) => b.position - a.position)
+    .map(r => ({
+      id:          r.id,
+      name:        r.name,
+      color:       r.hexColor,
+      hoist:       r.hoist,
+      mentionable: r.mentionable,
+      position:    r.position,
+      permissions: r.permissions.bitfield.toString(),
+    }));
+
+  const channels = guild.channels.cache
+    .sort((a, b) => a.rawPosition - b.rawPosition)
+    .map(c => ({
+      id:                   c.id,
+      name:                 c.name,
+      type:                 c.type,
+      position:             c.rawPosition,
+      parentId:             c.parentId || null,
+      parentName:           c.parent?.name || null,
+      topic:                c.topic || null,
+      nsfw:                 c.nsfw || false,
+      rateLimitPerUser:     c.rateLimitPerUser ?? null,
+      bitrate:              c.bitrate ?? null,
+      userLimit:            c.userLimit ?? null,
+      permissionOverwrites: c.permissionOverwrites
+        ? [...c.permissionOverwrites.cache.values()].map(o => ({
+            id:   o.id,
+            type: o.type,
+            allow: o.allow.bitfield.toString(),
+            deny:  o.deny.bitfield.toString(),
+          }))
+        : [],
+    }));
+
+  const backup = {
+    guildId:           guild.id,
+    guildName:         guild.name,
+    savedAt:           new Date().toISOString(),
+    iconURL:           guild.iconURL({ size: 512 }) || null,
+    verificationLevel: guild.verificationLevel,
+    afkChannelId:      guild.afkChannelId,
+    afkTimeout:        guild.afkTimeout,
+    roles,
+    channels,
+  };
+
+  const filePath = path.join(BACKUP_DIR, `${guild.id}.json`);
+  fs.writeFileSync(filePath, JSON.stringify(backup, null, 2));
+  return { backup, filePath };
+}
 
 // ============================================================================
 // AUTO-RESPONSES
@@ -933,6 +1019,8 @@ async function handleJarvisCommands(message, text, guild) {
       { name: 'Usuarios',      value: '`jarvis dame el rol Admin`\n`jarvis quitame el rol Admin`\n`jarvis quitale el rol Admin a @user`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`\n`jarvis cambia el nick de @user a NuevoNick`', inline: false },
       { name: 'Mensajes',      value: '`jarvis di <texto>` — Enviar mensaje anonimo (soporta @menciones)\n`/say` — Slash command anonimo con soporte de canal', inline: false },
       { name: 'Voice Jail',    value: '`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline: false },
+      { name: 'Anti-spam',     value: '`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline: false },
+      { name: 'Backups',       value: '`/save` — Guardar la configuracion actual del servidor', inline: false },
     );
     await message.reply({ embeds: [embed] });
     return true;
@@ -1821,7 +1909,7 @@ async function handleCommand(message) {
       .addFields(
         { name: 'Moderacion',    value: '`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline: false },
         { name: 'Utilidades',    value: '`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline: false },
-        { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`', inline: false },
+        { name: 'Slash (/)',     value: '`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`\n`/borrar_mensajes_persona` `/save`', inline: false },
       );
     if (isOwner) embed.addFields({ name: 'Admin (solo owner)', value: '`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline: false });
     return message.reply({ embeds: [embed] });
@@ -1844,6 +1932,13 @@ client.once('clientReady', async () => {
 
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
+
+  // ── AUTO-DELETE WATCH: borra en el acto los mensajes de usuarios vigilados ──
+  if (isWatchedForDeletion(message.guild.id, message.author.id)) {
+    await message.delete().catch(() => {});
+    return;
+  }
+
   try {
     await addXp(message);
     const jarvisHandled = await handleJarvis(message);
@@ -2035,6 +2130,16 @@ const slashCommands = [
     .addUserOption(o => o.setName('user3').setDescription('Miembro 3'))
     .addUserOption(o => o.setName('user4').setDescription('Miembro 4'))
     .addStringOption(o => o.setName('nombre').setDescription('Nombre del canal (opcional)')),
+
+  new SlashCommandBuilder()
+    .setName('borrar_mensajes_persona')
+    .setDescription('Borra automaticamente los proximos mensajes que envie un usuario')
+    .addUserOption(o => o.setName('usuario').setDescription('Usuario a vigilar').setRequired(true))
+    .addBooleanOption(o => o.setName('desactivar').setDescription('Desactivar el borrado automatico para este usuario')),
+
+  new SlashCommandBuilder()
+    .setName('save')
+    .setDescription('Guarda la configuracion actual del servidor (canales, roles, etc.)'),
 ].map(cmd => cmd.toJSON());
 
 async function registerSlashCommands() {
@@ -2424,6 +2529,72 @@ client.on('interactionCreate', async interaction => {
       const mentions = [...invited].map(m => m.toString()).join(', ');
       await interaction.editReply(`Canal \`${ch.name}\` creado!\nInvitados: ${mentions}\nEntrar: ${ch}`);
     } catch (err) { await interaction.editReply(`Error: ${err.message}`); }
+    return;
+  }
+
+  // ── BORRAR_MENSAJES_PERSONA ──
+  if (commandName === 'borrar_mensajes_persona') {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages))
+      return interaction.reply({ content: 'Necesitas el permiso **Manage Messages** para usar este comando.', flags: MessageFlags.Ephemeral });
+
+    const target      = interaction.options.getUser('usuario');
+    const desactivar   = interaction.options.getBoolean('desactivar');
+
+    if (target.id === client.user.id)
+      return interaction.reply({ content: 'No puedo vigilarme a mi mismo.', flags: MessageFlags.Ephemeral });
+    if (target.id === OWNER_ID && !desactivar)
+      return interaction.reply({ content: 'No puedes activar esto sobre el owner del bot.', flags: MessageFlags.Ephemeral });
+
+    if (desactivar) {
+      if (!isWatchedForDeletion(guild.id, target.id))
+        return interaction.reply({ content: `${target} no esta siendo vigilado actualmente.`, flags: MessageFlags.Ephemeral });
+      removeDelWatch(guild.id, target.id);
+      return interaction.reply({
+        embeds: [simpleEmbed(
+          'Borrado Automatico Desactivado',
+          `Ya no se borraran los mensajes que envie ${target} de aqui en adelante.`,
+          0x2ecc71,
+        )],
+      });
+    }
+
+    if (isWatchedForDeletion(guild.id, target.id))
+      return interaction.reply({ content: `${target} ya esta siendo vigilado. Sus mensajes se siguen borrando.`, flags: MessageFlags.Ephemeral });
+
+    addDelWatch(guild.id, target.id);
+    const embed = simpleEmbed(
+      'Borrado Automatico Activado',
+      `A partir de ahora se borrara **automaticamente** cada mensaje que envie ${target} en este servidor.\n` +
+      `Usa \`/borrar_mensajes_persona usuario:${target.tag ?? target.username} desactivar:true\` para detenerlo.`,
+      0xe74c3c,
+    );
+    embed.setFooter({ text: `Activado por ${user.tag}` });
+    return interaction.reply({ embeds: [embed] });
+  }
+
+  // ── SAVE ──
+  if (commandName === 'save') {
+    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator))
+      return interaction.reply({ content: 'Necesitas permisos de **Administrador** para usar este comando.', flags: MessageFlags.Ephemeral });
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      const { backup, filePath } = await saveServerConfig(guild);
+      const embed = simpleEmbed(
+        'Configuracion Guardada',
+        `Se guardo una copia de la configuracion de **${guild.name}**.\n\n` +
+        `**Roles guardados:** ${backup.roles.length}\n` +
+        `**Canales guardados:** ${backup.channels.length}\n` +
+        `**Fecha:** <t:${Math.floor(Date.now()/1000)}:f>`,
+        0x2ecc71,
+      );
+      await interaction.editReply({
+        embeds: [embed],
+        files: [{ attachment: filePath, name: `backup_${guild.id}.json` }],
+      });
+    } catch (err) {
+      await interaction.editReply(`Error al guardar la configuracion: ${err.message}`);
+    }
     return;
   }
 
