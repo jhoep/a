@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Bot de Discord "Jarvis" - version Python (discord.py)
-Conversion 1:1 desde la version original en discord.js
-"""
 
 # ============================================================================
 # IMPORTS
