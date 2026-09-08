@@ -1,23 +1,21 @@
-FROM node:20-slim
+FROM python:3.11-slim
 
-# Instalar ffmpeg, python3, yt-dlp y dependencias de audio
+# Instalar ffmpeg, yt-dlp y dependencias de audio/compilación
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    python3 \
-    python3-pip \
     build-essential \
     curl \
     libtool \
     autoconf \
     automake \
-    && pip3 install yt-dlp --break-system-packages \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm install
+COPY requirements.txt .
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt \
+    && pip install --no-cache-dir --break-system-packages yt-dlp
 
 COPY . .
 
-CMD ["node", "index.js"]
+CMD ["python3", "bot.py"]
