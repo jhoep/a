@@ -1,19 +1,18 @@
-
-# ============================================================================
-# IMPORTS
-# ============================================================================
 import os
 import re
 import json
 import time
 import random
 import asyncio
+import shutil
+import functools
 import unicodedata
 import threading
 import http.server
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
+from typing import Optional
 import aiohttp
 import discord
 from discord import app_commands
@@ -1191,6 +1190,1176 @@ async def ask_groq(prompt, use_search=False):
     except Exception as e:
         return f'Error contactando Groq: {e}'
 # ============================================================================
+# MUSIC SYSTEM (yt-dlp + FFmpeg)
+# ============================================================================
+# Requisitos:
+#   pip install -U "discord.py[voice]" "yt-dlp[default]"
+#   ffmpeg + libopus instalados en el servidor (si no puedes instalar ffmpeg:
+#   `pip install imageio-ffmpeg` y el bot lo detecta solo)
+#   un runtime de JavaScript para YouTube (Deno recomendado; Node o Bun tambien sirven)
+# Opcional (variables de entorno):
+#   YTDLP_COOKIES     ruta a un cookies.txt (si YouTube pide "confirma que no eres un bot")
+#   YTDLP_JS_RUNTIME  deno | node | bun | quickjs (fuerza el runtime de JavaScript)
+#   FFMPEG_PATH       ruta al ejecutable de ffmpeg
+try:
+    import yt_dlp
+    YTDLP_AVAILABLE = True
+except Exception:
+    yt_dlp = None
+    YTDLP_AVAILABLE = False
+
+MUSIC_IDLE_TIMEOUT   = 300        # seg. sin musica antes de salir del canal de voz
+MUSIC_ALONE_TIMEOUT  = 60         # seg. solo en el canal antes de salir
+MUSIC_MAX_QUEUE      = 100        # maximo de canciones en cola por servidor
+MUSIC_MAX_PLAYLIST   = 50         # maximo de canciones que se cargan de una playlist
+MUSIC_DEFAULT_VOLUME = 50         # volumen inicial (%)
+MUSIC_STREAM_TTL     = 3 * 3600   # los links directos caducan; se renuevan pasado este tiempo
+MUSIC_MIN_PLAY_SECS  = 1.5        # si una cancion suena menos que esto sin que nadie la salte, se considera fallo
+QUEUE_PER_PAGE       = 10
+YTDLP_COOKIES        = os.environ.get('YTDLP_COOKIES')
+FFMPEG_BEFORE_OPTS   = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+MUSIC_URL_RE         = re.compile(r'^https?://', re.IGNORECASE)
+LOOP_LABELS          = {'off': 'Apagado', 'track': 'Cancion', 'queue': 'Cola'}
+
+
+def _find_ffmpeg():
+    path = os.environ.get('FFMPEG_PATH') or shutil.which('ffmpeg')
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _opus_ready():
+    try:
+        if discord.opus.is_loaded():
+            return True
+        loader = getattr(discord.opus, '_load_default', None)
+        return bool(loader()) if loader else True
+    except Exception:
+        return False
+
+
+def _detect_js_runtimes():
+    forced = (os.environ.get('YTDLP_JS_RUNTIME') or '').strip().lower()
+    if forced:
+        return {forced: {}}
+    found = {}
+    for name in ('deno', 'node', 'bun'):
+        if shutil.which(name):
+            found[name] = {}
+    return found or None
+
+
+_vc_mod            = getattr(discord, 'voice_client', None)
+FFMPEG_EXE         = _find_ffmpeg()
+OPUS_OK            = _opus_ready()
+NACL_OK            = bool(getattr(_vc_mod, 'has_nacl', False))
+DAVE_OK            = bool(getattr(_vc_mod, 'has_dave', False))
+YTDLP_JS_RUNTIMES  = _detect_js_runtimes()
+
+
+def music_status_line():
+    js = ', '.join(YTDLP_JS_RUNTIMES) if YTDLP_JS_RUNTIMES else 'NO (YouTube puede fallar)'
+    return (
+        f'[Music] yt-dlp={"OK" if YTDLP_AVAILABLE else "NO"} | ffmpeg={FFMPEG_EXE or "NO"} | '
+        f'opus={"OK" if OPUS_OK else "NO"} | pynacl={"OK" if NACL_OK else "NO"} | '
+        f'davey={"OK" if DAVE_OK else "NO"} | js={js}'
+    )
+
+
+class MusicError(Exception):
+    """Error que se le muestra tal cual al usuario (mensaje ya redactado)."""
+
+
+def music_ensure_available():
+    missing = []
+    if not YTDLP_AVAILABLE:
+        missing.append('`yt-dlp`')
+    if not FFMPEG_EXE:
+        missing.append('`FFmpeg`')
+    if not OPUS_OK:
+        missing.append('`libopus`')
+    if not NACL_OK:
+        missing.append('`PyNaCl`')
+    if missing:
+        raise MusicError('La musica no esta disponible: faltan ' + ', '.join(missing) + ' en el servidor del bot.')
+
+
+# ----------------------------------------------------------------- utilidades --
+def fmt_clock(secs):
+    secs = max(0, int(secs or 0))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f'{h}:{m:02d}:{s:02d}' if h else f'{m}:{s:02d}'
+
+
+def clean_title(text, limit=70):
+    t = str(text or 'Desconocido').replace('[', '(').replace(']', ')').replace('\n', ' ').strip() or 'Desconocido'
+    if len(t) > limit:
+        t = t[:limit - 1] + '\u2026'
+    return discord.utils.escape_markdown(t)
+
+
+def short_error(e, limit=300):
+    s = re.sub(r'\x1b\[[0-9;]*m', '', str(e) or e.__class__.__name__).strip()
+    s = re.sub(r'^ERROR:\s*', '', s)
+    return s if len(s) <= limit else s[:limit - 3] + '...'
+
+
+def friendly_ytdl_error(e):
+    msg = short_error(e, 400)
+    low = msg.lower()
+    if 'confirm you' in low and 'bot' in low:
+        return ('YouTube esta pidiendo verificacion anti-bot a este servidor. '
+                'Configura la variable `YTDLP_COOKIES` con un cookies.txt o prueba con otro enlace.')
+    if 'unsupported url' in low:
+        return 'Ese enlace no es compatible. Usa YouTube, SoundCloud, Bandcamp... o escribe el nombre de la cancion.'
+    if 'private video' in low or 'video unavailable' in low or 'not available' in low:
+        return 'Ese video no esta disponible (privado, borrado o bloqueado en la region del servidor).'
+    if 'age' in low and 'sign in' in low:
+        return 'Ese video tiene restriccion de edad y necesita cookies (`YTDLP_COOKIES`) para reproducirse.'
+    return msg
+
+
+def voice_channel_of(member):
+    vs = getattr(member, 'voice', None)
+    return vs.channel if vs and vs.channel else None
+
+
+def can_announce(channel, guild):
+    try:
+        perms = channel.permissions_for(guild.me)
+        return bool(perms.send_messages and perms.embed_links)
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------- tracks --
+@dataclass
+class Track:
+    title: str
+    webpage_url: str
+    duration: Optional[int] = None
+    thumbnail: Optional[str] = None
+    uploader: Optional[str] = None
+    is_live: bool = False
+    requester_id: int = 0
+    requester_name: str = ''
+    stream_url: Optional[str] = None
+    user_agent: Optional[str] = None
+    resolved_at: float = 0.0
+    announced: bool = False
+    resolving: Optional[object] = field(default=None, repr=False, compare=False)
+
+    def link(self, limit=70):
+        title = clean_title(self.title, limit)
+        if self.webpage_url and MUSIC_URL_RE.match(self.webpage_url):
+            url = self.webpage_url.replace(')', '%29')
+            return f'[{title}]({url})'
+        return title
+
+    def duration_text(self):
+        if self.is_live:
+            return 'EN VIVO'
+        return fmt_clock(self.duration) if self.duration else '?'
+
+
+def _entry_url(e):
+    url = e.get('webpage_url') or e.get('original_url') or e.get('url') or ''
+    if url and not MUSIC_URL_RE.match(url) and e.get('id'):
+        url = f'https://www.youtube.com/watch?v={e["id"]}'
+    return url
+
+
+def _track_from_info(info, member, full):
+    thumb = info.get('thumbnail')
+    if not thumb and info.get('thumbnails'):
+        thumb = (info['thumbnails'][-1] or {}).get('url')
+    dur = info.get('duration')
+    t = Track(
+        title=info.get('title') or 'Desconocido',
+        webpage_url=_entry_url(info),
+        duration=int(dur) if dur else None,
+        thumbnail=thumb,
+        uploader=info.get('uploader') or info.get('channel') or info.get('artist'),
+        is_live=bool(info.get('is_live')),
+        requester_id=member.id,
+        requester_name=member.display_name,
+    )
+    if full and info.get('url'):
+        t.stream_url = info['url']
+        t.user_agent = (info.get('http_headers') or {}).get('User-Agent')
+        t.resolved_at = time.time()
+    return t
+
+
+# -------------------------------------------------------------------- yt-dlp --
+def _ytdl_opts(noplaylist=True, flat=False):
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'noplaylist': noplaylist,
+        'playlistend': MUSIC_MAX_PLAYLIST,
+        'socket_timeout': 15,
+        'source_address': '0.0.0.0',   # fuerza IPv4 (YouTube bloquea mas rangos IPv6)
+    }
+    if flat:
+        opts['extract_flat'] = 'in_playlist'
+    else:
+        opts['format'] = 'bestaudio/best'
+    if YTDLP_COOKIES and os.path.isfile(YTDLP_COOKIES):
+        opts['cookiefile'] = YTDLP_COOKIES
+    if YTDLP_JS_RUNTIMES:
+        opts['js_runtimes'] = YTDLP_JS_RUNTIMES
+    return opts
+
+
+def _ytdl_extract(query, noplaylist=True, flat=False):
+    with yt_dlp.YoutubeDL(_ytdl_opts(noplaylist, flat)) as ydl:
+        return ydl.extract_info(query, download=False)
+
+
+async def ytdl_run(query, noplaylist=True, flat=False):
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(_ytdl_extract, query, noplaylist, flat)
+    try:
+        return await asyncio.wait_for(loop.run_in_executor(None, fn), timeout=60)
+    except asyncio.TimeoutError:
+        raise MusicError('La busqueda tardo demasiado. Intenta de nuevo en un momento.')
+    except Exception as e:
+        raise MusicError(friendly_ytdl_error(e))
+
+
+def is_playlist_url(url):
+    u = url.lower()
+    if 'watch?v=' in u or 'youtu.be/' in u or '/shorts/' in u:
+        return False
+    return 'list=' in u or '/sets/' in u or '/playlist' in u or '/album/' in u
+
+
+async def resolve_tracks(query, member):
+    """Devuelve (tracks, titulo_playlist, es_playlist)."""
+    query = query.strip()
+    if MUSIC_URL_RE.match(query):
+        if is_playlist_url(query):
+            data = await ytdl_run(query, noplaylist=False, flat=True)
+            if data and data.get('entries') is not None:
+                entries = [e for e in list(data['entries']) if e]
+                tracks = [_track_from_info(e, member, full=False) for e in entries[:MUSIC_MAX_PLAYLIST]]
+                tracks = [t for t in tracks if t.webpage_url]
+                if not tracks:
+                    raise MusicError('La playlist esta vacia o no pude leerla.')
+                return tracks, (data.get('title') or 'Playlist'), True
+            if data:
+                return [_track_from_info(data, member, full=False)], None, False
+            raise MusicError('No pude leer ese enlace.')
+        data = await ytdl_run(query, noplaylist=True)
+    else:
+        data = await ytdl_run(f'ytsearch1:{query}', noplaylist=True)
+    if data and data.get('entries') is not None:
+        data = next((e for e in list(data['entries']) if e), None)
+    if not data:
+        raise MusicError('No encontre resultados para esa busqueda.')
+    return [_track_from_info(data, member, full=True)], None, False
+
+
+async def _resolve_stream(track):
+    if not track.webpage_url:
+        raise MusicError('Esa cancion no tiene un enlace valido.')
+    data = await ytdl_run(track.webpage_url, noplaylist=True)
+    if data and data.get('entries') is not None:
+        data = next((e for e in list(data['entries']) if e), None)
+    if not data:
+        raise MusicError('No pude obtener el audio de esta cancion.')
+    url = data.get('url')
+    if not url and data.get('requested_formats'):
+        fmts = data['requested_formats']
+        audio = [f for f in fmts if f.get('acodec') not in (None, 'none')]
+        url = (audio or fmts)[0].get('url')
+    if not url:
+        raise MusicError('No pude obtener el audio de esta cancion.')
+    track.stream_url = url
+    track.user_agent = (data.get('http_headers') or {}).get('User-Agent')
+    track.resolved_at = time.time()
+    track.is_live = bool(data.get('is_live'))
+    if data.get('duration') and not track.duration:
+        track.duration = int(data['duration'])
+
+
+async def ensure_stream(track, force=False):
+    if not force and track.stream_url and (time.time() - track.resolved_at) < MUSIC_STREAM_TTL:
+        return
+    task = track.resolving
+    if task is None or task.done():
+        task = asyncio.ensure_future(_resolve_stream(track))
+        track.resolving = task
+    await asyncio.shield(task)
+
+
+def make_source(track, volume):
+    before = FFMPEG_BEFORE_OPTS
+    if track.user_agent:
+        before += ' -user_agent "' + track.user_agent.replace('"', '') + '"'
+    audio = discord.FFmpegPCMAudio(track.stream_url, executable=FFMPEG_EXE, before_options=before, options='-vn')
+    return discord.PCMVolumeTransformer(audio, volume=volume)
+
+
+# ------------------------------------------------------------------- embeds --
+def now_playing_embed(player, track, with_progress=False):
+    embed = discord.Embed(title='Reproduciendo ahora', description=f'**{track.link(80)}**', color=0x1DB954)
+    if track.thumbnail:
+        embed.set_thumbnail(url=track.thumbnail)
+    if track.uploader:
+        embed.add_field(name='Canal', value=clean_title(track.uploader, 40), inline=True)
+    embed.add_field(name='Duracion', value=track.duration_text(), inline=True)
+    embed.add_field(name='Pedida por', value=f'<@{track.requester_id}>', inline=True)
+    embed.add_field(name='Volumen', value=f'{int(round(player.volume * 100))}%', inline=True)
+    embed.add_field(name='Loop', value=LOOP_LABELS.get(player.loop_mode, 'Apagado'), inline=True)
+    embed.add_field(name='En cola', value=str(len(player.queue)), inline=True)
+    if with_progress and track.duration and not track.is_live:
+        pos = min(int(player.position()), track.duration)
+        filled = min(20, int(pos / track.duration * 20))
+        bar = '\u2588' * filled + '\u2591' * (20 - filled)
+        embed.add_field(name='Progreso', value=f'`{bar}`\n`{fmt_clock(pos)} / {fmt_clock(track.duration)}`', inline=False)
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
+def queue_total_pages(player):
+    return max(1, (len(player.queue) + QUEUE_PER_PAGE - 1) // QUEUE_PER_PAGE)
+
+
+def build_queue_embed(player, page=0):
+    total_pages = queue_total_pages(player)
+    page = max(0, min(page, total_pages - 1))
+    start = page * QUEUE_PER_PAGE
+    chunk = player.queue[start:start + QUEUE_PER_PAGE]
+    lines = []
+    if page == 0 and player.current:
+        lines.append(f'**Sonando ahora:** {player.current.link(60)} `{player.current.duration_text()}`')
+        lines.append('')
+    if chunk:
+        for i, t in enumerate(chunk):
+            lines.append(f'`{start + i + 1}.` {t.link(55)} `{t.duration_text()}` - {clean_title(t.requester_name, 20)}')
+    elif page == 0:
+        lines.append('La cola esta vacia.')
+    embed = discord.Embed(title=f'Cola de {player.guild.name}'[:256], description='\n'.join(lines)[:4000], color=0x3498db)
+    total_secs = sum((t.duration or 0) for t in player.queue)
+    embed.set_footer(
+        text=f'Pagina {page + 1}/{total_pages} | {len(player.queue)} en cola | {fmt_clock(total_secs)} en total | '
+             f'Loop: {LOOP_LABELS.get(player.loop_mode, "Apagado")}'
+    )
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed
+
+
+async def send_queue(send, player, user_id):
+    """send = funcion async que acepta embed= y view= (message.reply, response.send_message...)."""
+    total_pages = queue_total_pages(player)
+
+    def build(page):
+        return build_queue_embed(player, page)
+
+    if total_pages <= 1:
+        await send(embed=build(0))
+    else:
+        await send(embed=build(0), view=MembersView(user_id, build, total_pages))
+
+
+# ------------------------------------------------------------------- player --
+music_players = {}   # guildId -> MusicPlayer
+
+
+class MusicPlayer:
+    def __init__(self, guild):
+        self.guild = guild
+        self.loop = asyncio.get_running_loop()
+        self.queue = []
+        self.current = None
+        self.loop_mode = 'off'          # off | track | queue
+        self.volume = MUSIC_DEFAULT_VOLUME / 100
+        self.text_channel = None
+        self.np_message = None
+        self.np_view = None
+        self.lock = asyncio.Lock()
+        self.destroyed = False
+        self.started_at = 0.0
+        self.paused_since = None
+        self.paused_total = 0.0
+        self._wake = asyncio.Event()
+        self._next = asyncio.Event()
+        self._end_reason = 'end'        # end | skip | stop
+        self._task = None
+        self._alone_task = None
+        self._prefetch_task = None
+
+    # ---- estado ----
+    @property
+    def vc(self):
+        return self.guild.voice_client
+
+    def is_paused(self):
+        vc = self.vc
+        return bool(vc and vc.is_paused())
+
+    def position(self):
+        if not self.current:
+            return 0.0
+        ref = self.paused_since if self.paused_since is not None else time.monotonic()
+        return max(0.0, ref - self.started_at - self.paused_total)
+
+    def start(self):
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+        self._wake.set()
+
+    async def say(self, **kwargs):
+        ch = self.text_channel
+        if not ch:
+            return None
+        try:
+            return await ch.send(**kwargs)
+        except Exception:
+            return None
+
+    # ---- controles ----
+    def pause(self):
+        vc = self.vc
+        if not vc or not vc.is_playing():
+            return False
+        vc.pause()
+        self.paused_since = time.monotonic()
+        return True
+
+    def resume(self):
+        vc = self.vc
+        if not vc or not vc.is_paused():
+            return False
+        vc.resume()
+        if self.paused_since is not None:
+            self.paused_total += time.monotonic() - self.paused_since
+            self.paused_since = None
+        return True
+
+    def skip(self):
+        if not self.current:
+            return False
+        self._end_reason = 'skip'
+        vc = self.vc
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        return True
+
+    def stop(self):
+        self.queue.clear()
+        if self.current:
+            self._end_reason = 'stop'
+            vc = self.vc
+            if vc and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+
+    # ---- ciclo principal ----
+    def _after(self, error):
+        if error:
+            print(f'[Music] Error de reproduccion en {self.guild.id}: {error}')
+        try:
+            self.loop.call_soon_threadsafe(self._next.set)
+        except RuntimeError:
+            pass
+
+    def _requeue(self, track, reason):
+        if reason == 'stop':
+            return
+        if self.loop_mode == 'queue':
+            track.announced = False
+            self.queue.append(track)
+        elif self.loop_mode == 'track' and reason == 'end':
+            self.queue.insert(0, track)
+
+    async def _run(self):
+        try:
+            await self._loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            import traceback
+            print(f'[Music] Error en el reproductor de {self.guild.id}: {e}')
+            traceback.print_exc()
+            await self.say(embed=simple_embed('Error del reproductor', short_error(e), 0xe74c3c))
+            await self.destroy()
+
+    async def _loop(self):
+        while True:
+            if not self.queue:
+                self.current = None
+                await self._clear_card()
+            if not self.queue:
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=MUSIC_IDLE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    await self.say(embed=simple_embed('Inactividad', 'Me sali del canal de voz por inactividad.', 0x95a5a6))
+                    await self.destroy()
+                    return
+                continue
+
+            track = self.queue.pop(0)
+            self.current = track
+            self._end_reason = 'end'
+
+            vc = self.vc
+            if not vc or not vc.is_connected():
+                await self.destroy()
+                return
+
+            try:
+                await ensure_stream(track)
+                source = make_source(track, self.volume)
+            except Exception as e:
+                await self.say(embed=simple_embed('No pude reproducir', f'{track.link()}\n{short_error(e)}', 0xe74c3c))
+                continue
+
+            # el usuario pudo pedir skip/stop mientras se cargaba la cancion
+            if self._end_reason != 'end':
+                self._requeue(track, self._end_reason)
+                self._end_reason = 'end'
+                continue
+
+            self._next.clear()
+            self.paused_since = None
+            self.paused_total = 0.0
+            self.started_at = time.monotonic()
+            try:
+                vc.play(source, after=self._after)
+            except Exception as e:
+                await self.say(embed=simple_embed('No pude reproducir', f'{track.link()}\n{short_error(e)}', 0xe74c3c))
+                continue
+
+            if not track.announced:
+                await self._announce(track)
+            self._prefetch_next()
+
+            await self._next.wait()
+
+            reason = self._end_reason
+            self._end_reason = 'end'
+            played = self.position()
+            short_track = bool(track.duration and track.duration <= 2)
+            if reason == 'end' and played < MUSIC_MIN_PLAY_SECS and not short_track:
+                await self.say(embed=simple_embed(
+                    'Fallo la reproduccion',
+                    f'{track.link()}\nEl audio se corto al empezar. Paso a la siguiente.',
+                    0xe74c3c,
+                ))
+            else:
+                self._requeue(track, reason)
+
+    def _prefetch_next(self):
+        if not self.queue or (self._prefetch_task is not None and not self._prefetch_task.done()):
+            return
+        nxt = self.queue[0]
+
+        async def _go():
+            try:
+                await ensure_stream(nxt)
+            except Exception:
+                pass
+
+        self._prefetch_task = asyncio.create_task(_go())
+
+    # ---- tarjeta "reproduciendo ahora" ----
+    async def _announce(self, track):
+        track.announced = True
+        await self._clear_card()
+        if not self.text_channel:
+            return
+        view = MusicControlView(self, track)
+        try:
+            self.np_message = await self.text_channel.send(embed=now_playing_embed(self, track), view=view)
+            self.np_view = view
+        except Exception as e:
+            view.stop()
+            print(f'[Music] No pude enviar la tarjeta de reproduccion: {e}')
+
+    async def _clear_card(self):
+        if self.np_view is not None:
+            self.np_view.stop()
+            self.np_view = None
+        msg, self.np_message = self.np_message, None
+        if msg is not None:
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+
+    # ---- auto-salida si me quedo solo ----
+    def start_alone_timer(self):
+        if self._alone_task is not None and not self._alone_task.done():
+            return
+
+        async def _wait():
+            try:
+                await asyncio.sleep(MUSIC_ALONE_TIMEOUT)
+            except asyncio.CancelledError:
+                return
+            vc = self.vc
+            if vc and vc.channel and not any(not m.bot for m in vc.channel.members):
+                await self.say(embed=simple_embed('Canal vacio', 'Me sali del canal de voz porque me quede solo.', 0x95a5a6))
+                await self.destroy()
+
+        self._alone_task = asyncio.create_task(_wait())
+
+    def cancel_alone_timer(self):
+        if self._alone_task is not None and not self._alone_task.done():
+            self._alone_task.cancel()
+        self._alone_task = None
+
+    async def destroy(self):
+        self.destroyed = True
+        music_players.pop(self.guild.id, None)
+        me = asyncio.current_task()
+        for t in (self._task, self._alone_task, self._prefetch_task):
+            if t is not None and t is not me and not t.done():
+                t.cancel()
+        self.queue.clear()
+        self.current = None
+        await self._clear_card()
+        vc = self.vc
+        if vc:
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+
+
+# ----------------------------------------------------------------- botones --
+class MusicControlView(discord.ui.View):
+    def __init__(self, player, track):
+        super().__init__(timeout=None)
+        self.player = player
+        self.track = track
+        self._sync()
+
+    def _sync(self):
+        self.pause_btn.emoji = '\u25B6\uFE0F' if self.player.is_paused() else '\u23F8\uFE0F'
+        self.loop_btn.style = discord.ButtonStyle.secondary if self.player.loop_mode == 'off' else discord.ButtonStyle.success
+
+    async def _exec(self, interaction, op, *args):
+        try:
+            return await op(interaction.guild, interaction.user, *args)
+        except MusicError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+        except Exception as e:
+            print(f'[Music] boton {op.__name__}: {e}')
+            await interaction.response.send_message(f'Error inesperado: {short_error(e)}', ephemeral=True)
+        return None
+
+    @discord.ui.button(emoji='\u23F8\uFE0F', style=discord.ButtonStyle.primary)
+    async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        op = music_resume if self.player.is_paused() else music_pause
+        if await self._exec(interaction, op) is None:
+            return
+        self._sync()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(emoji='\u23ED\uFE0F', style=discord.ButtonStyle.secondary)
+    async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = await self._exec(interaction, music_skip)
+        if embed is not None:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(emoji='\u23F9\uFE0F', style=discord.ButtonStyle.danger)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = await self._exec(interaction, music_stop)
+        if embed is not None:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(emoji='\U0001F501', style=discord.ButtonStyle.secondary)
+    async def loop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if await self._exec(interaction, music_loop, None) is None:
+            return
+        self._sync()
+        await interaction.response.edit_message(embed=now_playing_embed(self.player, self.track), view=self)
+
+    @discord.ui.button(emoji='\U0001F500', style=discord.ButtonStyle.secondary)
+    async def shuffle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = await self._exec(interaction, music_shuffle)
+        if embed is not None:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# --------------------------------------------------------- operaciones (core) --
+def music_check_member_in_channel(member, channel):
+    ch = voice_channel_of(member)
+    is_admin = member.guild_permissions.manage_guild or str(member.id) == OWNER_ID
+    if not is_admin and (not ch or ch.id != channel.id):
+        raise MusicError(f'Tienes que estar en mi canal de voz ({channel.mention}) para controlar la musica.')
+
+
+def music_control_check(guild, member):
+    player = music_players.get(guild.id)
+    vc = guild.voice_client
+    if not player or not vc or not vc.is_connected():
+        raise MusicError('No hay musica reproduciendose ahora mismo.')
+    music_check_member_in_channel(member, vc.channel)
+    return player, vc
+
+
+def music_get_active_player(guild):
+    player = music_players.get(guild.id)
+    if not player or (not player.current and not player.queue):
+        raise MusicError('No hay nada reproduciendose ni en la cola.')
+    return player
+
+
+def music_precheck_play(guild, member):
+    music_ensure_available()
+    user_ch = voice_channel_of(member)
+    if not user_ch:
+        raise MusicError('Primero entra a un canal de voz.')
+    perms = user_ch.permissions_for(guild.me)
+    if not perms.connect or (not perms.speak and not isinstance(user_ch, discord.StageChannel)):
+        raise MusicError(f'No tengo permisos para conectarme o hablar en {user_ch.mention}.')
+    vc = guild.voice_client
+    player = music_players.get(guild.id)
+    if vc and vc.is_connected() and vc.channel.id != user_ch.id and player and (player.current or player.queue):
+        raise MusicError(f'Ya estoy reproduciendo musica en {vc.channel.mention}. Unete ahi o espera a que termine.')
+    return user_ch
+
+
+async def music_connect(guild, channel):
+    vc = guild.voice_client
+    if vc is not None and not vc.is_connected():
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        vc = None
+    if vc is None:
+        vc = await channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
+    elif vc.channel.id != channel.id:
+        await vc.move_to(channel)
+    if isinstance(channel, discord.StageChannel):
+        try:
+            await guild.me.edit(suppress=False)
+        except Exception:
+            pass
+    return vc
+
+
+async def music_play(guild, member, query, text_channel, play_next=False):
+    """Devuelve (embed, silencioso). silencioso=True: la tarjeta 'Reproduciendo ahora' ya avisa, no hace falta responder."""
+    user_ch = music_precheck_play(guild, member)
+    query = (query or '').strip().strip('<>').strip()
+    if not query:
+        raise MusicError('Dime que quieres escuchar: un nombre o un link.')
+    low = query.lower()
+    if 'open.spotify.com' in low or low.startswith('spotify:'):
+        raise MusicError('Los links de Spotify no se pueden reproducir directamente. Escribe el nombre de la cancion y la busco.')
+
+    tracks, playlist_title, is_playlist = await resolve_tracks(query, member)
+
+    user_ch = music_precheck_play(guild, member)   # el usuario pudo moverse mientras se buscaba
+
+    player = music_players.get(guild.id)
+    if player is None:
+        player = MusicPlayer(guild)
+        music_players[guild.id] = player
+
+    async with player.lock:
+        if player.destroyed:
+            raise MusicError('El reproductor se cerro mientras buscaba. Intenta de nuevo.')
+        try:
+            await music_connect(guild, user_ch)
+        except Exception as e:
+            if not player.queue and not player.current:
+                music_players.pop(guild.id, None)
+            raise MusicError(f'No pude conectarme al canal de voz: {short_error(e)}')
+
+        room = MUSIC_MAX_QUEUE - len(player.queue)
+        if room <= 0:
+            raise MusicError(f'La cola esta llena (maximo {MUSIC_MAX_QUEUE} canciones).')
+        skipped = max(0, len(tracks) - room)
+        tracks = tracks[:room]
+
+        player.text_channel = text_channel
+        started_now = player.current is None and not player.queue
+        queued_before = len(player.queue)
+        if play_next:
+            player.queue[0:0] = tracks
+        else:
+            player.queue.extend(tracks)
+        player.start()
+
+    if is_playlist:
+        desc = f'**{clean_title(playlist_title, 80)}**\n**{len(tracks)}** canciones agregadas a la cola.'
+        if skipped:
+            desc += f'\nSe omitieron {skipped} por el limite de {MUSIC_MAX_QUEUE} en cola.'
+        return simple_embed('Playlist anadida', desc, 0x3498db), False
+
+    t = tracks[0]
+    embed = discord.Embed(
+        title='Reproduciendo' if started_now else 'Anadida a la cola',
+        description=f'**{t.link(80)}**',
+        color=0x1DB954 if started_now else 0x3498db,
+    )
+    if t.thumbnail:
+        embed.set_thumbnail(url=t.thumbnail)
+    embed.add_field(name='Duracion', value=t.duration_text(), inline=True)
+    if not started_now:
+        embed.add_field(name='Posicion', value=f'#{1 if play_next else queued_before + 1}', inline=True)
+    embed.add_field(name='Pedida por', value=member.mention, inline=True)
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed, bool(started_now and can_announce(text_channel, guild))
+
+
+async def music_pause(guild, member):
+    player, vc = music_control_check(guild, member)
+    if vc.is_paused():
+        raise MusicError('Ya esta en pausa.')
+    if not player.pause():
+        raise MusicError('No hay nada reproduciendose.')
+    return simple_embed('Pausado', f'Musica pausada por {member.mention}.', 0xf39c12)
+
+
+async def music_resume(guild, member):
+    player, vc = music_control_check(guild, member)
+    if not vc.is_paused():
+        raise MusicError('La musica no esta en pausa.')
+    player.resume()
+    return simple_embed('Reanudado', f'Musica reanudada por {member.mention}.', 0x2ecc71)
+
+
+async def music_skip(guild, member):
+    player, vc = music_control_check(guild, member)
+    current = player.current
+    if not current or not player.skip():
+        raise MusicError('No hay nada que saltar.')
+    return simple_embed('Cancion saltada', f'Se salto {current.link(60)}.', 0x3498db)
+
+
+async def music_stop(guild, member):
+    player, vc = music_control_check(guild, member)
+    n = len(player.queue)
+    player.stop()
+    return simple_embed('Reproduccion detenida', f'Se detuvo la musica y se limpio la cola ({n} canciones).', 0xe74c3c)
+
+
+async def music_leave(guild, member):
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        raise MusicError('No estoy en ningun canal de voz.')
+    music_check_member_in_channel(member, vc.channel)
+    player = music_players.get(guild.id)
+    if player:
+        await player.destroy()
+    else:
+        await vc.disconnect(force=True)
+    return simple_embed('Desconectado', 'Sali del canal de voz y limpie la cola.', 0x95a5a6)
+
+
+async def music_nowplaying(guild, member=None):
+    player = music_players.get(guild.id)
+    if not player or not player.current:
+        raise MusicError('No hay nada reproduciendose ahora mismo.')
+    return now_playing_embed(player, player.current, with_progress=True)
+
+
+async def music_volume(guild, member, value=None):
+    if value is None:
+        player = music_players.get(guild.id)
+        if not player:
+            raise MusicError('No hay musica reproduciendose ahora mismo.')
+        return simple_embed('Volumen', f'El volumen actual es **{int(round(player.volume * 100))}%**.')
+    player, vc = music_control_check(guild, member)
+    value = max(0, min(200, int(value)))
+    player.volume = value / 100
+    src = vc.source
+    if isinstance(src, discord.PCMVolumeTransformer):
+        src.volume = player.volume
+    return simple_embed('Volumen', f'Volumen ajustado a **{value}%**.', 0x3498db)
+
+
+async def music_loop(guild, member, mode=None):
+    player, vc = music_control_check(guild, member)
+    order = ['off', 'track', 'queue']
+    if mode not in order:
+        mode = order[(order.index(player.loop_mode) + 1) % len(order)]
+    player.loop_mode = mode
+    desc = {
+        'off': 'Repeticion desactivada.',
+        'track': 'Repitiendo la cancion actual.',
+        'queue': 'Repitiendo toda la cola.',
+    }[mode]
+    return simple_embed('Loop', desc, 0x3498db)
+
+
+async def music_shuffle(guild, member):
+    player, vc = music_control_check(guild, member)
+    if len(player.queue) < 2:
+        raise MusicError('Necesito al menos 2 canciones en la cola para mezclarla.')
+    random.shuffle(player.queue)
+    return simple_embed('Cola mezclada', f'Se mezclaron **{len(player.queue)}** canciones.', 0x3498db)
+
+
+async def music_remove(guild, member, index):
+    player, vc = music_control_check(guild, member)
+    if not player.queue:
+        raise MusicError('La cola esta vacia.')
+    if index < 1 or index > len(player.queue):
+        raise MusicError(f'Indica un numero entre 1 y {len(player.queue)}.')
+    track = player.queue.pop(index - 1)
+    return simple_embed('Cancion eliminada', f'Se quito {track.link(60)} de la cola.', 0xe67e22)
+
+
+async def music_clear(guild, member):
+    player, vc = music_control_check(guild, member)
+    n = len(player.queue)
+    player.queue.clear()
+    return simple_embed('Cola limpiada', f'Se eliminaron **{n}** canciones de la cola.', 0xe67e22)
+
+
+async def music_on_voice_state_update(member, before, after):
+    guild = member.guild
+    player = music_players.get(guild.id)
+    if not player:
+        return
+    if guild.me and member.id == guild.me.id:
+        # me desconectaron (o me sacaron) del canal de voz
+        if before.channel and not after.channel:
+            await asyncio.sleep(3)
+            vc = guild.voice_client
+            if music_players.get(guild.id) is player and (not vc or not vc.is_connected()):
+                await player.destroy()
+        return
+    vc = guild.voice_client
+    if not vc or not vc.is_connected() or not vc.channel:
+        return
+    if any(not m.bot for m in vc.channel.members):
+        player.cancel_alone_timer()
+    else:
+        player.start_alone_timer()
+
+
+# ------------------------------------------------- adaptador: comandos con prefijo --
+MUSIC_PREFIX_CMDS = {
+    'play': 'play', 'p': 'play', 'reproducir': 'play', 'tocar': 'play',
+    'playnext': 'playnext', 'pn': 'playnext',
+    'skip': 'skip', 's': 'skip', 'saltar': 'skip', 'next': 'skip',
+    'stop': 'stop', 'detener': 'stop',
+    'pause': 'pause', 'pausa': 'pause',
+    'resume': 'resume', 'reanudar': 'resume', 'continuar': 'resume',
+    'queue': 'queue', 'q': 'queue', 'cola': 'queue',
+    'nowplaying': 'np', 'np': 'np', 'actual': 'np',
+    'volume': 'volume', 'vol': 'volume', 'volumen': 'volume',
+    'loop': 'loop', 'repetir': 'loop', 'bucle': 'loop',
+    'shuffle': 'shuffle', 'mezclar': 'shuffle',
+    'remove': 'remove', 'quitar': 'remove',
+    'clear': 'clear', 'clearqueue': 'clear', 'limpiarcola': 'clear',
+    'leave': 'leave', 'dc': 'leave', 'disconnect': 'leave', 'salir': 'leave', 'desconectar': 'leave',
+}
+
+
+def parse_loop_mode(text):
+    t = normalize_for_compare(text or '')
+    if not t:
+        return None
+    if re.search(r'\b(off|apag\w*|desactiv\w*|no|ninguno)\b', t):
+        return 'off'
+    if re.search(r'\b(queue|cola|lista|todo\w*|all|playlist)\b', t):
+        return 'queue'
+    if re.search(r'\b(track|cancion|tema|song|uno|one|actual|esta)\b', t):
+        return 'track'
+    return None
+
+
+async def play_from_message(message, query, play_next=False):
+    async with message.channel.typing():
+        embed, quiet = await music_play(message.guild, message.author, query, message.channel, play_next)
+    if quiet:
+        try:
+            await message.add_reaction('\u2705')
+        except Exception:
+            pass
+    else:
+        await message.reply(embed=embed)
+
+
+async def handle_music_prefix(message, cmd, args):
+    action = MUSIC_PREFIX_CMDS[cmd]
+    guild, member = message.guild, message.author
+    try:
+        if action in ('play', 'playnext'):
+            query = ' '.join(args).strip()
+            if not query and message.attachments:
+                query = message.attachments[0].url
+            await play_from_message(message, query, action == 'playnext')
+        elif action == 'queue':
+            await send_queue(message.reply, music_get_active_player(guild), member.id)
+        elif action == 'np':
+            await message.reply(embed=await music_nowplaying(guild, member))
+        elif action == 'volume':
+            m = re.match(r'^(\d{1,3})%?$', args[0]) if args else None
+            if args and not m:
+                raise MusicError('Uso: `>>volume <0-200>`')
+            await message.reply(embed=await music_volume(guild, member, int(m.group(1)) if m else None))
+        elif action == 'loop':
+            await message.reply(embed=await music_loop(guild, member, parse_loop_mode(' '.join(args))))
+        elif action == 'remove':
+            if not args or not args[0].isdigit():
+                raise MusicError('Uso: `>>remove <posicion en la cola>`')
+            await message.reply(embed=await music_remove(guild, member, int(args[0])))
+        else:
+            ops = {
+                'skip': music_skip, 'stop': music_stop, 'pause': music_pause, 'resume': music_resume,
+                'shuffle': music_shuffle, 'clear': music_clear, 'leave': music_leave,
+            }
+            await message.reply(embed=await ops[action](guild, member))
+    except MusicError as e:
+        await message.reply(str(e))
+    except Exception as e:
+        print(f'[Music] >>{cmd}: {e}')
+        await message.reply(f'Error inesperado: {short_error(e)}')
+
+
+# ------------------------------------------- adaptador: lenguaje natural (Jarvis) --
+NL_PLAY = re.compile(
+    r'^(?:reproduc[eé](?:me|lo|la)?|reproducir|t[oó]ca(?:me)?|tocar|play|ponme|'
+    r'pon(?:\s+(?:la|el|una|un))?\s+(?:canci[oó]n|m[uú]sica|tema|rola|v[ií]deo))\s+(.+)$',
+    re.IGNORECASE | re.DOTALL,
+)
+NL_PLAY_HELP = re.compile(
+    r'^(?:pon(?:me)?|reproduce|t[oó]ca(?:me)?)\s+(?:algo\s+de\s+)?(?:m[uú]sica|canci[oó]n|algo)\s*[.!]*$', re.IGNORECASE)
+NL_SKIP = re.compile(
+    r'^(?:salta(?:r|te)?|skip|siguiente|next|pasa\s+(?:a\s+)?(?:la\s+)?(?:siguiente|otra)|'
+    r'(?:cambia|cambiar)\s+(?:de\s+)?(?:canci[oó]n|tema))(?:\s+(?:la\s+)?(?:canci[oó]n|tema|m[uú]sica))?\s*[.!]*$',
+    re.IGNORECASE)
+NL_STOP = re.compile(
+    r'^(?:(?:para|det[eé]n|apaga|corta|calla|stop)(?:\s+(?:la|el))?\s+(?:m[uú]sica|canci[oó]n|reproducci[oó]n)|stop)\s*[.!]*$',
+    re.IGNORECASE)
+NL_PAUSE = re.compile(r'^(?:pausa(?:r)?|pause)(?:\s+(?:la\s+)?(?:m[uú]sica|canci[oó]n))?\s*[.!]*$', re.IGNORECASE)
+NL_RESUME = re.compile(
+    r'^(?:reanuda(?:r)?|resume|contin[uú]a(?:r)?|sigue|despausa|quita\s+(?:la\s+)?pausa)'
+    r'(?:\s+(?:la\s+)?(?:m[uú]sica|canci[oó]n))?\s*[.!]*$',
+    re.IGNORECASE)
+NL_QUEUE = re.compile(
+    r'^(?:cola|queue|lista\s+de\s+reproducci[oó]n|(?:muestra|ver|mu[eé]strame)\s+(?:la\s+)?cola|'
+    r'qu[eé]\s+(?:hay|sigue|viene)\s+en\s+(?:la\s+)?cola)\s*[?.!]*$',
+    re.IGNORECASE)
+NL_NOWPLAYING = re.compile(
+    r'^(?:qu[eé]\s+(?:suena|est[aá]\s+sonando|canci[oó]n\s+es\s+(?:esta|esa))|now\s*playing|np|'
+    r'canci[oó]n\s+actual|qu[eé]\s+(?:estoy\s+)?escuchando)\s*[?.!]*$',
+    re.IGNORECASE)
+NL_VOLUME = re.compile(r'^(?:volumen|volume|vol)\s+(?:a\s+)?(\d{1,3})\s*%?\s*$', re.IGNORECASE)
+NL_VOLUME_REL = re.compile(r'^(sube|subir|baja|bajar)(?:\s+(?:el|un\s+poco\s+el))?\s+volumen\s*[.!]*$', re.IGNORECASE)
+NL_LOOP = re.compile(
+    r'^(?:(?:desactiva|quita|apaga)\s+(?:el\s+)?(?:loop|bucle|repetici[oó]n)|'
+    r'(?:loop|bucle)(?:\s+.*)?|'
+    r'(?:repite|repetir)(?:\s+(?:la\s+|el\s+|toda\s+la\s+)?(?:canci[oó]n|tema|cola|lista|m[uú]sica|playlist)(?:\s+actual)?)?)\s*[.!]*$',
+    re.IGNORECASE)
+NL_SHUFFLE = re.compile(
+    r'^(?:mezcla(?:r)?|shuffle|aleatorio|baraja(?:r)?)(?:\s+(?:la\s+)?(?:cola|lista|m[uú]sica))?\s*[.!]*$', re.IGNORECASE)
+NL_LEAVE = re.compile(
+    r'^(?:desc[oó]nectate|disconnect|(?:sal|salte|vete)\s+(?:de\s+)?(?:la\s+|el\s+)?(?:voz|canal(?:\s+de\s+voz)?))\s*[.!]*$',
+    re.IGNORECASE)
+
+
+def clean_nl_query(q):
+    q = (q or '').strip()
+    q = re.sub(r'\s+(?:por\s+favor|porfa|porfis|please|plis)\s*[.!]*$', '', q, flags=re.IGNORECASE)
+    q = re.sub(r'^(?:de|del)\s+', '', q, flags=re.IGNORECASE)
+    return q.strip()
+
+
+async def handle_music_natural(message, text, guild):
+    """Comandos de musica en lenguaje natural ('jarvis reproduce X', 'jarvis salta'...). Devuelve True si lo manejo."""
+    t = text.strip()
+    author = message.author
+
+    async def run(coro):
+        try:
+            return await coro
+        except MusicError as e:
+            await message.reply(str(e))
+        except Exception as e:
+            print(f'[Music] jarvis: {e}')
+            await message.reply(f'Error inesperado: {short_error(e)}')
+        return None
+
+    async def reply_op(coro):
+        embed = await run(coro)
+        if embed is not None:
+            await message.reply(embed=embed)
+        return True
+
+    if NL_PLAY_HELP.match(t):
+        await message.reply('Dime que quieres escuchar: `jarvis reproduce <nombre o link>`.')
+        return True
+
+    m = NL_PLAY.match(t)
+    if m:
+        query = clean_nl_query(m.group(1))
+        try:
+            await play_from_message(message, query)
+        except MusicError as e:
+            await message.reply(str(e))
+        except Exception as e:
+            print(f'[Music] jarvis play: {e}')
+            await message.reply(f'Error inesperado: {short_error(e)}')
+        return True
+
+    if NL_SKIP.match(t):
+        return await reply_op(music_skip(guild, author))
+    if NL_STOP.match(t):
+        return await reply_op(music_stop(guild, author))
+    if NL_PAUSE.match(t):
+        return await reply_op(music_pause(guild, author))
+    if NL_RESUME.match(t):
+        return await reply_op(music_resume(guild, author))
+    if NL_QUEUE.match(t):
+        try:
+            await send_queue(message.reply, music_get_active_player(guild), author.id)
+        except MusicError as e:
+            await message.reply(str(e))
+        return True
+    if NL_NOWPLAYING.match(t):
+        return await reply_op(music_nowplaying(guild, author))
+
+    m = NL_VOLUME.match(t)
+    if m:
+        return await reply_op(music_volume(guild, author, int(m.group(1))))
+    m = NL_VOLUME_REL.match(t)
+    if m:
+        player = music_players.get(guild.id)
+        if not player:
+            await message.reply('No hay musica reproduciendose ahora mismo.')
+            return True
+        delta = 10 if m.group(1).lower().startswith('sub') else -10
+        return await reply_op(music_volume(guild, author, int(round(player.volume * 100)) + delta))
+
+    if NL_LOOP.match(t):
+        if re.match(r'^(?:desactiva|quita|apaga)', t, re.IGNORECASE):
+            mode = 'off'
+        else:
+            rest = re.sub(r'^(?:loop|repite|repetir|bucle)\s*', '', t, flags=re.IGNORECASE)
+            mode = parse_loop_mode(rest) or 'track'
+        return await reply_op(music_loop(guild, author, mode))
+    if NL_SHUFFLE.match(t):
+        return await reply_op(music_shuffle(guild, author))
+    if NL_LEAVE.match(t):
+        return await reply_op(music_leave(guild, author))
+
+    return False
+# ============================================================================
 # JARVIS RESPONSES
 # ============================================================================
 JARVIS_RESPONSES = {
@@ -1352,7 +2521,7 @@ def parse_role_remove_command(text):
             if i == 0:
                 return {'roleStr': m.group(1).strip(), 'userStr': m.group(2).strip()}
             if i == 1:
-                return {'roleStr': m.group(3).strip(), 'userStr': m.group(2).strip()}
+                return {'roleStr': m.group(2).strip(), 'userStr': m.group(1).strip()}
 
     self_match = re.search(
         r'(?:quita(?:me)?|remueve(?:me)?|saca(?:me)?|elimina(?:me)?)\s+(?:el\s+)?(?:mi\s+)?rol\s+(.+)', text, re.IGNORECASE,
@@ -1368,6 +2537,10 @@ async def handle_jarvis_commands(message: discord.Message, text, guild: discord.
     me = guild.me
     author = message.author
     norm = normalize_text(text)
+
+    # ── MUSICA (va primero para que nombres de canciones no choquen con otros comandos) ──
+    if await handle_music_natural(message, text, guild):
+        return True
 
     # ── MEMBERS COUNT ──
     if re.search(r'cuantos\s*miembros|cuanta\s*gente|cuantos\s*(somos|hay|estan)|total\s*de\s*miembros|cuantos\s*usuarios|poblacion', norm, re.IGNORECASE):
@@ -1409,6 +2582,7 @@ async def handle_jarvis_commands(message: discord.Message, text, guild: discord.
         embed = simple_embed('Mis Capacidades', 'Mira, te cuento todo lo que puedo hacer:', 0xf1c40f)
         embed.add_field(name='Moderacion', value='`jarvis banea a @user [razon]`\n`jarvis expulsa a @user`\n`jarvis silencia a @user 10m`\n`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis advierte a @user [razon]`', inline=False)
         embed.add_field(name='Voz', value='`jarvis desconecta a @user`\n`jarvis mueve a @user a #canal-voz`', inline=False)
+        embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
         embed.add_field(name='Encuestas', value='`/poll` — Crear encuesta con botones', inline=False)
         embed.add_field(name='Giveaways', value='`/giveaway` `/gend` `/greroll`', inline=False)
         embed.add_field(name='Recordatorios', value='`/remind` `/reminders` `/remindcancel`', inline=False)
@@ -2118,6 +3292,10 @@ async def handle_command(message: discord.Message):
     cmd = args.pop(0).lower()
     guild = message.guild
 
+    # ── MUSICA (>>play, >>skip, >>queue, ...) ──
+    if cmd in MUSIC_PREFIX_CMDS:
+        return await handle_music_prefix(message, cmd, args)
+
     # ── DESACTIVAR / ACTIVAR AUTORESPUESTAS por guild (owner only) ──
     if cmd == 'desactivar':
         if str(message.author.id) != OWNER_ID:
@@ -2550,7 +3728,8 @@ async def handle_command(message: discord.Message):
         embed.timestamp = datetime.now(timezone.utc)
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`', inline=False)
+        embed.add_field(name='Musica', value='`play` (`p`) `playnext` `skip` (`s`) `stop` `pause` `resume` `queue` (`q`)\n`np` `volume` (`vol`) `loop` `shuffle` `remove` `clear` `leave` (`dc`)', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
         return await message.reply(embed=embed)
@@ -2562,6 +3741,7 @@ async def on_ready():
     print(f'Bot listo: {client.user}')
     print(f'Conectado a {len(client.guilds)} servidores')
     print(f'Jarvis whitelist: {", ".join(JARVIS_WHITELIST)}')
+    print(music_status_line())
     await client.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f'{PREFIX}help | /help'))
     try:
         synced = await client.tree.sync()
@@ -2623,10 +3803,16 @@ async def on_message(message: discord.Message):
 
 
 # ============================================================================
-# VOICE STATE UPDATE — VOICE JAIL ENFORCEMENT
+# VOICE STATE UPDATE — MUSICA + VOICE JAIL ENFORCEMENT
 # ============================================================================
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # musica: limpiar el reproductor si me desconectan / salir si me quedo solo en el canal
+    try:
+        await music_on_voice_state_update(member, before, after)
+    except Exception as e:
+        print(f'[Music] voice_state_update: {e}')
+
     guild = member.guild
     user_id = member.id
 
@@ -3215,6 +4401,147 @@ async def slash_restore(interaction: discord.Interaction, archivo: discord.Attac
         await interaction.edit_original_response(content='', embed=embed)
     except Exception as e:
         await interaction.followup.send(f'Error durante la restauracion: {e}')
+
+
+# ============================================================================
+# MUSIC SLASH COMMANDS
+# ============================================================================
+async def music_slash(interaction: discord.Interaction, coro):
+    """Ejecuta una operacion de musica; si falla responde solo al usuario (efimero)."""
+    try:
+        embed = await coro
+    except MusicError as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
+    except Exception as e:
+        name = interaction.command.name if interaction.command else '?'
+        print(f'[Music] /{name}: {e}')
+        return await interaction.response.send_message(f'Error inesperado: {short_error(e)}', ephemeral=True)
+    await interaction.response.send_message(embed=embed)
+
+
+# ── PLAY ──
+@client.tree.command(name='play', description='Reproduce una cancion o playlist (nombre o link de YouTube/SoundCloud)')
+@app_commands.describe(busqueda='Nombre de la cancion o link', siguiente='Ponerla de siguiente en la cola')
+@app_commands.guild_only()
+async def slash_play(interaction: discord.Interaction, busqueda: str, siguiente: bool = False):
+    try:
+        music_precheck_play(interaction.guild, interaction.user)
+    except MusicError as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
+
+    await interaction.response.defer()
+    try:
+        embed, quiet = await music_play(interaction.guild, interaction.user, busqueda, interaction.channel, siguiente)
+    except MusicError as e:
+        return await interaction.followup.send(str(e))
+    except Exception as e:
+        print(f'[Music] /play: {e}')
+        return await interaction.followup.send(f'Error inesperado: {short_error(e)}')
+
+    if quiet:
+        # la tarjeta "Reproduciendo ahora" ya avisa; quito el mensaje de "pensando..."
+        try:
+            await interaction.delete_original_response()
+            return
+        except Exception:
+            pass
+    await interaction.followup.send(embed=embed)
+
+
+# ── PAUSE ──
+@client.tree.command(name='pause', description='Pausar la musica')
+@app_commands.guild_only()
+async def slash_pause(interaction: discord.Interaction):
+    await music_slash(interaction, music_pause(interaction.guild, interaction.user))
+
+
+# ── RESUME ──
+@client.tree.command(name='resume', description='Reanudar la musica')
+@app_commands.guild_only()
+async def slash_resume(interaction: discord.Interaction):
+    await music_slash(interaction, music_resume(interaction.guild, interaction.user))
+
+
+# ── SKIP ──
+@client.tree.command(name='skip', description='Saltar la cancion actual')
+@app_commands.guild_only()
+async def slash_skip(interaction: discord.Interaction):
+    await music_slash(interaction, music_skip(interaction.guild, interaction.user))
+
+
+# ── STOP ──
+@client.tree.command(name='stop', description='Detener la musica y limpiar la cola')
+@app_commands.guild_only()
+async def slash_stop(interaction: discord.Interaction):
+    await music_slash(interaction, music_stop(interaction.guild, interaction.user))
+
+
+# ── QUEUE ──
+@client.tree.command(name='queue', description='Ver la cola de reproduccion')
+@app_commands.guild_only()
+async def slash_queue(interaction: discord.Interaction):
+    try:
+        player = music_get_active_player(interaction.guild)
+    except MusicError as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
+    await send_queue(interaction.response.send_message, player, interaction.user.id)
+
+
+# ── NOWPLAYING ──
+@client.tree.command(name='nowplaying', description='Ver que cancion esta sonando')
+@app_commands.guild_only()
+async def slash_nowplaying(interaction: discord.Interaction):
+    await music_slash(interaction, music_nowplaying(interaction.guild, interaction.user))
+
+
+# ── VOLUME ──
+@client.tree.command(name='volume', description='Ver o cambiar el volumen (0-200)')
+@app_commands.describe(nivel='Volumen en % (omitir = ver el actual)')
+@app_commands.guild_only()
+async def slash_volume(interaction: discord.Interaction, nivel: app_commands.Range[int, 0, 200] = None):
+    await music_slash(interaction, music_volume(interaction.guild, interaction.user, nivel))
+
+
+# ── LOOP ──
+@client.tree.command(name='loop', description='Repetir la cancion actual o toda la cola')
+@app_commands.describe(modo='Modo de repeticion (omitir = ir alternando)')
+@app_commands.choices(modo=[
+    app_commands.Choice(name='Apagado', value='off'),
+    app_commands.Choice(name='Cancion actual', value='track'),
+    app_commands.Choice(name='Toda la cola', value='queue'),
+])
+@app_commands.guild_only()
+async def slash_loop(interaction: discord.Interaction, modo: app_commands.Choice[str] = None):
+    await music_slash(interaction, music_loop(interaction.guild, interaction.user, modo.value if modo else None))
+
+
+# ── SHUFFLE ──
+@client.tree.command(name='shuffle', description='Mezclar la cola')
+@app_commands.guild_only()
+async def slash_shuffle(interaction: discord.Interaction):
+    await music_slash(interaction, music_shuffle(interaction.guild, interaction.user))
+
+
+# ── REMOVE ──
+@client.tree.command(name='remove', description='Quitar una cancion de la cola')
+@app_commands.describe(posicion='Posicion en la cola (mira /queue)')
+@app_commands.guild_only()
+async def slash_remove(interaction: discord.Interaction, posicion: app_commands.Range[int, 1, 100]):
+    await music_slash(interaction, music_remove(interaction.guild, interaction.user, posicion))
+
+
+# ── CLEARQUEUE ──
+@client.tree.command(name='clearqueue', description='Vaciar la cola (la cancion actual sigue sonando)')
+@app_commands.guild_only()
+async def slash_clearqueue(interaction: discord.Interaction):
+    await music_slash(interaction, music_clear(interaction.guild, interaction.user))
+
+
+# ── LEAVE ──
+@client.tree.command(name='leave', description='Desconectar al bot del canal de voz')
+@app_commands.guild_only()
+async def slash_leave(interaction: discord.Interaction):
+    await music_slash(interaction, music_leave(interaction.guild, interaction.user))
 # ============================================================================
 # KEEPALIVE
 # ============================================================================
