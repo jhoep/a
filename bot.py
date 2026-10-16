@@ -1421,7 +1421,15 @@ MUSIC_DEFAULT_VOLUME = 50         # volumen inicial (%)
 MUSIC_STREAM_TTL     = 3 * 3600   # los links directos caducan; se renuevan pasado este tiempo
 MUSIC_MIN_PLAY_SECS  = 1.5        # si una cancion suena menos que esto sin que nadie la salte, se considera fallo
 QUEUE_PER_PAGE       = 10
-YTDLP_COOKIES        = os.environ.get('YTDLP_COOKIES')
+_cookies_src  = os.environ.get('YTDLP_COOKIES')
+YTDLP_COOKIES = None
+if _cookies_src and os.path.isfile(_cookies_src):
+    try:
+        YTDLP_COOKIES = str(DATA_DIR / 'yt_cookies.txt')
+        shutil.copyfile(_cookies_src, YTDLP_COOKIES)
+    except Exception as e:
+        print(f'[Music] No pude copiar las cookies: {e}')
+        YTDLP_COOKIES = None
 FFMPEG_BEFORE_OPTS   = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
 MUSIC_URL_RE         = re.compile(r'^https?://', re.IGNORECASE)
 LOOP_LABELS          = {'off': 'Apagado', 'track': 'Cancion', 'queue': 'Cola'}
