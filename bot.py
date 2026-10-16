@@ -6419,10 +6419,19 @@ def keep_alive():
 # STARTUP
 # ============================================================================
 async def main():
-    keep_alive()
     if not DISCORD_TOKEN:
         print('FATAL: DISCORD_TOKEN no configurado.')
         raise SystemExit(1)
+
+    await webserver.start(
+        client,
+        music_players_getter=lambda: music_players,
+        extra=lambda: {
+            'Whitelist': len(JARVIS_WHITELIST),
+            'Giveaways activos': sum(1 for g in giveaways.values() if not g['ended']),
+            'Recordatorios': len(reminders),
+        },
+    )
 
     attempt = 0
     while attempt < 10:
