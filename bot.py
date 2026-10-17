@@ -2362,8 +2362,6 @@ async def music_on_voice_state_update(member, before, after):
         player.cancel_alone_timer()
     else:
         player.start_alone_timer()
-
-
 # ------------------------------------------------- adaptador: comandos con prefijo --
 MUSIC_PREFIX_CMDS = {
     'play': 'play', 'p': 'play', 'reproducir': 'play', 'tocar': 'play',
@@ -2801,6 +2799,7 @@ class Intent:
     hoist: Optional[bool] = None
     mentionable: Optional[bool] = None
     nsfw: Optional[bool] = None
+    setting: Optional[str] = None                    # ajuste del anti-raid (joins, ventana, accion...)
     chain: list = field(default_factory=list)        # pasos extra encadenados (orden de varios pasos)
     source: str = 'regex'        # ai | regex
     explicit: bool = False       # orden 100% clara (@mencion / ID): se ejecuta sin consultar a la IA
@@ -3009,7 +3008,7 @@ async def gather_chat_context(message, limit=None):
 INTENT_SYSTEM_PROMPT = """Eres el CEREBRO de Jarvis, un bot de Discord (moderacion, gestion del servidor, utilidades, musica y charla). Conviertes la orden del JEFE en un JSON, usando el contexto del chat para entender a quien o a que se refiere. La gente habla coloquial (latino): "hp", "gonorrea", "parce", "ese man", "q", "qn", "xq" son normales.
 
 Responde SOLO con un objeto JSON valido, sin texto extra. Campos (omite los que no apliquen):
-{"action","target_ids":[ids exactos],"target_query","reason","duration","amount","seconds","role","channel","nick","text","query","value","mode","name","names":[...],"new_name","kind","category","topic","color","private","hoist","mentionable","nsfw","permissions":[...],"confidence","why","clarify","reply"}
+{"action","target_ids":[ids exactos],"target_query","reason","duration","amount","seconds","role","channel","nick","text","query","value","mode","name","names":[...],"new_name","kind","category","topic","color","private","hoist","mentionable","nsfw","setting","permissions":[...],"confidence","why","clarify","reply"}
 Para ordenes de VARIOS pasos responde {"actions":[{...},{...}]} (maximo 8 pasos, en orden; cada paso con sus campos).
 
 ACCIONES (action) y sus campos:
@@ -3037,6 +3036,12 @@ ACCIONES (action) y sus campos:
 - voice_autokick_off: quitar esa regla. target_ids (vacio = el JEFE)
 - autodelete_on | autodelete_off: REGLA PERMANENTE: borrar cada mensaje nuevo de alguien / dejar de hacerlo. target_ids (vacio = el JEFE)
 - rules_show: ver las reglas permanentes activas
+- antiraid_on | antiraid_off | antiraid_status: activar / desactivar / ver el sistema ANTI-RAID (proteccion contra raids = mucha gente entrando de golpe, y contra spam masivo)
+- antiraid_logs: channel opcional (vacio = canal actual); mode="off" para quitar el canal de logs del anti-raid
+- antiraid_lockdown_on | antiraid_lockdown_off: lockdown de emergencia (sanciona a todo el que entre); duration opcional ("10m")
+- antiraid_config: setting (joins|ventana|edad_cuenta|accion|spam|mensajes|menciones|lockdown_tiempo) + value (numero; los tiempos van en SEGUNDOS, o usa duration) y/o text (kick|ban|timeout para accion; on|off para spam)
+- antialt_on: activar el ANTI-ALT (expulsa/banea cuentas de Discord mas nuevas que X dias). value = edad minima en DIAS, text = accion opcional (kick|ban|timeout) | antialt_off | antialt_status
+- antialt_allow | antialt_disallow: target_ids (o target_query con el ID): dejar entrar a esa persona aunque su cuenta sea nueva / quitar la excepcion
 - music_play: query | music_skip | music_stop | music_pause | music_resume | music_queue | music_nowplaying | music_shuffle | music_leave | music_volume: value (0-200) | music_loop: mode (off|track|queue)
 - chat: el JEFE solo conversa, pregunta o bromea -> escribe en "reply"
 - clarify: no puedes decidir con seguridad -> pregunta corta en "clarify"
@@ -3058,7 +3063,9 @@ REGLAS
 14. delete_channel / delete_role / ban / kick solo si el JEFE lo pide de forma clara. Nombres de canales nuevos: tal como los pidio el JEFE.
 15. create_channel con private=true y target_ids: solo esas personas (mas el JEFE) podran verlo.
 16. "cada vez que...", "siempre que...", "todas las veces", "hasta que te diga" = regla PERMANENTE (voice_autokick / autodelete_on). voice_disconnect es solo UNA vez y AHORA: si piden algo recurrente, usa voice_autokick, NUNCA voice_disconnect aunque la persona no este en voz en este momento.
-17. "ya no", "deja de", "quitame eso", "ya puedes dejarme" sobre una regla permanente = la accion _off correspondiente (mira REGLAS ACTIVAS)."""
+17. "ya no", "deja de", "quitame eso", "ya puedes dejarme" sobre una regla permanente = la accion _off correspondiente (mira REGLAS ACTIVAS).
+18. "anti raid" / "antiraid" SIEMPRE son acciones antiraid_*, nunca voice_autokick ni ban. "activa el anti raid con 5 joins en 10s" = {"actions":[{"action":"antiraid_on"},{"action":"antiraid_config","setting":"joins","value":5},{"action":"antiraid_config","setting":"ventana","value":10}]}
+19. "anti alt" / "antialt" (bloquear cuentas de Discord nuevas al entrar) SIEMPRE son acciones antialt_*, nunca antiraid_*. "activa el anti alt de 265 dias" = {"action":"antialt_on","value":265}. "deja entrar a 123456789012345678 aunque su cuenta sea nueva" = {"action":"antialt_allow","target_query":"123456789012345678"}."""
 
 
 def format_chat_line(ln, people):
@@ -3184,7 +3191,7 @@ def intent_from_ai(data):
         why=s('why'), clarify=s('clarify'), reply=s('reply'), source='ai',
         name=s('name'), names=names_list, new_name=s('new_name'), kind=s('kind'), category=s('category'),
         topic=s('topic'), color=s('color'), perms=perms_list, private=b('private'), hoist=b('hoist'),
-        mentionable=b('mentionable'), nsfw=b('nsfw'),
+        mentionable=b('mentionable'), nsfw=b('nsfw'), setting=s('setting'),
     )
     if it.clarify and action in TARGET_ACTIONS and not it.targets and not it.target_query:
         it.action = 'clarify'
@@ -3407,8 +3414,6 @@ async def resolve_targets(ctx, intent, chat):
             return [], not_found(not_found_q)
         return [], 'No supe a quien te refieres. Mencionalo o responde a su mensaje y lo hago.'
     return out[:JARVIS_MAX_TARGETS], None
-
-
 # ------------------------------------------------------------------- protecciones --
 def guard_sanction(ctx, t, verb, need_member=False, hierarchy=True):
     if t.id == ctx.author.id:
@@ -3518,7 +3523,10 @@ class ConfirmView(discord.ui.View):
         await interaction.response.edit_message(content='Cancelado, no hice nada.', embed=None, view=None)
 
 
-def needs_confirmation(intent, targets):
+def needs_confirmation(ctx, intent, targets):
+    # el owner del bot no necesita confirmar nada
+    if str(ctx.author.id) == OWNER_ID:
+        return False
     if intent.action not in CONFIRM_ACTIONS:
         return False
     if intent.source == 'ai' and intent.confidence < JARVIS_MIN_CONFIDENCE:
@@ -4107,6 +4115,23 @@ def build_help_embed():
               '`jarvis que reglas hay activas`',
         inline=False,
     )
+    embed.add_field(
+        name='Anti-Raid',
+        value='`jarvis activa el anti raid` / `jarvis desactiva el anti raid` / `jarvis estado del anti raid`\n'
+              '`jarvis activa logs de anti raid en este canal` (o en #canal) / `jarvis quita los logs del anti raid`\n'
+              '`jarvis activa el lockdown 15m` / `jarvis quita el lockdown`\n'
+              '`jarvis configura el anti raid: 5 joins en 10s, accion ban`\n'
+              '`/antiraid activar|desactivar|estado|logs|lockdown|config`',
+        inline=False,
+    )
+    embed.add_field(
+        name='Anti-Alt (cuentas nuevas)',
+        value='`jarvis activa el anti alt de 265 dias` (tu decides los dias; puedes anadir `ban`, `kick` o `timeout`)\n'
+              '`jarvis desactiva el anti alt` / `jarvis estado del anti alt`\n'
+              '`jarvis permite a <ID> en el anti alt` (excepcion) / `jarvis quita el permiso a <ID>`\n'
+              '`/antialt activar|desactivar|estado|permitir|quitar_permiso`',
+        inline=False,
+    )
     embed.add_field(name='Whitelist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (anadir/quitar: solo owner)', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
@@ -4138,8 +4163,6 @@ async def act_music(ctx, intent):
         'music_nowplaying': music_nowplaying,
     }
     return await ops[a](guild, member)
-
-
 # ============================================================================
 # GESTION CON IA: canales, roles, servidor
 # ============================================================================
@@ -4512,6 +4535,885 @@ PLAIN_HANDLERS['rules_show'] = act_rules_show
 for _a in ('music_play', 'music_skip', 'music_stop', 'music_pause', 'music_resume', 'music_queue',
            'music_nowplaying', 'music_volume', 'music_loop', 'music_shuffle', 'music_leave'):
     PLAIN_HANDLERS[_a] = act_music
+# ============================================================================
+# ANTI-RAID
+# ============================================================================
+ANTIRAID_FILE = DATA_DIR / 'antiraid.json'
+antiraid_data = load_json(ANTIRAID_FILE, {})     # { guildId: {config} }
+
+ANTIRAID_DEFAULTS = {
+    'enabled': False,
+    'log_channel': None,          # id (str) del canal de logs
+    'join_threshold': 6,          # entradas...
+    'join_window': 10,            # ...en estos segundos = raid
+    'alt_enabled': False,         # ANTI-ALT: bloquear cuentas de Discord demasiado nuevas al entrar
+    'alt_days': 30,               # edad minima de la cuenta (dias) que decide el admin
+    'alt_action': 'kick',         # kick | ban | timeout (24h)
+    'alt_allow': [],              # IDs que pueden entrar aunque su cuenta sea nueva
+    'action': 'kick',             # kick | ban | timeout (24h)
+    'lockdown_secs': 600,         # duracion del lockdown tras detectar un raid
+    'lockdown_until': 0,          # timestamp; mientras dure, TODO el que entre es sancionado
+    'spam_enabled': True,
+    'spam_msgs': 7,               # mensajes...
+    'spam_window': 6,             # ...en estos segundos = flood
+    'mention_limit': 8,           # menciones en un solo mensaje (0 = apagado)
+    'spam_timeout_secs': 600,     # timeout al spammer
+}
+AR_ACTION_LABELS = {'kick': 'Expulsar', 'ban': 'Banear', 'timeout': 'Timeout 24h'}
+AR_LABELS = {
+    'join_threshold': 'Entradas para detectar raid', 'join_window': 'Ventana de entradas (s)',
+    'alt_days': 'Edad minima de cuenta anti-alt (dias)', 'alt_action': 'Accion anti-alt', 'alt_enabled': 'Anti-alt',
+    'action': 'Accion contra raiders',
+    'spam_enabled': 'Anti-spam', 'spam_msgs': 'Mensajes para flood', 'spam_window': 'Ventana de flood (s)',
+    'mention_limit': 'Limite de menciones', 'lockdown_secs': 'Duracion del lockdown (s)',
+}
+AR_LIMITS = {
+    'join_threshold': (2, 100), 'join_window': (2, 300), 'alt_days': (1, 3650),
+    'spam_msgs': (3, 50), 'spam_window': (2, 60), 'mention_limit': (0, 50), 'lockdown_secs': (30, 86400),
+}
+AR_SETTING_ALIASES = {
+    'joins': 'join_threshold', 'join': 'join_threshold', 'entradas': 'join_threshold', 'umbral': 'join_threshold',
+    'jointhreshold': 'join_threshold',
+    'ventana': 'join_window', 'tiempo': 'join_window', 'joinwindow': 'join_window',
+    'edadcuenta': 'alt_days', 'edad': 'alt_days', 'altdays': 'alt_days', 'antialt': 'alt_enabled',
+    'accionalt': 'alt_action', 'altaccion': 'alt_action',
+    'accion': 'action', 'action': 'action', 'castigo': 'action', 'sancion': 'action',
+    'spam': 'spam_enabled', 'antispam': 'spam_enabled', 'spamenabled': 'spam_enabled',
+    'mensajes': 'spam_msgs', 'flood': 'spam_msgs', 'spammsgs': 'spam_msgs',
+    'ventanaspam': 'spam_window', 'ventanaflood': 'spam_window', 'spamwindow': 'spam_window',
+    'menciones': 'mention_limit', 'mentionlimit': 'mention_limit',
+    'lockdowntiempo': 'lockdown_secs', 'lockdown': 'lockdown_secs', 'lockdownsecs': 'lockdown_secs',
+    'duracionlockdown': 'lockdown_secs',
+}
+AR_ACTION_WORDS = {
+    'kick': 'kick', 'expulsar': 'kick', 'expulsa': 'kick', 'echar': 'kick',
+    'ban': 'ban', 'banear': 'ban', 'banea': 'ban',
+    'timeout': 'timeout', 'silenciar': 'timeout', 'silencia': 'timeout', 'mute': 'timeout',
+}
+AR_ON_WORDS = {'on', 'si', 'yes', 'true', '1', 'activar', 'activado', 'activa', 'enable'}
+AR_OFF_WORDS = {'off', 'no', 'false', '0', 'desactivar', 'desactivado', 'desactiva', 'disable'}
+
+antiraid_joins = {}          # guildId -> deque([(ts, member_id)])
+antiraid_msgs = {}           # (guildId, userId) -> deque([(ts, message_id, channel_id, hash)])
+antiraid_blocked = {}        # guildId -> [texto, ...]  (para agrupar logs durante un raid)
+antiraid_flush_tasks = {}
+
+
+def antiraid_save():
+    save_json(ANTIRAID_FILE, antiraid_data)
+
+
+def antiraid_cfg(guild_id):
+    cfg = antiraid_data.setdefault(str(guild_id), {})
+    for k, v in ANTIRAID_DEFAULTS.items():
+        cfg.setdefault(k, list(v) if isinstance(v, list) else v)
+    return cfg
+
+
+def antiraid_active(guild_id):
+    d = antiraid_data.get(str(guild_id))
+    return bool(d and d.get('enabled'))
+
+
+def antiraid_exempt(member):
+    """Gente que el anti-raid nunca toca: bots, owner, whitelist de Jarvis, admins y moderadores."""
+    if member.bot or str(member.id) == str(OWNER_ID) or str(member.id) in JARVIS_WHITELIST:
+        return True
+    if member.id == member.guild.owner_id:
+        return True
+    p = member.guild_permissions
+    return bool(p.administrator or p.manage_guild or p.manage_messages)
+
+
+async def antiraid_log(guild, embed):
+    cfg = antiraid_data.get(str(guild.id)) or {}
+    cid = cfg.get('log_channel') or modlog_map.get(str(guild.id))
+    if not cid:
+        return
+    ch = guild.get_channel(int(cid))
+    if ch is None:
+        return
+    try:
+        await ch.send(embed=embed)
+    except Exception as e:
+        print(f'[AntiRaid] No pude escribir en el canal de logs: {e}')
+
+
+def antiraid_note_blocked(guild, text):
+    """Agrupa en UN solo log lo que se va bloqueando durante unos segundos (evita inundar el canal)."""
+    antiraid_blocked.setdefault(guild.id, []).append(text)
+    if guild.id in antiraid_flush_tasks:
+        return
+
+    async def _flush():
+        await asyncio.sleep(5)
+        antiraid_flush_tasks.pop(guild.id, None)
+        items = antiraid_blocked.pop(guild.id, [])
+        if not items:
+            return
+        shown = items[:25]
+        desc = '\n'.join(shown)
+        if len(items) > len(shown):
+            desc += f'\n... y {len(items) - len(shown)} mas'
+        await antiraid_log(guild, simple_embed(f'Anti-Raid: {len(items)} entrada(s) bloqueadas', desc[:4000], 0xe67e22))
+
+    antiraid_flush_tasks[guild.id] = spawn(_flush())
+
+
+async def antiraid_punish(member, cfg, reason, action=None):
+    """Aplica la accion configurada (o la indicada). Devuelve (ok, error)."""
+    action = action or cfg.get('action', 'kick')
+    why = f'[AntiRaid] {reason}'[:500]
+    try:
+        if action == 'ban':
+            await member.ban(reason=why, delete_message_seconds=0)
+        elif action == 'timeout':
+            await member.timeout(timedelta(days=1), reason=why)
+        else:
+            await member.kick(reason=why)
+        return True, None
+    except Exception as e:
+        return False, short_error(e)
+
+
+def antiraid_schedule_lockdown_end(guild, until):
+    async def _end():
+        await asyncio.sleep(max(0.0, until - time.time()))
+        cfg = antiraid_data.get(str(guild.id)) or {}
+        if cfg.get('lockdown_until') == until:      # sigue siendo ese mismo lockdown (no se extendio ni se cancelo)
+            cfg['lockdown_until'] = 0
+            antiraid_save()
+            await antiraid_log(guild, simple_embed('Lockdown terminado', 'El servidor vuelve a aceptar entradas con normalidad.', 0x2ecc71))
+
+    spawn(_end())
+
+
+def antiraid_resume():
+    """Al arrancar: reprograma los lockdowns que seguian activos."""
+    now = time.time()
+    for gid, cfg in antiraid_data.items():
+        until = cfg.get('lockdown_until') or 0
+        if until > now:
+            g = client.get_guild(int(gid))
+            if g:
+                antiraid_schedule_lockdown_end(g, until)
+        elif until:
+            cfg['lockdown_until'] = 0
+    antiraid_save()
+
+
+async def antiraid_trigger(guild, cfg, member_ids, why):
+    """Raid detectado: lockdown + sancionar a los que entraron. Devuelve el set de IDs sancionados."""
+    # --- parte sincrona (sin awaits): evita que dos joins simultaneos disparen el raid dos veces ---
+    until = time.time() + cfg['lockdown_secs']
+    cfg['lockdown_until'] = until
+    dq = antiraid_joins.get(guild.id)
+    if dq:
+        dq.clear()
+    antiraid_save()
+    antiraid_schedule_lockdown_end(guild, until)
+
+    done, failed, ids_done = [], [], set()
+    for uid in dict.fromkeys(member_ids):
+        m = guild.get_member(uid)
+        if m is None or antiraid_exempt(m):
+            continue
+        ok, err = await antiraid_punish(m, cfg, why)
+        if ok:
+            done.append(f'{m} (`{m.id}`)')
+            ids_done.add(uid)
+        else:
+            failed.append(f'{m} - {err}')
+
+    e = discord.Embed(title='RAID DETECTADO', description=why, color=0xe74c3c)
+    e.add_field(name='Accion', value=AR_ACTION_LABELS.get(cfg['action'], cfg['action']), inline=True)
+    e.add_field(name='Lockdown', value=f'hasta <t:{int(until)}:R>', inline=True)
+    e.add_field(name=f'Sancionados ({len(done)})', value='\n'.join(done[:15])[:1000] or 'Nadie', inline=False)
+    if failed:
+        e.add_field(name=f'No pude ({len(failed)})', value='\n'.join(failed[:8])[:1000], inline=False)
+    e.set_footer(text='Mientras dure el lockdown, todo el que entre sera sancionado. Quitalo con: jarvis quita el lockdown')
+    e.timestamp = datetime.now(timezone.utc)
+    await antiraid_log(guild, e)
+    return ids_done
+
+
+async def antialt_block(member, cfg, age_days):
+    """Anti-alt: cuenta demasiado nueva. Devuelve True si se sanciono."""
+    guild = member.guild
+    action = cfg['alt_action']
+    try:
+        await member.send(
+            f'No puedes entrar a **{guild.name}** todavia: tu cuenta de Discord tiene {age_days:.0f} dia(s) '
+            f'y el servidor pide un minimo de {cfg["alt_days"]} dias.')
+    except Exception:
+        pass
+    ok, err = await antiraid_punish(
+        member, cfg, f'anti-alt: cuenta de {age_days:.0f} dias (minimo {cfg["alt_days"]})', action)
+    e = discord.Embed(title='Anti-Alt: cuenta bloqueada', color=0xe67e22 if ok else 0xe74c3c)
+    e.add_field(name='Usuario', value=f'{member} (`{member.id}`)', inline=True)
+    e.add_field(name='Cuenta creada', value=f'<t:{int(member.created_at.timestamp())}:R> ({age_days:.0f} dias)', inline=True)
+    e.add_field(name='Minimo', value=f'{cfg["alt_days"]} dias', inline=True)
+    e.add_field(name='Accion', value=AR_ACTION_LABELS.get(action, action) + ('' if ok else f' - no pude: {err}'), inline=False)
+    e.set_footer(text='Para dejarlo entrar: jarvis permite a <ID> en el anti alt  (o /antialt permitir)')
+    e.timestamp = datetime.now(timezone.utc)
+    await antiraid_log(guild, e)
+    return ok
+
+
+async def antiraid_on_member_join(member):
+    """Devuelve True si el miembro fue sancionado (para saltarse el log de bienvenida)."""
+    guild = member.guild
+    d = antiraid_data.get(str(guild.id))
+    if not d or member.bot:
+        return False
+    raid_on, alt_on = bool(d.get('enabled')), bool(d.get('alt_enabled'))
+    if not (raid_on or alt_on) or antiraid_exempt(member):
+        return False
+    cfg = antiraid_cfg(guild.id)
+    now = time.time()
+    age_days = (datetime.now(timezone.utc) - member.created_at).total_seconds() / 86400
+
+    # 1) lockdown activo: no entra nadie
+    if raid_on and now < cfg['lockdown_until']:
+        ok, err = await antiraid_punish(member, cfg, 'lockdown activo')
+        antiraid_note_blocked(guild, f'{member} (`{member.id}`)' + ('' if ok else f' - no pude: {err}'))
+        return ok
+
+    # 2) anti-alt: cuenta mas nueva que el minimo que decidio el admin
+    if alt_on and age_days < cfg['alt_days'] and str(member.id) not in cfg['alt_allow']:
+        return await antialt_block(member, cfg, age_days)
+
+    if not raid_on:
+        return False
+
+    # 3) muchas entradas seguidas = raid
+    dq = antiraid_joins.setdefault(guild.id, deque(maxlen=200))
+    dq.append((now, member.id))
+    recent = [uid for ts, uid in dq if now - ts <= cfg['join_window']]
+    if len(recent) >= cfg['join_threshold']:
+        why = f'{len(recent)} usuarios entraron en {cfg["join_window"]}s (limite: {cfg["join_threshold"]})'
+        done = await antiraid_trigger(guild, cfg, recent, why)
+        return member.id in done
+    return False
+
+
+def antiraid_msg_exempt_cleanup(now):
+    if len(antiraid_msgs) > 4000:
+        for k in [k for k, v in antiraid_msgs.items() if not v or now - v[-1][0] > 120]:
+            antiraid_msgs.pop(k, None)
+
+
+async def antiraid_delete_flagged(guild, flagged):
+    async def _del(cid, mid):
+        ch = guild.get_channel_or_thread(cid)
+        if ch is None:
+            return False
+        try:
+            await ch.get_partial_message(mid).delete()
+            return True
+        except Exception:
+            return False
+
+    res = await asyncio.gather(*(_del(c, m) for _, m, c, _h in flagged))
+    return sum(1 for r in res if r)
+
+
+async def antiraid_on_message(message):
+    """Anti-spam: mencion masiva, flood y mismo mensaje en varios canales. Devuelve True si actuo."""
+    guild = message.guild
+    if not guild or not antiraid_active(guild.id):
+        return False
+    cfg = antiraid_cfg(guild.id)
+    if not cfg['spam_enabled']:
+        return False
+    member = message.author
+    if not isinstance(member, discord.Member) or antiraid_exempt(member):
+        return False
+
+    now = time.time()
+    content = (message.content or '').strip().lower()
+    h = hash(content) if len(content) >= 8 else None
+    dq = antiraid_msgs.setdefault((guild.id, member.id), deque(maxlen=30))
+    dq.append((now, message.id, message.channel.id, h))
+    antiraid_msg_exempt_cleanup(now)
+
+    window = cfg['spam_window']
+    recent = [x for x in dq if now - x[0] <= window]
+    mentions = len(message.mentions) + len(message.role_mentions)
+    reason = None
+    if cfg['mention_limit'] and mentions >= cfg['mention_limit']:
+        reason = f'mencion masiva ({mentions} menciones en un mensaje)'
+    elif len(recent) >= cfg['spam_msgs']:
+        reason = f'flood ({len(recent)} mensajes en {window}s)'
+    elif h is not None:
+        same = [x for x in dq if now - x[0] <= 30 and x[3] == h]
+        chans = {x[2] for x in same}
+        if len(chans) >= 3:
+            reason = f'mismo mensaje en {len(chans)} canales'
+    if not reason:
+        return False
+
+    flagged = [x for x in dq if now - x[0] <= max(window, 30)]
+    dq.clear()                       # sin awaits antes: evita sancionar dos veces
+    deleted = await antiraid_delete_flagged(guild, flagged)
+    secs = cfg['spam_timeout_secs']
+    err = None
+    try:
+        await member.timeout(timedelta(seconds=secs), reason=f'[AntiRaid] {reason}')
+    except Exception as e:
+        err = short_error(e)
+
+    e = discord.Embed(title='Anti-Raid: spam detectado', color=0xe67e22)
+    e.add_field(name='Usuario', value=f'{member} (`{member.id}`)', inline=True)
+    e.add_field(name='Canal', value=message.channel.mention if hasattr(message.channel, 'mention') else '?', inline=True)
+    e.add_field(name='Motivo', value=reason, inline=False)
+    e.add_field(name='Mensajes borrados', value=str(deleted), inline=True)
+    e.add_field(name='Timeout', value=format_duration(secs) if not err else f'No pude: {err}', inline=True)
+    e.timestamp = datetime.now(timezone.utc)
+    await antiraid_log(guild, e)
+    return True
+
+
+# ------------------------------------------------------- operaciones (compartidas) --
+def ar_missing_perms(guild):
+    p = guild.me.guild_permissions
+    need = {'kick_members': 'Kick Members', 'ban_members': 'Ban Members',
+            'moderate_members': 'Timeout Members', 'manage_messages': 'Manage Messages'}
+    return [label for attr, label in need.items() if not getattr(p, attr, False)]
+
+
+def antiraid_status_embed(guild, title='Estado del Anti-Raid'):
+    cfg = antiraid_cfg(guild.id)
+    on = cfg['enabled']
+    e = simple_embed(title, 'Proteccion contra raids (entradas masivas) y spam masivo.', 0x2ecc71 if on else 0x95a5a6)
+    e.add_field(name='Estado', value='Activado' if on else 'Desactivado', inline=True)
+    locked = time.time() < cfg['lockdown_until']
+    e.add_field(name='Lockdown', value=f'ACTIVO hasta <t:{int(cfg["lockdown_until"])}:R>' if locked else 'Apagado', inline=True)
+    e.add_field(name='Logs', value=f'<#{cfg["log_channel"]}>' if cfg['log_channel'] else 'Sin canal (uso el mod log si existe)', inline=True)
+    raid = (f'{cfg["join_threshold"]} entradas en {cfg["join_window"]}s\n'
+            f'Accion: **{AR_ACTION_LABELS.get(cfg["action"], cfg["action"])}**\n'
+            f'Lockdown de {format_duration(cfg["lockdown_secs"])}')
+    e.add_field(name='Deteccion de raid', value=raid, inline=False)
+    e.add_field(name='Anti-alt', value=antialt_summary(cfg), inline=False)
+    if cfg['spam_enabled']:
+        spam = (f'{cfg["spam_msgs"]} mensajes en {cfg["spam_window"]}s = flood\n'
+                f'Menciones max por mensaje: {cfg["mention_limit"] or "sin limite"}\n'
+                f'Castigo: timeout de {format_duration(cfg["spam_timeout_secs"])}')
+    else:
+        spam = 'Apagado'
+    e.add_field(name='Anti-spam', value=spam, inline=False)
+    miss = ar_missing_perms(guild)
+    if miss:
+        e.add_field(name='Permisos que me faltan', value=', '.join(miss), inline=False)
+    e.set_footer(text='Admins, moderadores, bots, el owner y la whitelist de Jarvis nunca son sancionados.')
+    return e
+
+
+def ar_enable(guild, on):
+    cfg = antiraid_cfg(guild.id)
+    if on:
+        if cfg['enabled']:
+            raise JarvisError('El anti-raid ya esta activado.')
+        cfg['enabled'] = True
+        title = 'Anti-Raid Activado'
+    else:
+        if not cfg['enabled']:
+            raise JarvisError('El anti-raid ya esta desactivado.')
+        cfg['enabled'] = False
+        cfg['lockdown_until'] = 0
+        title = 'Anti-Raid Desactivado'
+    antiraid_save()
+    return antiraid_status_embed(guild, title)
+
+
+def ar_set_logs(guild, channel):
+    cfg = antiraid_cfg(guild.id)
+    if channel is None:
+        if not cfg['log_channel']:
+            raise JarvisError('El anti-raid no tenia canal de logs.')
+        cfg['log_channel'] = None
+        antiraid_save()
+        return simple_embed('Logs del Anti-Raid', 'Quite el canal de logs (usare el mod log si existe).', 0xe67e22)
+    if not isinstance(channel, discord.TextChannel):
+        raise JarvisError('Los logs tienen que ir a un canal de texto.')
+    perms = channel.permissions_for(guild.me)
+    if not (perms.view_channel and perms.send_messages and perms.embed_links):
+        raise JarvisError(f'No tengo permiso para enviar embeds en {channel.mention}.')
+    cfg['log_channel'] = str(channel.id)
+    antiraid_save()
+    return simple_embed('Logs del Anti-Raid', f'Los logs del anti-raid se enviaran a {channel.mention}.', 0x2ecc71)
+
+
+def ar_lockdown(guild, on, secs=None):
+    cfg = antiraid_cfg(guild.id)
+    if not on:
+        if time.time() >= cfg['lockdown_until']:
+            raise JarvisError('No hay ningun lockdown activo.')
+        cfg['lockdown_until'] = 0
+        antiraid_save()
+        return simple_embed('Lockdown Desactivado', 'El servidor vuelve a aceptar entradas.', 0x2ecc71)
+    if not cfg['enabled']:
+        raise JarvisError('Primero activa el anti-raid (`jarvis activa el anti raid`).')
+    secs = max(30, min(int(secs or cfg['lockdown_secs']), 86400))
+    until = time.time() + secs
+    cfg['lockdown_until'] = until
+    antiraid_save()
+    antiraid_schedule_lockdown_end(guild, until)
+    return simple_embed(
+        'Lockdown Activado',
+        f'Todo el que entre al servidor sera **{AR_ACTION_LABELS.get(cfg["action"], cfg["action"]).lower()}** '
+        f'hasta <t:{int(until)}:R> ({format_duration(secs)}).',
+        0xe74c3c,
+    )
+
+
+def ar_apply_settings(guild, changes):
+    """changes = [(campo, valor), ...]. Valida todo antes de aplicar nada."""
+    checked = []
+    for key, val in changes:
+        if key in ('action', 'alt_action'):
+            if val not in AR_ACTION_LABELS:
+                raise JarvisError('La accion puede ser `kick`, `ban` o `timeout`.')
+        elif key in ('spam_enabled', 'alt_enabled'):
+            val = bool(val)
+        else:
+            lo, hi = AR_LIMITS[key]
+            try:
+                val = int(val)
+            except (TypeError, ValueError):
+                raise JarvisError(f'Valor invalido para **{AR_LABELS[key]}**.')
+            if not lo <= val <= hi:
+                raise JarvisError(f'**{AR_LABELS[key]}** debe estar entre {lo} y {hi}.')
+        checked.append((key, val))
+    cfg = antiraid_cfg(guild.id)
+    lines = []
+    for key, val in checked:
+        cfg[key] = val
+        if key in ('action', 'alt_action'):
+            shown = AR_ACTION_LABELS[val]
+        elif key in ('spam_enabled', 'alt_enabled'):
+            shown = 'Activado' if val else 'Desactivado'
+        else:
+            shown = str(val)
+        lines.append(f'{AR_LABELS[key]}: **{shown}**')
+    antiraid_save()
+    e = simple_embed('Anti-Raid: ajustes actualizados', '\n'.join(lines), 0x3498db)
+    if not cfg['enabled']:
+        e.set_footer(text='Ojo: el anti-raid sigue desactivado.')
+    return e
+
+
+# ------------------------------------------------------------- handlers de Jarvis --
+async def act_antiraid_on(ctx, intent):
+    e = ar_enable(ctx.guild, True)
+    return e
+
+
+async def act_antiraid_off(ctx, intent):
+    return ar_enable(ctx.guild, False)
+
+
+async def act_antiraid_status(ctx, intent):
+    return antiraid_status_embed(ctx.guild)
+
+
+async def act_antiraid_logs(ctx, intent):
+    if intent.mode == 'off':
+        return ar_set_logs(ctx.guild, None)
+    return ar_set_logs(ctx.guild, pick_channel(ctx, intent))
+
+
+async def act_antiraid_lockdown_on(ctx, intent):
+    secs = None
+    if intent.duration:
+        secs = parse_natural_duration(intent.duration)
+        if not secs:
+            raise JarvisError(f'No entendi la duracion `{intent.duration}`. Usa 10m, 1h...')
+    return ar_lockdown(ctx.guild, True, secs)
+
+
+async def act_antiraid_lockdown_off(ctx, intent):
+    return ar_lockdown(ctx.guild, False)
+
+
+async def act_antiraid_config(ctx, intent):
+    key = re.sub(r'[\s_\-]+', '', normalize_for_compare(intent.setting or ''))
+    field = AR_SETTING_ALIASES.get(key)
+    if not field:
+        raise JarvisError('No se que ajuste quieres cambiar. Puedo: joins, ventana, edad_cuenta, accion, spam, '
+                          'mensajes, menciones, lockdown_tiempo.')
+    txt = normalize_for_compare(intent.text or '')
+    num = next((v for v in (intent.value, intent.seconds, intent.amount) if v is not None), None)
+    if field in ('action', 'alt_action'):
+        val = AR_ACTION_WORDS.get(txt)
+        if not val:
+            raise JarvisError('La accion puede ser `kick`, `ban` o `timeout`.')
+    elif field in ('spam_enabled', 'alt_enabled'):
+        if txt in AR_ON_WORDS or num == 1:
+            val = True
+        elif txt in AR_OFF_WORDS or num == 0:
+            val = False
+        else:
+            raise JarvisError('Quieres el anti-spam activado o desactivado?')
+    else:
+        if intent.duration and field in ('join_window', 'spam_window', 'lockdown_secs'):
+            num = parse_natural_duration(intent.duration)
+        if num is None:
+            raise JarvisError('Que valor le pongo?')
+        val = num
+    return ar_apply_settings(ctx.guild, [(field, val)])
+
+
+ANTIRAID_ACTIONS = {
+    'antiraid_on', 'antiraid_off', 'antiraid_status', 'antiraid_logs',
+    'antiraid_lockdown_on', 'antiraid_lockdown_off', 'antiraid_config',
+}
+PLAIN_ACTIONS |= ANTIRAID_ACTIONS
+KNOWN_ACTIONS |= ANTIRAID_ACTIONS
+PLAIN_HANDLERS.update({
+    'antiraid_on': act_antiraid_on, 'antiraid_off': act_antiraid_off, 'antiraid_status': act_antiraid_status,
+    'antiraid_logs': act_antiraid_logs, 'antiraid_lockdown_on': act_antiraid_lockdown_on,
+    'antiraid_lockdown_off': act_antiraid_lockdown_off, 'antiraid_config': act_antiraid_config,
+})
+ACTION_LABELS.update({
+    'antiraid_on': 'Activar anti-raid', 'antiraid_off': 'Desactivar anti-raid', 'antiraid_status': 'Ver anti-raid',
+    'antiraid_logs': 'Logs del anti-raid', 'antiraid_lockdown_on': 'Activar lockdown',
+    'antiraid_lockdown_off': 'Quitar lockdown', 'antiraid_config': 'Ajustar anti-raid',
+})
+
+
+# ------------------------------------------------------------ patrones (sin IA) --
+def antiraid_regex_intent(text, nwords):
+    """Devuelve (coincide, Intent|None). Si coincide pero devuelve None, se lo deja a la IA (ej. ordenes con numeros)."""
+    nn = normalize_for_compare(text)
+    if not re.search(r'\banti\s*raid\b', nn):
+        return False, None
+    F = re.IGNORECASE
+    stop = bool(re.search(r'\b(?:desactiva\w*|apaga\w*|quita\w*|deshabilita\w*|termina\w*|levanta\w*|off|deja\s+de)\b', nn))
+    start = bool(re.search(r'\b(?:activa\w*|enciende\w*|prende\w*|habilita\w*|pon\w*|inicia\w*)\b', nn))
+
+    def ar(action, **kw):
+        it = Intent(action=action, source='regex', **kw)
+        it.explicit = nwords <= 14
+        return True, it
+
+    if re.search(r'\b(?:logs?|registros?|bitacora)\b', nn):
+        if stop:
+            return ar('antiraid_logs', mode='off')
+        cm = re.search(r'<#\d+>', text)
+        chan = cm.group(0) if cm else None
+        if not chan and not re.search(r'\beste\s+canal\b|\baqui\b|\baca\b', nn):
+            nm = re.search(r'\b(?:en|al)\s+(?:el\s+)?(?:canal\s+)?#?([\w\-]+)\s*$', text, F)
+            if nm and normalize_for_compare(nm.group(1)) not in ('raid', 'antiraid', 'logs', 'log'):
+                chan = nm.group(1)
+        return ar('antiraid_logs', channel=chan)
+    if re.search(r'\b(?:lockdown|modo\s+panico|modo\s+emergencia|bloqueo\s+total)\b', nn):
+        if stop:
+            return ar('antiraid_lockdown_off')
+        dm = DURATION_RE.search(text)
+        return ar('antiraid_lockdown_on', duration=dm.group(1).strip() if dm else None)
+    if re.search(r'\d', nn):
+        return True, None            # "activa el anti raid con 5 joins en 10s" -> lo entiende la IA
+    if stop:
+        return ar('antiraid_off')
+    if start:
+        return ar('antiraid_on')
+    if re.search(r'\b(?:estado|status|como\s+esta|muestra\w*|ver|config\w*|ajustes)\b', nn):
+        return ar('antiraid_status')
+    return True, None
+
+
+# ------------------------------------------------------------------ slash commands --
+antiraid_group = app_commands.Group(name='antiraid', description='Sistema anti-raid', guild_only=True)
+
+
+def ar_can_manage(user):
+    if str(user.id) == str(OWNER_ID) or str(user.id) in JARVIS_WHITELIST:
+        return True
+    p = user.guild_permissions
+    return bool(p.administrator or p.manage_guild)
+
+
+async def ar_slash(interaction, fn):
+    if not ar_can_manage(interaction.user):
+        return await interaction.response.send_message(
+            'Necesitas el permiso **Manage Server** (o estar en la whitelist de Jarvis) para usar el anti-raid.', ephemeral=True)
+    try:
+        embed = fn()
+    except JarvisError as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
+    except Exception as e:
+        print(f'[AntiRaid] slash: {e}')
+        return await interaction.response.send_message(f'Error inesperado: {short_error(e)}', ephemeral=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@antiraid_group.command(name='activar', description='Activar el anti-raid')
+async def ar_slash_on(interaction: discord.Interaction):
+    await ar_slash(interaction, lambda: ar_enable(interaction.guild, True))
+
+
+@antiraid_group.command(name='desactivar', description='Desactivar el anti-raid')
+async def ar_slash_off(interaction: discord.Interaction):
+    await ar_slash(interaction, lambda: ar_enable(interaction.guild, False))
+
+
+@antiraid_group.command(name='estado', description='Ver el estado y la configuracion del anti-raid')
+async def ar_slash_status(interaction: discord.Interaction):
+    await ar_slash(interaction, lambda: antiraid_status_embed(interaction.guild))
+
+
+@antiraid_group.command(name='logs', description='Elegir el canal de logs del anti-raid')
+@app_commands.describe(canal='Canal de texto (omitir = este canal)', quitar='Quitar el canal de logs')
+async def ar_slash_logs(interaction: discord.Interaction, canal: discord.TextChannel = None, quitar: bool = False):
+    target = None if quitar else (canal or interaction.channel)
+    await ar_slash(interaction, lambda: ar_set_logs(interaction.guild, target))
+
+
+@antiraid_group.command(name='lockdown', description='Lockdown de emergencia: sanciona a todo el que entre')
+@app_commands.describe(estado='Activar o desactivar', duracion='Duracion (ej: 10m, 1h). Omitir = la configurada')
+@app_commands.choices(estado=[
+    app_commands.Choice(name='Activar', value='on'),
+    app_commands.Choice(name='Desactivar', value='off'),
+])
+async def ar_slash_lockdown(interaction: discord.Interaction, estado: app_commands.Choice[str], duracion: str = None):
+    def run():
+        if estado.value == 'off':
+            return ar_lockdown(interaction.guild, False)
+        secs = None
+        if duracion:
+            secs = parse_duration(duracion)
+            if not secs:
+                raise JarvisError('Duracion invalida. Usa 10m, 1h...')
+        return ar_lockdown(interaction.guild, True, secs)
+    await ar_slash(interaction, run)
+
+
+@antiraid_group.command(name='config', description='Ajustar la sensibilidad del anti-raid')
+@app_commands.describe(
+    joins='Entradas necesarias para detectar un raid', ventana='Ventana de tiempo de las entradas (segundos)',
+    accion='Que hacer con los raiders',
+    spam='Activar/desactivar el anti-spam', mensajes='Mensajes para considerar flood',
+    menciones='Menciones maximas por mensaje (0 = sin limite)', lockdown_minutos='Duracion del lockdown (minutos)',
+)
+@app_commands.choices(accion=[
+    app_commands.Choice(name='Expulsar', value='kick'),
+    app_commands.Choice(name='Banear', value='ban'),
+    app_commands.Choice(name='Timeout 24h', value='timeout'),
+])
+async def ar_slash_config(
+    interaction: discord.Interaction,
+    joins: app_commands.Range[int, 2, 100] = None,
+    ventana: app_commands.Range[int, 2, 300] = None,
+    accion: app_commands.Choice[str] = None,
+    spam: bool = None,
+    mensajes: app_commands.Range[int, 3, 50] = None,
+    menciones: app_commands.Range[int, 0, 50] = None,
+    lockdown_minutos: app_commands.Range[int, 1, 1440] = None,
+):
+    changes = []
+    if joins is not None: changes.append(('join_threshold', joins))
+    if ventana is not None: changes.append(('join_window', ventana))
+    if accion is not None: changes.append(('action', accion.value))
+    if spam is not None: changes.append(('spam_enabled', spam))
+    if mensajes is not None: changes.append(('spam_msgs', mensajes))
+    if menciones is not None: changes.append(('mention_limit', menciones))
+    if lockdown_minutos is not None: changes.append(('lockdown_secs', lockdown_minutos * 60))
+    if not changes:
+        if not ar_can_manage(interaction.user):
+            return await interaction.response.send_message('No tienes permisos.', ephemeral=True)
+        return await interaction.response.send_message('Indica al menos un ajuste. Usa `/antiraid estado` para ver los actuales.', ephemeral=True)
+    await ar_slash(interaction, lambda: ar_apply_settings(interaction.guild, changes))
+
+
+client.tree.add_command(antiraid_group)
+
+
+# ============================================================================
+# ANTI-ALT (bloquear cuentas de Discord demasiado nuevas)
+# ============================================================================
+def antialt_summary(cfg):
+    if not cfg['alt_enabled']:
+        return f'Apagado (edad minima guardada: {cfg["alt_days"]} dias)'
+    txt = (f'Activado: se bloquean cuentas de **menos de {cfg["alt_days"]} dias**\n'
+           f'Accion: **{AR_ACTION_LABELS.get(cfg["alt_action"], cfg["alt_action"])}**')
+    if cfg['alt_allow']:
+        txt += f'\nExcepciones: {len(cfg["alt_allow"])} usuario(s)'
+    return txt
+
+
+def antialt_status_embed(guild, title='Estado del Anti-Alt'):
+    cfg = antiraid_cfg(guild.id)
+    e = simple_embed(title, 'Bloquea al entrar las cuentas de Discord demasiado nuevas (alts).',
+                     0x2ecc71 if cfg['alt_enabled'] else 0x95a5a6)
+    e.add_field(name='Estado', value=antialt_summary(cfg), inline=False)
+    if cfg['alt_allow']:
+        e.add_field(name='Pueden entrar aunque su cuenta sea nueva',
+                    value=', '.join(f'<@{u}>' for u in cfg['alt_allow'][:20])[:1000], inline=False)
+    miss = ar_missing_perms(guild)
+    if miss:
+        e.add_field(name='Permisos que me faltan', value=', '.join(miss), inline=False)
+    e.set_footer(text='Funciona aunque el anti-raid este apagado. Los avisos van al canal de logs del anti-raid.')
+    return e
+
+
+def ar_alt_set(guild, enabled, days=None, action=None):
+    cfg = antiraid_cfg(guild.id)
+    changed = False
+    if days is not None:
+        lo, hi = AR_LIMITS['alt_days']
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            raise JarvisError('La edad minima tiene que ser un numero de dias.')
+        if not lo <= days <= hi:
+            raise JarvisError(f'La edad minima debe estar entre {lo} y {hi} dias.')
+        changed |= cfg['alt_days'] != days
+        cfg['alt_days'] = days
+    if action is not None:
+        if action not in AR_ACTION_LABELS:
+            raise JarvisError('La accion puede ser `kick`, `ban` o `timeout`.')
+        changed |= cfg['alt_action'] != action
+        cfg['alt_action'] = action
+    if enabled is not None and bool(enabled) != cfg['alt_enabled']:
+        cfg['alt_enabled'] = bool(enabled)
+        changed = True
+    elif enabled is not None and not changed:
+        raise JarvisError('El anti-alt ya esta ' + ('activado.' if enabled else 'desactivado.'))
+    antiraid_save()
+    return antialt_status_embed(guild, 'Anti-Alt Activado' if cfg['alt_enabled'] else 'Anti-Alt Desactivado')
+
+
+def ar_alt_allow(guild, user_id, add):
+    cfg = antiraid_cfg(guild.id)
+    uid = str(user_id)
+    if add:
+        if uid in cfg['alt_allow']:
+            raise JarvisError(f'<@{uid}> ya tiene excepcion en el anti-alt.')
+        cfg['alt_allow'].append(uid)
+        title, desc, color = 'Excepcion Anti-Alt', f'<@{uid}> (`{uid}`) podra entrar aunque su cuenta sea nueva.', 0x2ecc71
+    else:
+        if uid not in cfg['alt_allow']:
+            raise JarvisError(f'<@{uid}> no tenia excepcion en el anti-alt.')
+        cfg['alt_allow'].remove(uid)
+        title, desc, color = 'Excepcion Quitada', f'<@{uid}> (`{uid}`) vuelve a estar sujeto al anti-alt.', 0xe67e22
+    antiraid_save()
+    return simple_embed(title, desc, color)
+
+
+async def act_antialt_on(ctx, intent):
+    txt = normalize_for_compare(intent.text or '')
+    action = AR_ACTION_WORDS.get(txt) if txt else None
+    if txt and not action:
+        raise JarvisError('La accion puede ser `kick`, `ban` o `timeout`.')
+    return ar_alt_set(ctx.guild, True, intent.value, action)
+
+
+async def act_antialt_off(ctx, intent):
+    return ar_alt_set(ctx.guild, False)
+
+
+async def act_antialt_status(ctx, intent):
+    return antialt_status_embed(ctx.guild)
+
+
+async def act_antialt_allow(ctx, t, intent):
+    return ar_alt_allow(ctx.guild, t.id, True)
+
+
+async def act_antialt_disallow(ctx, t, intent):
+    return ar_alt_allow(ctx.guild, t.id, False)
+
+
+ANTIALT_PLAIN = {'antialt_on', 'antialt_off', 'antialt_status'}
+ANTIALT_TARGET = {'antialt_allow', 'antialt_disallow'}
+PLAIN_ACTIONS |= ANTIALT_PLAIN
+TARGET_ACTIONS |= ANTIALT_TARGET
+KNOWN_ACTIONS |= ANTIALT_PLAIN | ANTIALT_TARGET
+PLAIN_HANDLERS.update({'antialt_on': act_antialt_on, 'antialt_off': act_antialt_off, 'antialt_status': act_antialt_status})
+TARGET_HANDLERS.update({'antialt_allow': act_antialt_allow, 'antialt_disallow': act_antialt_disallow})
+ACTION_LABELS.update({
+    'antialt_on': 'Activar anti-alt', 'antialt_off': 'Desactivar anti-alt', 'antialt_status': 'Ver anti-alt',
+    'antialt_allow': 'Permitir entrar (anti-alt)', 'antialt_disallow': 'Quitar excepcion (anti-alt)',
+})
+
+
+def antialt_regex_intent(text, nwords):
+    """Devuelve (coincide, Intent|None) para ordenes tipo 'activa el anti alt de 265 dias'."""
+    nn = normalize_for_compare(text)
+    if not re.search(r'\banti\s*alts?\b', nn):
+        return False, None
+    stop = bool(re.search(r'\b(?:desactiva\w*|apaga\w*|quita\w*|deshabilita\w*|off|deja\s+de|ya\s+no)\b', nn))
+    start = bool(re.search(r'\b(?:activa\w*|enciende\w*|prende\w*|habilita\w*|pon\w*|inicia\w*)\b', nn))
+
+    def mk(action, **kw):
+        it = Intent(action=action, source='regex', **kw)
+        it.explicit = nwords <= 14
+        return True, it
+
+    ids = [a or b for a, b in REF_RE.findall(text)]
+    if ids and re.search(r'\b(?:permit\w*|dej\w*|excepci\w*|exceptua\w*|autoriza\w*|permiso)\b', nn):
+        return mk('antialt_disallow' if stop else 'antialt_allow', targets=ids)
+    if stop:
+        return mk('antialt_off')
+
+    days = None
+    m = re.search(r'\b(\d+)\s*(dias?|d|semanas?|meses|mes|anos?)\b', nn)
+    if m:
+        n, u = int(m.group(1)), m.group(2)
+        days = n * (7 if u.startswith('sem') else 30 if u.startswith('mes') else 365 if u.startswith('ano') else 1)
+    else:
+        m = re.search(r'\b(\d+)\b', nn)
+        if m:
+            days = int(m.group(1))
+    action = None
+    am = re.search(r'\b(kick\w*|expuls\w*|ban\w*|timeout|silenci\w*|mute\w*)\b', nn)
+    if am:
+        w = am.group(1)
+        action = 'ban' if w.startswith('ban') else 'timeout' if w.startswith(('timeout', 'silenci', 'mute')) else 'kick'
+    if start or days is not None or action:
+        return mk('antialt_on', value=days, text=action)
+    return mk('antialt_status')
+
+
+antialt_group = app_commands.Group(name='antialt', description='Anti-alt: bloquea cuentas nuevas al entrar', guild_only=True)
+
+
+@antialt_group.command(name='activar', description='Activar el anti-alt (y fijar la edad minima de la cuenta)')
+@app_commands.describe(dias='Edad minima de la cuenta en dias (ej: 265)', accion='Que hacer con las cuentas nuevas')
+@app_commands.choices(accion=[
+    app_commands.Choice(name='Expulsar', value='kick'),
+    app_commands.Choice(name='Banear', value='ban'),
+    app_commands.Choice(name='Timeout 24h', value='timeout'),
+])
+async def ar_slash_alt_on(interaction: discord.Interaction, dias: app_commands.Range[int, 1, 3650] = None,
+                          accion: app_commands.Choice[str] = None):
+    await ar_slash(interaction, lambda: ar_alt_set(interaction.guild, True, dias, accion.value if accion else None))
+
+
+@antialt_group.command(name='desactivar', description='Desactivar el anti-alt')
+async def ar_slash_alt_off(interaction: discord.Interaction):
+    await ar_slash(interaction, lambda: ar_alt_set(interaction.guild, False))
+
+
+@antialt_group.command(name='estado', description='Ver la configuracion del anti-alt')
+async def ar_slash_alt_status(interaction: discord.Interaction):
+    await ar_slash(interaction, lambda: antialt_status_embed(interaction.guild))
+
+
+@antialt_group.command(name='permitir', description='Dejar entrar a alguien aunque su cuenta sea nueva')
+@app_commands.describe(usuario='Usuario (tambien puedes poner su ID)')
+async def ar_slash_alt_allow(interaction: discord.Interaction, usuario: discord.User):
+    await ar_slash(interaction, lambda: ar_alt_allow(interaction.guild, usuario.id, True))
+
+
+@antialt_group.command(name='quitar_permiso', description='Quitar la excepcion de alguien')
+@app_commands.describe(usuario='Usuario')
+async def ar_slash_alt_disallow(interaction: discord.Interaction, usuario: discord.User):
+    await ar_slash(interaction, lambda: ar_alt_allow(interaction.guild, usuario.id, False))
+
+
+client.tree.add_command(antialt_group)
 
 
 # ------------------------------------------------------ ordenes de varios pasos --
@@ -4617,6 +5519,14 @@ def regex_parse_intent(ctx):
         it = Intent(action=action, source='regex', **kw)
         it.explicit = m.start() == 0 and nwords <= 4
         return it
+
+    # -- anti-raid (primero: "activa logs de anti raid" no es otra cosa)
+    matched, ar_it = antiraid_regex_intent(text, nwords)
+    if matched:
+        return ar_it
+    matched, alt_it = antialt_regex_intent(text, nwords)
+    if matched:
+        return alt_it
 
     # -- whitelist (primero: "saca a X de la whitelist" no es un kick)
     if re.search(r'\b(?:whitelist|lista\s*blanca)\b', norm, F):
@@ -4824,9 +5734,10 @@ def make_replier(message):
 
 
 async def execute_chain(ctx, steps):
-    """Orden de varios pasos: si hay algo delicado, se pide UNA confirmacion para toda la cadena."""
+    """Orden de varios pasos: si hay algo delicado, se pide UNA confirmacion para toda la cadena
+    (el owner del bot no confirma nada)."""
     reply = make_replier(ctx.message)
-    risky = any(
+    risky = str(ctx.author.id) != OWNER_ID and any(
         s.action in CONFIRM_ACTIONS or s.action in PLAIN_CONFIRM
         or (s.source == 'ai' and s.action in MANAGE_ACTIONS and s.confidence < JARVIS_MIN_CONFIDENCE)
         for s in steps
@@ -4863,13 +5774,14 @@ async def execute_intent(ctx, intent):
                 return False
             await reply(content=err)
             return True
-        if needs_confirmation(intent, targets):
+        if needs_confirmation(ctx, intent, targets):
             await ask_confirmation(ctx, intent, targets)
             return True
         results = await run_target_action(ctx, intent, targets)
     elif act in PLAIN_HANDLERS:
-        if act in PLAIN_CONFIRM or (intent.source == 'ai' and act in MANAGE_ACTIONS
-                                    and intent.confidence < JARVIS_MIN_CONFIDENCE):
+        if str(ctx.author.id) != OWNER_ID and (
+                act in PLAIN_CONFIRM
+                or (intent.source == 'ai' and act in MANAGE_ACTIONS and intent.confidence < JARVIS_MIN_CONFIDENCE)):
             await ask_confirmation(ctx, intent, [])
             return True
         results = [await safe_act(PLAIN_HANDLERS[act](ctx, intent))]
@@ -5561,7 +6473,7 @@ async def handle_command(message: discord.Message):
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline=False)
         embed.add_field(name='Musica', value='`play` (`p`) `playnext` `skip` (`s`) `stop` `pause` `resume` `queue` (`q`)\n`np` `volume` (`vol`) `loop` `shuffle` `remove` `clear` `leave` (`dc`)', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
@@ -5585,6 +6497,7 @@ async def on_ready():
     except Exception as e:
         print(f'[Slash] Error: {e}')
     load_reminders(client)
+    antiraid_resume()
     if not giveaway_checker_loop.is_running():
         giveaway_checker_loop.start()
 
@@ -5607,6 +6520,13 @@ async def on_message(message: discord.Message):
         except Exception:
             pass
         return
+
+    # ── ANTI-RAID (anti-spam): flood, menciones masivas, mismo mensaje en varios canales ──
+    try:
+        if await antiraid_on_message(message):
+            return
+    except Exception as e:
+        print(f'[AntiRaid] on_message: {e}')
 
     try:
         await add_xp(message)
@@ -5707,6 +6627,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @client.event
 async def on_member_join(member: discord.Member):
+    # anti-raid: si el miembro fue sancionado no hace falta el log de "Nuevo miembro"
+    try:
+        if await antiraid_on_member_join(member):
+            return
+    except Exception as e:
+        print(f'[AntiRaid] on_member_join: {e}')
+
     embed = discord.Embed(title='Nuevo miembro', description=f'{member.mention} se unio al servidor.', color=0x2ecc71)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name='Usuario', value=f'{member} (`{member.id}`)', inline=True)
@@ -6431,6 +7358,7 @@ async def main():
             'Whitelist': len(JARVIS_WHITELIST),
             'Giveaways activos': sum(1 for g in giveaways.values() if not g['ended']),
             'Recordatorios': len(reminders),
+            'Anti-raid activo en': sum(1 for c in antiraid_data.values() if c.get('enabled')),
         },
     )
 
