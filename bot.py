@@ -170,6 +170,64 @@ def voicekick_use(guild_id, user_id):
 
 
 # ============================================================================
+# ROLES TEMPORALES (quitar/dar un rol y revertirlo solo)
+# ============================================================================
+TEMPROLES_FILE = DATA_DIR / 'temp_roles.json'
+temp_roles = load_json(TEMPROLES_FILE, [])   # [{guildId, userId, roleId, mode: 'remove'|'add', until}]
+_temprole_resumed = False
+
+
+def _save_temproles():
+    save_json(TEMPROLES_FILE, temp_roles)
+
+
+async def _fire_temprole(entry):
+    try:
+        guild = client.get_guild(int(entry['guildId']))
+        if guild:
+            role = guild.get_role(int(entry['roleId']))
+            uid = int(entry['userId'])
+            member = guild.get_member(uid) or await guild.fetch_member(uid)
+            if role and member:
+                if entry['mode'] == 'remove':      # se lo quite -> se lo devuelvo
+                    if role not in member.roles:
+                        await member.add_roles(role, reason='[Jarvis] Fin del rol temporal')
+                else:                              # se lo di -> se lo quito
+                    if role in member.roles:
+                        await member.remove_roles(role, reason='[Jarvis] Fin del rol temporal')
+    except Exception as e:
+        print(f'[TempRole] {e}')
+    finally:
+        if entry in temp_roles:
+            temp_roles.remove(entry)
+            _save_temproles()
+
+
+def schedule_temprole(entry):
+    async def _wait():
+        await asyncio.sleep(max(0.0, entry['until'] - time.time()))
+        await _fire_temprole(entry)
+    spawn(_wait())
+
+
+def add_temprole(guild_id, user_id, role_id, mode, secs):
+    entry = {'guildId': str(guild_id), 'userId': str(user_id), 'roleId': str(role_id),
+             'mode': mode, 'until': time.time() + secs}
+    temp_roles.append(entry)
+    _save_temproles()
+    schedule_temprole(entry)
+
+
+def temprole_resume():
+    global _temprole_resumed
+    if _temprole_resumed:
+        return
+    _temprole_resumed = True
+    for e in list(temp_roles):
+        schedule_temprole(e)
+
+
+# ============================================================================
 # AUTO-DELETE WATCH (borrar mensajes de una persona automaticamente)
 # ============================================================================
 def get_delwatch_arr(guild_id):
@@ -2109,8 +2167,6 @@ class MusicControlView(discord.ui.View):
         embed = await self._exec(interaction, music_shuffle)
         if embed is not None:
             await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 # --------------------------------------------------------- operaciones (core) --
 def music_check_member_in_channel(member, channel):
     ch = voice_channel_of(member)
@@ -3018,7 +3074,7 @@ ACCIONES (action) y sus campos:
 - purge: amount (1-500); target_ids opcional = borrar solo los mensajes de esa persona
 - slowmode: seconds (0 = quitar), channel opcional | lock | unlock: channel opcional (vacio = canal actual)
 - voice_disconnect: target_ids | voice_move: target_ids, channel (nombre del canal de voz)
-- role_add | role_remove: role, target_ids (vacio = el JEFE)
+- role_add | role_remove: role, target_ids (vacio = el JEFE), duration (OPCIONAL: si es TEMPORAL, ej "30s","10m","1h"; Jarvis revierte solo cuando pasa el tiempo)
 - list_roles | members_count | server_info | help | whitelist_show
 - nick: target_ids, nick | dm: target_ids, text | say: text (lo que debe escribir el bot), channel opcional (donde escribirlo)
 - avatar | userinfo: target_ids (vacio = el JEFE)
@@ -3065,7 +3121,8 @@ REGLAS
 16. "cada vez que...", "siempre que...", "todas las veces", "hasta que te diga" = regla PERMANENTE (voice_autokick / autodelete_on). voice_disconnect es solo UNA vez y AHORA: si piden algo recurrente, usa voice_autokick, NUNCA voice_disconnect aunque la persona no este en voz en este momento.
 17. "ya no", "deja de", "quitame eso", "ya puedes dejarme" sobre una regla permanente = la accion _off correspondiente (mira REGLAS ACTIVAS).
 18. "anti raid" / "antiraid" SIEMPRE son acciones antiraid_*, nunca voice_autokick ni ban. "activa el anti raid con 5 joins en 10s" = {"actions":[{"action":"antiraid_on"},{"action":"antiraid_config","setting":"joins","value":5},{"action":"antiraid_config","setting":"ventana","value":10}]}
-19. "anti alt" / "antialt" (bloquear cuentas de Discord nuevas al entrar) SIEMPRE son acciones antialt_*, nunca antiraid_*. "activa el anti alt de 265 dias" = {"action":"antialt_on","value":265}. "deja entrar a 123456789012345678 aunque su cuenta sea nueva" = {"action":"antialt_allow","target_query":"123456789012345678"}."""
+19. "anti alt" / "antialt" (bloquear cuentas de Discord nuevas al entrar) SIEMPRE son acciones antialt_*, nunca antiraid_*. "activa el anti alt de 265 dias" = {"action":"antialt_on","value":265}. "deja entrar a 123456789012345678 aunque su cuenta sea nueva" = {"action":"antialt_allow","target_query":"123456789012345678"}.
+20. Cualquier "por X tiempo", "durante X", "X segundos/minutos", "un ratito" en role_add/role_remove significa TEMPORAL: pon duration y Jarvis lo revierte solo. Palabras de relleno como "completos", "enteros" no son parte del nombre del rol."""
 
 
 def format_chat_line(ln, people):
@@ -3228,8 +3285,6 @@ async def ai_understand(ctx):
         return None
     print(f'[Jarvis] {ctx.author} -> {ctx.text!r} => {json.dumps(data, ensure_ascii=False)[:400]}')
     return intents_from_ai(data)
-
-
 # --------------------------------------------------------- resolucion de personas --
 @dataclass
 class Target:
@@ -3854,8 +3909,6 @@ async def act_voice_move(ctx, t, intent):
         raise JarvisError(f'{t.member} no esta en ningun canal de voz ahora mismo.')
     await t.member.move_to(target_channel, reason=f'[Jarvis] Movido por {ctx.author}')
     return simple_embed('Movido de Canal', f'**{t.member.display_name}** fue movido a **{target_channel.name}**.', 0x3498db)
-
-
 # ------------------------------------------------------------------------- roles --
 def find_role_or_fail(ctx, raw):
     if not raw:
@@ -3877,8 +3930,17 @@ async def act_role_add(ctx, t, intent):
     guard_role(ctx, role)
     if role in t.member.roles:
         raise JarvisError(f'{t.member} ya tiene el rol **{role.name}**.')
+    secs = None
+    if intent.duration:
+        secs = parse_natural_duration(intent.duration)
+        if not secs or secs > 30 * 86400:
+            raise JarvisError(f'No entendi la duracion `{intent.duration}` (maximo 30 dias).')
     await t.member.add_roles(role, reason=f'[Jarvis] Asignado por {ctx.author}')
-    return simple_embed('Rol Asignado', f'Se asigno **{role.name}** a {t.member}.', 0x2ecc71)
+    extra = ''
+    if secs:
+        add_temprole(ctx.guild.id, t.id, role.id, 'add', secs)
+        extra = f'\nSe lo quito solo <t:{int(time.time() + secs)}:R>.'
+    return simple_embed('Rol Asignado', f'Se asigno **{role.name}** a {t.member}.{extra}', 0x2ecc71)
 
 
 async def act_role_remove(ctx, t, intent):
@@ -3890,11 +3952,20 @@ async def act_role_remove(ctx, t, intent):
         raise JarvisError(f'{t.member} no tiene el rol **{role.name}**.')
     if t.id != ctx.author.id and ctx.me is not None and ctx.me.top_role <= t.member.top_role:
         raise JarvisError(f'Mi rol es inferior al de {t.member}, no puedo modificar sus roles.')
+    secs = None
+    if intent.duration:
+        secs = parse_natural_duration(intent.duration)
+        if not secs or secs > 30 * 86400:
+            raise JarvisError(f'No entendi la duracion `{intent.duration}` (maximo 30 dias).')
     await t.member.remove_roles(role, reason=f'[Jarvis] Removido por {ctx.author}')
+    extra = ''
+    if secs:
+        add_temprole(ctx.guild.id, t.id, role.id, 'remove', secs)
+        extra = f'\nSe lo devuelvo solo <t:{int(time.time() + secs)}:R>.'
     is_self = t.id == ctx.author.id
     embed = simple_embed(
         'Rol Removido',
-        f'Se te quito el rol **{role.name}**.' if is_self else f'Se quito **{role.name}** de {t.member}.',
+        (f'Se te quito el rol **{role.name}**.' if is_self else f'Se quito **{role.name}** de {t.member}.') + extra,
         0xe67e22,
     )
     embed.add_field(name='Rol', value=f'{role.mention} (`{role.id}`)', inline=True)
@@ -4093,7 +4164,7 @@ def build_help_embed():
     embed.add_field(name='Niveles / XP', value='`/rank` `/leaderboard` `/setxpchannel`\n`>>nivel @user <nivel>` — Asignar nivel (solo owner)', inline=False)
     embed.add_field(name='Mod Log', value='`/setmodlog` `/warns` `/clearwarns`', inline=False)
     embed.add_field(name='Canal', value='`jarvis borra 50 mensajes` (o `jarvis borra los mensajes de ese man`)\n`jarvis pon slowmode 5s`\n`jarvis bloquea el canal`', inline=False)
-    embed.add_field(name='Usuarios', value='`jarvis dame el rol Admin`\n`jarvis quitame el rol Admin`\n`jarvis quitale el rol Admin a @user`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`\n`jarvis cambia el nick de @user a NuevoNick`', inline=False)
+    embed.add_field(name='Usuarios', value='`jarvis dame el rol Admin`\n`jarvis quitame el rol Admin`\n`jarvis quitame el rol Admin por 30 segundos` (temporal: se lo devuelvo solo)\n`jarvis quitale el rol Admin a @user`\n`jarvis muestra avatar de @user`\n`jarvis info de @user`\n`jarvis cambia el nick de @user a NuevoNick`', inline=False)
     embed.add_field(name='Mensajes', value='`jarvis di <texto>` — Enviar mensaje anonimo (soporta @menciones)\n`jarvis di en #general <texto>` — Escribir en otro canal\n`/say` — Slash command anonimo con soporte de canal', inline=False)
     embed.add_field(
         name='Gestion con IA (canales, roles, servidor)',
@@ -5544,20 +5615,30 @@ def regex_parse_intent(ctx):
             return Intent(action='whitelist_remove', source='regex', targets=ids, target_query=q, explicit=bool(ids) and only)
         return Intent(action='whitelist_show', source='regex', explicit=True)
 
-    # -- roles
+    # -- roles (separando la duracion del nombre del rol)
     if re.search(r'\brol(?:es)?\b', norm, F):
-        rem = parse_role_remove_command(norm)
+        role_norm, role_dur = norm, None
+        dm = DURATION_RE.search(role_norm)
+        if dm:
+            role_dur = dm.group(1).strip()
+            role_norm = role_norm[:dm.start()] + ' ' + role_norm[dm.end():]
+        role_norm = re.sub(r'\b(?:completos?|enteros?|nada\s+mas|no\s+mas)\b', '', role_norm, flags=F)
+        role_norm = re.sub(r'\s+', ' ', role_norm).strip()
+
+        rem = parse_role_remove_command(role_norm)
         if rem:
             ids, q, only = parse_target_phrase(rem['userStr'])
-            it = Intent(action='role_remove', source='regex', role=rem['roleStr'], targets=ids, target_query=q)
+            it = Intent(action='role_remove', source='regex', role=rem['roleStr'], targets=ids,
+                        target_query=q, duration=role_dur)
             it.explicit = (rem['userStr'] is None or (bool(ids) and only)) and nwords <= 12
             return it
         m = re.search(
             r'(?:dame?|a[\u00f1n]ade|asigna(?:r)?|ponle|dale|otorga(?:r)?|da(?:r)?)\s+(?:el\s+)?(?:rol\s+)?(.+?)'
-            r'(?:\s+a[l]?\s+(<@!?\d+>|\d{17,20}|\S+))?$', norm, F)
+            r'(?:\s+a[l]?\s+(<@!?\d+>|\d{17,20}|\S+))?$', role_norm, F)
         if m:
             ids, q, only = parse_target_phrase(m.group(2))
-            it = Intent(action='role_add', source='regex', role=m.group(1).strip(), targets=ids, target_query=q)
+            it = Intent(action='role_add', source='regex', role=m.group(1).strip(), targets=ids,
+                        target_query=q, duration=role_dur)
             it.explicit = (m.group(2) is None or (bool(ids) and only)) and nwords <= 8
             return it
 
@@ -6498,6 +6579,7 @@ async def on_ready():
         print(f'[Slash] Error: {e}')
     load_reminders(client)
     antiraid_resume()
+    temprole_resume()
     if not giveaway_checker_loop.is_running():
         giveaway_checker_loop.start()
 
