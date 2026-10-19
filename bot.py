@@ -1383,10 +1383,12 @@ def extract_json(raw):
     return None
 
 
-async def ask_groq(prompt, use_search=False, system=None):
+async def ask_groq(prompt, use_search=False, system=None, max_tokens=600, low_effort=False):
     if not GROQ_API_KEY:
         return 'No hay GROQ_API_KEY configurada.'
     sys_content = system or SYSTEM_PROMPT
+    chat_model = os.environ.get('JARVIS_CHAT_MODEL', 'openai/gpt-oss-120b')
+    extra = {'reasoning_effort': 'low'} if (low_effort and 'gpt-oss' in chat_model) else {}
     if use_search:
         sys_content += ' El usuario quiere info actualizada. Si tu info podria estar desactualizada, mencionalo.'
     try:
@@ -1395,12 +1397,13 @@ async def ask_groq(prompt, use_search=False, system=None):
                 GROQ_URL,
                 headers={'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'},
                 json={
-                    'model': os.environ.get('JARVIS_CHAT_MODEL', 'openai/gpt-oss-120b'),
+                    'model': chat_model,
                     'messages': [
                         {'role': 'system', 'content': sys_content},
                         {'role': 'user', 'content': prompt},
                     ],
-                    'max_tokens': 600, 'temperature': 0.7,
+                    'max_tokens': max_tokens, 'temperature': 0.7,
+                    **extra,
                 },
             ) as res:
                 if res.status == 429:
@@ -4625,15 +4628,48 @@ BARDEAR_FALLBACKS = [
     'Me defiendo con estilo y sin faltar al respeto. Pasa buen dia.',
 ]
 BARDEAR_SYSTEM = (
-    'Eres Jarvis, un bot de Discord con humor. Alguien te esta molestando y te defiendes con ingenio, '
-    'usando lo que sabes de esa persona en ESTE servidor (sus mensajes, nivel, advertencias, roles, antiguedad, etc.). '
-    'REGLAS: responde con 2 o 3 frases cortas (maximo 400 caracteres en total), en el idioma de la persona. '
-    'Elige 1 o 2 datos concretos del perfil o de sus mensajes (puedes citar una frase suya, muy corta) y usalos '
-    'para dejarla en evidencia con humor y sarcasmo, como una indirecta ingeniosa. '
-    'PROHIBIDO: insultos directos, groserias fuertes, atacar fisico, familia, origen, genero, orientacion, '
-    'religion, salud o cualquier cosa hiriente; inventar datos que no esten en el perfil; hablar de algo '
-    'fuera de este servidor. Tono de bardeo entre amigos, no de acoso. Sin markdown ni emojis excesivos.'
+    'Eres Jarvis, un bot de Discord con mucha chispa. Alguien te esta molestando y lo vas a BARDEAR de verdad: '
+    'un roast con sarcasmo, ironia y burla comica, usando lo que sabes de esa persona en ESTE servidor '
+    '(sus mensajes, nivel, advertencias, roles, antiguedad, etc.). '
+    'REGLAS: 3 o 4 frases (maximo 550 caracteres en total), en el idioma de la persona, tono de roast battle entre amigos. '
+    'Usa 2 o 3 datos concretos del perfil o de sus mensajes (puedes citar una frase suya, corta) y exponlos con '
+    'burla inteligente: exageracion, comparaciones graciosas, sarcasmo. Se directo y filoso, no tibio ni amable. '
+    'PROHIBIDO: slurs o groserias fuertes, atacar fisico, familia, origen, genero, orientacion, religion, salud, '
+    'ni inventar datos que no esten en el perfil, ni hablar de nada fuera de este servidor. Sin markdown.'
 )
+
+# Palabras que SI se bloquean en el bardeo (insultos graves / slurs). Lo suave como "payaso" o "noob" se permite.
+BARDEAR_BLOCK = {
+    'hp', 'hpta', 'hijueputa', 'hijueputas', 'hijoeputa', 'hdp', 'malparido', 'malparidos', 'marica', 'maricas',
+    'maricon', 'puta', 'puto', 'perra', 'zorra', 'mierda', 'cabron', 'gonorrea', 'gonorreas', 'culicagado',
+    'fuck', 'shit', 'bitch', 'nigger', 'nigga', 'retrasado', 'mongolico', 'subnormal',
+}
+
+
+def local_roast(member, history, said):
+    """Bardeo sin IA: arma una burla con los datos que Jarvis conoce (plan B si Groq falla)."""
+    now = datetime.now(timezone.utc)
+    guild = member.guild
+    bits = []
+    xp = xp_data.get(str(guild.id), {}).get(str(member.id))
+    if xp is not None:
+        lvl = level_from_xp(xp['xp'])
+        bits.append(f'Nivel {lvl} con {xp["messages"]} mensajes contados y aun asi viene a opinar? He visto tostadoras con mas trayectoria.'
+                    if lvl < 8 else f'Nivel {lvl}: tantas horas aqui y la sabiduria no llego.')
+    warns = get_warnings(guild.id, member.id)
+    if warns:
+        bits.append(f'{len(warns)} advertencia(s) en el historial y todavia se siente con moral de debatir. Admirable el descaro.')
+    if member.joined_at:
+        d = (now - member.joined_at).days
+        bits.append(f'{d} dias en el servidor y ya se cree con autoridad, que fuerte.' if d < 60
+                    else f'{d} dias en el servidor y ese es el nivel de argumento? Pagaria por devolver el tiempo.')
+    if history:
+        q = history[0].split('] ', 1)[-1][:70]
+        bits.append(f'Y ese "{q}" que escribio... orgullo ajeno puro.')
+    elif said:
+        bits.append(f'Y ese "{said[-1][:70]}"... orgullo ajeno puro.')
+    random.shuffle(bits)
+    return ' '.join(bits[:3]) if bits else pick(BARDEAR_FALLBACKS)
 
 
 def _save_tempnicks():
@@ -4743,9 +4779,10 @@ async def act_bardear(ctx, t, intent):
         said.append(chat.replied.content)
 
     reply = None
+    async with ctx.message.channel.typing():
+        history = await collect_member_messages(ctx.guild, t.member, ctx.message.channel)
+    profile_history = history
     if ai_available():
-        async with ctx.message.channel.typing():
-            history = await collect_member_messages(ctx.guild, t.member, ctx.message.channel)
         profile = build_member_profile(ctx.guild, t.member)
         prompt = (f'PERFIL de {t.name} en este servidor:\n{profile}\n\n'
                   'MENSAJES SUYOS recientes en el servidor (del mas nuevo al mas viejo):\n'
@@ -4753,14 +4790,15 @@ async def act_bardear(ctx, t, intent):
                   + '\n\nLO ULTIMO QUE DIJO EN ESTE CHAT (lo que te esta molestando):\n'
                   + ('\n'.join(f'- {x[:150]}' for x in said) if said else '(nada reciente)')
                   + '\n\nResponde con tu bardeo.')
-        reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM) or '').strip()
+        reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM, max_tokens=1800, low_effort=True) or '').strip()
         low = normalize_for_compare(reply)
         if (not reply or reply.startswith(('Error', 'No hay', 'Demasiadas', 'Sin respuesta'))
-                or set(low.split()) & INSULT_WORDS):
+                or set(low.split()) & BARDEAR_BLOCK):
+            print(f'[Bardear] respuesta de la IA descartada: {reply[:120]!r}')
             reply = None
     if not reply:
-        reply = pick(BARDEAR_FALLBACKS)
-    reply = reply[:450]
+        reply = local_roast(t.member, profile_history, said)
+    reply = reply[:600]
 
     # apodo temporal (se restaura solo); si no se puede, solo se manda la respuesta
     me, member = ctx.me, t.member
