@@ -1383,10 +1383,10 @@ def extract_json(raw):
     return None
 
 
-async def ask_groq(prompt, use_search=False):
+async def ask_groq(prompt, use_search=False, system=None):
     if not GROQ_API_KEY:
         return 'No hay GROQ_API_KEY configurada.'
-    sys_content = SYSTEM_PROMPT
+    sys_content = system or SYSTEM_PROMPT
     if use_search:
         sys_content += ' El usuario quiere info actualizada. Si tu info podria estar desactualizada, mencionalo.'
     try:
@@ -3098,6 +3098,7 @@ ACCIONES (action) y sus campos:
 - antiraid_config: setting (joins|ventana|edad_cuenta|accion|spam|mensajes|menciones|lockdown_tiempo) + value (numero; los tiempos van en SEGUNDOS, o usa duration) y/o text (kick|ban|timeout para accion; on|off para spam)
 - antialt_on: activar el ANTI-ALT (expulsa/banea cuentas de Discord mas nuevas que X dias). value = edad minima en DIAS, text = accion opcional (kick|ban|timeout) | antialt_off | antialt_status
 - antialt_allow | antialt_disallow: target_ids (o target_query con el ID): dejar entrar a esa persona aunque su cuenta sea nueva / quitar la excepcion
+- bardear: target_ids. Jarvis se DEFIENDE de alguien que lo molesta con una respuesta con humor (sin insultos) y un apodo temporal que se restaura solo. Usalo cuando el JEFE diga "bardealo", "bardea a X", "defiendete de ese"
 - music_play: query | music_skip | music_stop | music_pause | music_resume | music_queue | music_nowplaying | music_shuffle | music_leave | music_volume: value (0-200) | music_loop: mode (off|track|queue)
 - chat: el JEFE solo conversa, pregunta o bromea -> escribe en "reply"
 - clarify: no puedes decidir con seguridad -> pregunta corta en "clarify"
@@ -3122,7 +3123,8 @@ REGLAS
 17. "ya no", "deja de", "quitame eso", "ya puedes dejarme" sobre una regla permanente = la accion _off correspondiente (mira REGLAS ACTIVAS).
 18. "anti raid" / "antiraid" SIEMPRE son acciones antiraid_*, nunca voice_autokick ni ban. "activa el anti raid con 5 joins en 10s" = {"actions":[{"action":"antiraid_on"},{"action":"antiraid_config","setting":"joins","value":5},{"action":"antiraid_config","setting":"ventana","value":10}]}
 19. "anti alt" / "antialt" (bloquear cuentas de Discord nuevas al entrar) SIEMPRE son acciones antialt_*, nunca antiraid_*. "activa el anti alt de 265 dias" = {"action":"antialt_on","value":265}. "deja entrar a 123456789012345678 aunque su cuenta sea nueva" = {"action":"antialt_allow","target_query":"123456789012345678"}.
-20. Cualquier "por X tiempo", "durante X", "X segundos/minutos", "un ratito" en role_add/role_remove significa TEMPORAL: pon duration y Jarvis lo revierte solo. Palabras de relleno como "completos", "enteros" no son parte del nombre del rol."""
+20. Cualquier "por X tiempo", "durante X", "X segundos/minutos", "un ratito" en role_add/role_remove significa TEMPORAL: pon duration y Jarvis lo revierte solo. Palabras de relleno como "completos", "enteros" no son parte del nombre del rol.
+21. bardear NUNCA es insultar: es defenderse con humor sano. Si el JEFE no nombra a nadie, elige a quien estuvo molestando a Jarvis o al JEFE en el HISTORIAL (o el autor del REPLY)."""
 
 
 def format_chat_line(ln, people):
@@ -4203,6 +4205,7 @@ def build_help_embed():
               '`/antialt activar|desactivar|estado|permitir|quitar_permiso`',
         inline=False,
     )
+    embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con una respuesta con humor (sin insultar) y le pongo un apodo temporal de 5 min que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
     embed.add_field(name='Whitelist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (anadir/quitar: solo owner)', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
@@ -4606,6 +4609,125 @@ PLAIN_HANDLERS['rules_show'] = act_rules_show
 for _a in ('music_play', 'music_skip', 'music_stop', 'music_pause', 'music_resume', 'music_queue',
            'music_nowplaying', 'music_volume', 'music_loop', 'music_shuffle', 'music_leave'):
     PLAIN_HANDLERS[_a] = act_music
+# ============================================================================
+# BARDEAR (Jarvis se defiende con humor sano, SIN insultar)
+# ============================================================================
+TEMPNICK_FILE = DATA_DIR / 'temp_nicks.json'
+temp_nicks = load_json(TEMPNICK_FILE, [])   # [{guildId, userId, oldNick, newNick, until}]
+_tempnick_resumed = False
+BARDEAR_COOLDOWN = {}
+BARDEAR_NICK_SECS = 300
+BARDEAR_NICKS = ['Debatiendo con un bot', 'Perdio contra Jarvis', 'Jarvis tenia razon', 'Rendido ante Jarvis']
+BARDEAR_FALLBACKS = [
+    'Tranqui, yo solo me defiendo. Si quieres paz, avisa.',
+    'Yo solo respondo con humor, nada personal. Respira y seguimos.',
+    'Esto es defensa propia con buena onda. Sin rencores.',
+    'Me defiendo con estilo y sin faltar al respeto. Pasa buen dia.',
+]
+BARDEAR_SYSTEM = (
+    'Eres Jarvis, un bot de Discord con humor. Alguien te esta molestando y te defiendes con ingenio. '
+    'REGLAS: una sola frase corta (maximo 200 caracteres), tono de broma amistosa y a la defensiva, '
+    'en el idioma de la persona. PROHIBIDO insultar, usar groserias, atacar fisico, familia, origen, genero, '
+    'orientacion o cualquier cosa hiriente. Solo defiendete y bromea sobre la situacion, no sobre la persona. '
+    'Sin markdown ni emojis excesivos.'
+)
+
+
+def _save_tempnicks():
+    save_json(TEMPNICK_FILE, temp_nicks)
+
+
+async def _fire_tempnick(entry):
+    try:
+        guild = client.get_guild(int(entry['guildId']))
+        if guild:
+            uid = int(entry['userId'])
+            member = guild.get_member(uid) or await guild.fetch_member(uid)
+            if member and member.nick == entry['newNick']:      # si ya se lo cambiaron, no lo piso
+                await member.edit(nick=entry['oldNick'], reason='[Jarvis] Fin del apodo temporal')
+    except Exception as e:
+        print(f'[TempNick] {e}')
+    finally:
+        if entry in temp_nicks:
+            temp_nicks.remove(entry)
+            _save_tempnicks()
+
+
+def schedule_tempnick(entry):
+    async def _wait():
+        await asyncio.sleep(max(0.0, entry['until'] - time.time()))
+        await _fire_tempnick(entry)
+    spawn(_wait())
+
+
+def tempnick_resume():
+    global _tempnick_resumed
+    if _tempnick_resumed:
+        return
+    _tempnick_resumed = True
+    for e in list(temp_nicks):
+        schedule_tempnick(e)
+
+
+async def act_bardear(ctx, t, intent):
+    guard_sanction(ctx, t, 'bardear', need_member=True, hierarchy=False)
+    if t.member.bot:
+        raise JarvisError('No vale la pena bardear a un bot.')
+    key = (ctx.guild.id, t.id)
+    now = time.time()
+    if now - BARDEAR_COOLDOWN.get(key, 0) < 60:
+        raise JarvisError('Ya me defendi hace nada, dejemos respirar a ese man un minuto.')
+    BARDEAR_COOLDOWN[key] = now
+
+    chat = await ctx.get_chat()
+    said = [ln.content for ln in chat.lines if ln.author_id == t.id][-3:]
+    if chat.replied and chat.replied.author_id == t.id and chat.replied.content not in said:
+        said.append(chat.replied.content)
+
+    reply = None
+    if ai_available() and said:
+        prompt = (f'{t.name} te estuvo molestando en el chat. Lo ultimo que escribio:\n'
+                  + '\n'.join(f'- {x[:150]}' for x in said)
+                  + '\nResponde con tu frase de defensa.')
+        reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM) or '').strip()
+        low = normalize_for_compare(reply)
+        if (not reply or reply.startswith(('Error', 'No hay', 'Demasiadas', 'Sin respuesta'))
+                or set(low.split()) & INSULT_WORDS):
+            reply = None
+    if not reply:
+        reply = pick(BARDEAR_FALLBACKS)
+    reply = reply[:250]
+
+    footer = None
+    me, member = ctx.me, t.member
+    if (me is not None and me.guild_permissions.manage_nicknames and me.top_role > member.top_role
+            and member.id != ctx.guild.owner_id
+            and not any(e['guildId'] == str(ctx.guild.id) and e['userId'] == str(member.id) for e in temp_nicks)):
+        new_nick = pick(BARDEAR_NICKS)
+        old_nick = member.nick          # se guarda ANTES de cambiarlo
+        try:
+            await member.edit(nick=new_nick, reason=f'[Jarvis] Bardeo temporal (por {ctx.author})')
+            entry = {'guildId': str(ctx.guild.id), 'userId': str(member.id), 'oldNick': old_nick,
+                     'newNick': new_nick, 'until': time.time() + BARDEAR_NICK_SECS}
+            temp_nicks.append(entry)
+            _save_tempnicks()
+            schedule_tempnick(entry)
+            footer = f'Apodo temporal por {BARDEAR_NICK_SECS // 60} min, luego se restaura solo.'
+        except Exception:
+            pass
+    embed = simple_embed('Jarvis se defiende', f'{member.mention} {reply}', 0x9b59b6)
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
+TARGET_ACTIONS.add('bardear')
+KNOWN_ACTIONS.add('bardear')
+CONFIRM_ACTIONS.add('bardear')
+TARGET_HANDLERS['bardear'] = act_bardear
+ACTION_LABELS['bardear'] = 'Bardear (defenderse con humor)'
+
+
 # ============================================================================
 # ANTI-RAID
 # ============================================================================
@@ -5599,6 +5721,11 @@ def regex_parse_intent(ctx):
     if matched:
         return alt_it
 
+    # -- bardear: Jarvis se defiende con humor
+    m = re.search(r'\bbardea(?:r|lo|la|le)?\b\s*(.*)$', norm, F)
+    if m:
+        return with_target('bardear', m, m.group(1))
+
     # -- whitelist (primero: "saca a X de la whitelist" no es un kick)
     if re.search(r'\b(?:whitelist|lista\s*blanca)\b', norm, F):
         m = re.search(
@@ -6157,6 +6284,20 @@ async def handle_command(message: discord.Message):
         embed.set_footer(text=f'Asignado por {message.author}')
         return await message.reply(embed=embed)
 
+    # BARDEALO (whitelist): Jarvis se defiende con humor, sin insultar
+    if cmd in ('bardealo', 'bardea', 'bardear'):
+        if str(message.author.id) not in JARVIS_WHITELIST:
+            return await message.reply('Solo la whitelist de Jarvis puede usar este comando.')
+        ctx = JarvisCtx(message=message, guild=guild, author=message.author, me=guild.me,
+                        text=message.content[len(PREFIX):].strip(), norm=message.content[len(PREFIX):].strip().lower())
+        intent = Intent(action='bardear', source='regex', explicit=True,
+                        targets=[str(m.id) for m in message.mentions if not m.bot][:1])
+        try:
+            await execute_intent(ctx, intent)
+        except Exception as e:
+            await message.reply(f'Error: {short_error(e)}')
+        return
+
     # PING
     if cmd == 'ping':
         sent = await message.reply('Calculando...')
@@ -6580,6 +6721,7 @@ async def on_ready():
     load_reminders(client)
     antiraid_resume()
     temprole_resume()
+    tempnick_resume()
     if not giveaway_checker_loop.is_running():
         giveaway_checker_loop.start()
 
