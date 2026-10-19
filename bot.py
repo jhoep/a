@@ -4900,7 +4900,7 @@ async def act_bardear(ctx, t, intent):
     key = (ctx.guild.id, t.id)
     now = time.time()
     if now - BARDEAR_COOLDOWN.get(key, 0) < 60:
-        raise JarvisError('Ya me defendi hace nada, dejemos respirar a ese man un minuto.')
+        raise JarvisError('Ya lo humille hace nada, dejemos respirar a ese raro un minuto.')
     BARDEAR_COOLDOWN[key] = now
 
     chat = await ctx.get_chat()
