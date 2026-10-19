@@ -4617,7 +4617,7 @@ temp_nicks = load_json(TEMPNICK_FILE, [])   # [{guildId, userId, oldNick, newNic
 _tempnick_resumed = False
 BARDEAR_COOLDOWN = {}
 BARDEAR_NICK_SECS = 300
-BARDEAR_NICKS = ['Debatiendo con un bot', 'Perdio contra Jarvis', 'Jarvis tenia razon', 'Rendido ante Jarvis']
+BARDEAR_NICK_PREFIX = 'Rendido ante '   # + nombre de quien dio la orden (maximo 32 caracteres en total)
 BARDEAR_FALLBACKS = [
     'Tranqui, yo solo me defiendo. Si quieres paz, avisa.',
     'Yo solo respondo con humor, nada personal. Respira y seguimos.',
@@ -4703,7 +4703,9 @@ async def act_bardear(ctx, t, intent):
     if (me is not None and me.guild_permissions.manage_nicknames and me.top_role > member.top_role
             and member.id != ctx.guild.owner_id
             and not any(e['guildId'] == str(ctx.guild.id) and e['userId'] == str(member.id) for e in temp_nicks)):
-        new_nick = pick(BARDEAR_NICKS)
+        who = ctx.author.display_name
+        room = 32 - len(BARDEAR_NICK_PREFIX)
+        new_nick = BARDEAR_NICK_PREFIX + (who if len(who) <= room else who[:room - 1] + '\u2026')
         old_nick = member.nick          # se guarda ANTES de cambiarlo
         try:
             await member.edit(nick=new_nick, reason=f'[Jarvis] Bardeo temporal (por {ctx.author})')
