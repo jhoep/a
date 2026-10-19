@@ -4205,7 +4205,7 @@ def build_help_embed():
               '`/antialt activar|desactivar|estado|permitir|quitar_permiso`',
         inline=False,
     )
-    embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con una respuesta con humor (sin insultar) y le pongo un apodo temporal de 5 min que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
+    embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que se de esa persona en el servidor (sus mensajes, nivel, warns, roles...), sin insultos graves, y le pongo un apodo temporal de 5 min que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
     embed.add_field(name='Whitelist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (anadir/quitar: solo owner)', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
@@ -4625,11 +4625,14 @@ BARDEAR_FALLBACKS = [
     'Me defiendo con estilo y sin faltar al respeto. Pasa buen dia.',
 ]
 BARDEAR_SYSTEM = (
-    'Eres Jarvis, un bot de Discord con humor. Alguien te esta molestando y te defiendes con ingenio. '
-    'REGLAS: una sola frase corta (maximo 200 caracteres), tono de broma amistosa y a la defensiva, '
-    'en el idioma de la persona. PROHIBIDO insultar, usar groserias, atacar fisico, familia, origen, genero, '
-    'orientacion o cualquier cosa hiriente. Solo defiendete y bromea sobre la situacion, no sobre la persona. '
-    'Sin markdown ni emojis excesivos.'
+    'Eres Jarvis, un bot de Discord con humor. Alguien te esta molestando y te defiendes con ingenio, '
+    'usando lo que sabes de esa persona en ESTE servidor (sus mensajes, nivel, advertencias, roles, antiguedad, etc.). '
+    'REGLAS: responde con 2 o 3 frases cortas (maximo 400 caracteres en total), en el idioma de la persona. '
+    'Elige 1 o 2 datos concretos del perfil o de sus mensajes (puedes citar una frase suya, muy corta) y usalos '
+    'para dejarla en evidencia con humor y sarcasmo, como una indirecta ingeniosa. '
+    'PROHIBIDO: insultos directos, groserias fuertes, atacar fisico, familia, origen, genero, orientacion, '
+    'religion, salud o cualquier cosa hiriente; inventar datos que no esten en el perfil; hablar de algo '
+    'fuera de este servidor. Tono de bardeo entre amigos, no de acoso. Sin markdown ni emojis excesivos.'
 )
 
 
@@ -4669,6 +4672,61 @@ def tempnick_resume():
         schedule_tempnick(e)
 
 
+async def collect_member_messages(guild, member, current_channel, max_msgs=15):
+    """Mensajes recientes de esa persona: canal actual + otros canales activos que ELLA tambien puede ver."""
+    async def scan(ch, limit):
+        out = []
+        try:
+            async for m in ch.history(limit=limit):
+                txt = (m.clean_content or '').replace('\n', ' ').strip()
+                if m.author.id == member.id and txt:
+                    out.append((m.created_at, ch.name, txt[:200]))
+        except Exception:
+            pass
+        return out
+
+    me = guild.me
+    others = [
+        c for c in guild.text_channels
+        if c.id != current_channel.id
+        and c.permissions_for(me).view_channel and c.permissions_for(me).read_message_history
+        and c.permissions_for(member).view_channel          # nunca leer canales que esa persona no ve
+    ]
+    others.sort(key=lambda c: c.last_message_id or 0, reverse=True)
+    jobs = [scan(current_channel, 300)] + [scan(c, 100) for c in others[:6]]
+    try:
+        results = await asyncio.wait_for(asyncio.gather(*jobs), timeout=12)
+    except Exception:
+        results = []
+    allm = sorted((x for r in results for x in r), key=lambda x: x[0], reverse=True)[:max_msgs]
+    now = datetime.now(timezone.utc)
+    return [f'[#{ch}, hace {short_age((now - ts).total_seconds())}] {txt}' for ts, ch, txt in allm]
+
+
+def build_member_profile(guild, member):
+    now = datetime.now(timezone.utc)
+    lines = [f'Nombre: {member.display_name} (@{member.name})',
+             f'Cuenta de Discord creada hace {(now - member.created_at).days} dias']
+    if member.joined_at:
+        lines.append(f'En este servidor hace {(now - member.joined_at).days} dias')
+    roles = [r.name for r in sorted(member.roles, key=lambda r: -r.position) if r.name != '@everyone'][:8]
+    lines.append('Roles: ' + (', '.join(roles) if roles else 'ninguno'))
+    xp = xp_data.get(str(guild.id), {}).get(str(member.id))
+    if xp:
+        lines.append(f'Nivel de XP: {level_from_xp(xp["xp"])} ({xp["messages"]} mensajes contados)')
+    warns = get_warnings(guild.id, member.id)
+    if warns:
+        lines.append(f'Advertencias: {len(warns)} (motivos: ' + '; '.join(w['reason'][:60] for w in warns[-3:]) + ')')
+    recent = [x for x in recent_mod_actions.get(str(guild.id), []) if x['target_id'] == str(member.id)]
+    if recent:
+        lines.append('Acciones de moderacion recientes sobre el: ' + ', '.join(x['action'] for x in recent[-4:]))
+    if member.voice and member.voice.channel:
+        lines.append(f'Ahora esta en el canal de voz "{member.voice.channel.name}"')
+    if member.is_timed_out():
+        lines.append('Ahora mismo tiene un timeout')
+    return '\n'.join(lines)
+
+
 async def act_bardear(ctx, t, intent):
     guard_sanction(ctx, t, 'bardear', need_member=True, hierarchy=False)
     if t.member.bot:
@@ -4685,10 +4743,16 @@ async def act_bardear(ctx, t, intent):
         said.append(chat.replied.content)
 
     reply = None
-    if ai_available() and said:
-        prompt = (f'{t.name} te estuvo molestando en el chat. Lo ultimo que escribio:\n'
-                  + '\n'.join(f'- {x[:150]}' for x in said)
-                  + '\nResponde con tu frase de defensa.')
+    if ai_available():
+        async with ctx.message.channel.typing():
+            history = await collect_member_messages(ctx.guild, t.member, ctx.message.channel)
+        profile = build_member_profile(ctx.guild, t.member)
+        prompt = (f'PERFIL de {t.name} en este servidor:\n{profile}\n\n'
+                  'MENSAJES SUYOS recientes en el servidor (del mas nuevo al mas viejo):\n'
+                  + ('\n'.join(f'- {x}' for x in history) if history else '(no encontre mensajes suyos)')
+                  + '\n\nLO ULTIMO QUE DIJO EN ESTE CHAT (lo que te esta molestando):\n'
+                  + ('\n'.join(f'- {x[:150]}' for x in said) if said else '(nada reciente)')
+                  + '\n\nResponde con tu bardeo.')
         reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM) or '').strip()
         low = normalize_for_compare(reply)
         if (not reply or reply.startswith(('Error', 'No hay', 'Demasiadas', 'Sin respuesta'))
@@ -4696,7 +4760,7 @@ async def act_bardear(ctx, t, intent):
             reply = None
     if not reply:
         reply = pick(BARDEAR_FALLBACKS)
-    reply = reply[:250]
+    reply = reply[:450]
 
     # apodo temporal (se restaura solo); si no se puede, solo se manda la respuesta
     me, member = ctx.me, t.member
