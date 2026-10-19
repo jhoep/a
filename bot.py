@@ -6554,7 +6554,7 @@ async def handle_command(message: discord.Message):
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline=False)
         embed.add_field(name='Musica', value='`play` (`p`) `playnext` `skip` (`s`) `stop` `pause` `resume` `queue` (`q`)\n`np` `volume` (`vol`) `loop` `shuffle` `remove` `clear` `leave` (`dc`)', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
@@ -7095,6 +7095,37 @@ async def slash_voicejailclear(interaction: discord.Interaction):
 
 
 # ── SAY ──
+SAYLOG_FILE = DATA_DIR / 'say_log.json'
+say_log = load_json(SAYLOG_FILE, [])   # [{userId, userName, guildId, guildName, channelId, text, ts}]
+SAYLOG_MAX = 200
+
+
+async def log_say_use(interaction: discord.Interaction, target_channel, mensaje):
+    """Guarda quien uso /say y le manda un DM al owner del bot (si quien lo uso no es el owner)."""
+    try:
+        entry = {
+            'userId': str(interaction.user.id), 'userName': str(interaction.user),
+            'guildId': str(interaction.guild.id) if interaction.guild else '',
+            'guildName': interaction.guild.name if interaction.guild else 'DM',
+            'channelId': str(target_channel.id), 'text': mensaje, 'ts': time.time(),
+        }
+        say_log.append(entry)
+        del say_log[:-SAYLOG_MAX]
+        save_json(SAYLOG_FILE, say_log)
+        if str(interaction.user.id) == OWNER_ID:
+            return
+        owner = await client.fetch_user(int(OWNER_ID))
+        embed = discord.Embed(title='Alguien uso /say', color=0xe67e22)
+        embed.add_field(name='Usuario', value=f'{interaction.user.mention} ({interaction.user}) `{interaction.user.id}`', inline=False)
+        embed.add_field(name='Servidor', value=f'{entry["guildName"]} (`{entry["guildId"]}`)', inline=True)
+        embed.add_field(name='Canal', value=f'<#{target_channel.id}>', inline=True)
+        embed.add_field(name='Mensaje', value=(mensaje[:1000] or '\u200b'), inline=False)
+        embed.timestamp = datetime.now(timezone.utc)
+        await owner.send(embed=embed)
+    except Exception as e:
+        print(f'[SayLog] {e}')
+
+
 @client.tree.command(name='say', description='Envía un mensaje como el bot (anónimo, soporta @menciones)')
 @app_commands.describe(mensaje='Texto a enviar (puedes usar @usuario, @rol, @everyone)', canal='Canal donde enviar (opcional, por defecto el canal actual)')
 async def slash_say(interaction: discord.Interaction, mensaje: str, canal: discord.TextChannel = None):
@@ -7103,7 +7134,32 @@ async def slash_say(interaction: discord.Interaction, mensaje: str, canal: disco
         await target_channel.send(content=mensaje, allowed_mentions=discord.AllowedMentions(users=True, roles=True, everyone=True))
         await interaction.response.send_message(f'Mensaje enviado en {target_channel.mention}.', ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f'Error al enviar: {e}', ephemeral=True)
+        return await interaction.response.send_message(f'Error al enviar: {e}', ephemeral=True)
+    spawn(log_say_use(interaction, target_channel, mensaje))
+
+
+# ── SAYSHOW (owner) ──
+@client.tree.command(name='sayshow', description='Ver quien uso /say y que mando (solo owner)')
+@app_commands.describe(cantidad='Cuantos mostrar (1-25, por defecto 10)', usuario='Filtrar por usuario (opcional)')
+async def slash_sayshow(interaction: discord.Interaction, cantidad: app_commands.Range[int, 1, 25] = 10, usuario: discord.User = None):
+    if str(interaction.user.id) != OWNER_ID:
+        return await interaction.response.send_message('Solo el owner del bot puede usar este comando.', ephemeral=True)
+    rows = [e for e in say_log if not usuario or e['userId'] == str(usuario.id)]
+    if not rows:
+        return await interaction.response.send_message('Nadie ha usado /say todavia.', ephemeral=True)
+    lines = []
+    for e in reversed(rows[-cantidad:]):
+        txt = (e['text'] or '').replace('\n', ' ')
+        if len(txt) > 150:
+            txt = txt[:149] + '\u2026'
+        lines.append(f'<t:{int(e["ts"])}:R> <@{e["userId"]}> (`{e["userName"]}`) en **{e["guildName"]}** <#{e["channelId"]}>\n> {txt}')
+    desc = ''
+    for ln in lines:
+        if len(desc) + len(ln) + 2 > 4000:
+            break
+        desc += ln + '\n\n'
+    await interaction.response.send_message(
+        embed=simple_embed(f'Usos de /say ({len(rows)} guardados)', desc.strip(), 0xe67e22), ephemeral=True)
 
 
 # ── MIX ──
