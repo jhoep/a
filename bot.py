@@ -113,6 +113,12 @@ def _save_whitelist():
         'added': sorted(JARVIS_WHITELIST - _WL_ENV),
         'removed': sorted(_WL_ENV - JARVIS_WHITELIST),
     })
+    # respaldo en Discord (el disco de muchos hosts se borra al reiniciar)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    spawn(whitelist_push_to_discord())
 
 
 def whitelist_add(user_id):
@@ -127,6 +133,89 @@ def whitelist_remove(user_id):
     JARVIS_WHITELIST.discard(user_id)
     _save_whitelist()
     return True
+
+
+# ---- respaldo de la whitelist en Discord (sobrevive aunque el host borre la carpeta data/) ----
+# Se guarda en un mensaje del bot en tu DM (o en el canal de la variable JARVIS_STORAGE_CHANNEL).
+WL_STORE_MARKER = '[JARVIS_WHITELIST_BACKUP]'
+WL_STORE_CHANNEL = (os.environ.get('JARVIS_STORAGE_CHANNEL') or '').strip()
+_wl_lock = None
+_wl_boot_done = False
+
+
+async def _wl_store_channel():
+    try:
+        if WL_STORE_CHANNEL.isdigit():
+            ch = client.get_channel(int(WL_STORE_CHANNEL)) or await client.fetch_channel(int(WL_STORE_CHANNEL))
+            if ch is not None:
+                return ch
+        owner = await client.fetch_user(int(OWNER_ID))
+        return owner.dm_channel or await owner.create_dm()
+    except Exception as e:
+        print(f'[Whitelist] No pude abrir el canal de respaldo: {e}')
+        return None
+
+
+def _wl_message_content():
+    payload = {'added': sorted(JARVIS_WHITELIST - _WL_ENV), 'removed': sorted(_WL_ENV - JARVIS_WHITELIST)}
+    return f'{WL_STORE_MARKER}\n```json\n{json.dumps(payload)}\n```'
+
+
+async def _wl_find_message(ch):
+    async for m in ch.history(limit=100):
+        if m.author.id == client.user.id and (m.content or '').startswith(WL_STORE_MARKER):
+            return m
+    return None
+
+
+async def whitelist_push_to_discord():
+    global _wl_lock
+    if _wl_lock is None:
+        _wl_lock = asyncio.Lock()
+    async with _wl_lock:
+        ch = await _wl_store_channel()
+        if ch is None:
+            return
+        content = _wl_message_content()
+        if len(content) > 1990:
+            print('[Whitelist] Demasiados usuarios para respaldar en un solo mensaje.')
+            return
+        try:
+            old = await _wl_find_message(ch)
+            if old is None:
+                await ch.send(content)
+            elif old.content != content:
+                await old.edit(content=content)
+        except Exception as e:
+            print(f'[Whitelist] No pude guardar el respaldo en Discord: {e}')
+
+
+async def whitelist_boot_sync():
+    """Al arrancar: si no hay data/whitelist.json (host que borra el disco) la recupera de Discord."""
+    global _wl_boot_done
+    if _wl_boot_done:
+        return
+    _wl_boot_done = True
+    if WHITELIST_FILE.exists():
+        await whitelist_push_to_discord()          # deja el respaldo igual que el archivo local
+        return
+    ch = await _wl_store_channel()
+    if ch is None:
+        return
+    try:
+        msg = await _wl_find_message(ch)
+        if msg is None:
+            return
+        a, b = msg.content.find('{'), msg.content.rfind('}')
+        data = json.loads(msg.content[a:b + 1])
+        JARVIS_WHITELIST.update(str(x) for x in data.get('added', []))
+        JARVIS_WHITELIST.difference_update(str(x) for x in data.get('removed', []))
+        JARVIS_WHITELIST.add(str(OWNER_ID))
+        save_json(WHITELIST_FILE, {'added': sorted(JARVIS_WHITELIST - _WL_ENV), 'removed': sorted(_WL_ENV - JARVIS_WHITELIST)})
+        print(f'[Whitelist] Recuperada desde Discord: {len(JARVIS_WHITELIST)} usuario(s).')
+    except Exception as e:
+        print(f'[Whitelist] No pude recuperar el respaldo: {e}')
+
 
 
 # ============================================================================
@@ -4818,7 +4907,7 @@ async def act_bardear(ctx, t, intent):
             schedule_tempnick(entry)
         except Exception:
             pass
-    return simple_embed('Jarvis se defiende', f'{member.mention} {reply}', 0x9b59b6)
+    return simple_embed(f'{ctx.author.display_name} se defiende'[:256], f'{member.mention} {reply}', 0x9b59b6)
 
 
 TARGET_ACTIONS.add('bardear')
@@ -6808,6 +6897,7 @@ async def handle_command(message: discord.Message):
 async def on_ready():
     print(f'Bot listo: {client.user}')
     print(f'Conectado a {len(client.guilds)} servidores')
+    await whitelist_boot_sync()
     print(f'Jarvis whitelist: {", ".join(JARVIS_WHITELIST)}')
     print(f'Jarvis cerebro: IA={"ON" if GROQ_API_KEY else "OFF (solo patrones)"} | modelo={JARVIS_INTENT_MODEL} | '
           f'contexto={JARVIS_CONTEXT_MESSAGES} msgs | confirmar_deducidos={"SI" if JARVIS_CONFIRM_INFERRED else "NO"}')
