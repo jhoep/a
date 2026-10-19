@@ -1472,7 +1472,7 @@ def extract_json(raw):
     return None
 
 
-async def ask_groq(prompt, use_search=False, system=None, max_tokens=600, low_effort=False):
+async def ask_groq(prompt, use_search=False, system=None, max_tokens=600, low_effort=False, temperature=0.7):
     if not GROQ_API_KEY:
         return 'No hay GROQ_API_KEY configurada.'
     sys_content = system or SYSTEM_PROMPT
@@ -1491,7 +1491,7 @@ async def ask_groq(prompt, use_search=False, system=None, max_tokens=600, low_ef
                         {'role': 'system', 'content': sys_content},
                         {'role': 'user', 'content': prompt},
                     ],
-                    'max_tokens': max_tokens, 'temperature': 0.7,
+                    'max_tokens': max_tokens, 'temperature': temperature,
                     **extra,
                 },
             ) as res:
@@ -4297,7 +4297,7 @@ def build_help_embed():
               '`/antialt activar|desactivar|estado|permitir|quitar_permiso`',
         inline=False,
     )
-    embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que se de esa persona en el servidor (sus mensajes, nivel, warns, roles...), sin insultos graves, y le pongo un apodo temporal de 5 min que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
+    embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que ha escrito esa persona en el servidor (un parrafo de burla con sus propios mensajes), sin insultos graves, y le pongo un apodo temporal de 5 min que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
     embed.add_field(name='Whitelist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (anadir/quitar: solo owner)', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
@@ -4717,14 +4717,20 @@ BARDEAR_FALLBACKS = [
     'Me defiendo con estilo y sin faltar al respeto. Pasa buen dia.',
 ]
 BARDEAR_SYSTEM = (
-    'Eres Jarvis, un bot de Discord con mucha chispa. Alguien te esta molestando y lo vas a BARDEAR de verdad: '
-    'un roast con sarcasmo, ironia y burla comica, usando lo que sabes de esa persona en ESTE servidor '
-    '(sus mensajes, nivel, advertencias, roles, antiguedad, etc.). '
-    'REGLAS: 3 o 4 frases (maximo 550 caracteres en total), en el idioma de la persona, tono de roast battle entre amigos. '
-    'Usa 2 o 3 datos concretos del perfil o de sus mensajes (puedes citar una frase suya, corta) y exponlos con '
-    'burla inteligente: exageracion, comparaciones graciosas, sarcasmo. Se directo y filoso, no tibio ni amable. '
-    'PROHIBIDO: slurs o groserias fuertes, atacar fisico, familia, origen, genero, orientacion, religion, salud, '
-    'ni inventar datos que no esten en el perfil, ni hablar de nada fuera de este servidor. Sin markdown.'
+    'Eres Jarvis, un bot de Discord con la lengua mas filosa del servidor. Alguien te esta molestando y vas a hacerle un '
+    'bardeo BRUTAL, 100% ORIGINAL: nada de plantillas, frases hechas ni muletillas repetidas (evita expresiones como '
+    '"orgullo ajeno", "se cree el rey", "mucho hablar y poco hacer"); cada bardeo tiene que sonar distinto y escrito '
+    'a medida para esa persona. '
+    'Escribe UN SOLO PARRAFO (6 a 9 frases, entre 600 y 900 caracteres) en tercera persona, empezando por su nombre. '
+    'Lee SUS MENSAJES, descubre sus manias, lo que pide, presume, repite, en que se contradice y como trata a los demas, '
+    'y destruyelo con eso: comparaciones absurdas y originales, ironia cruel pero ingeniosa, exageraciones comicas, '
+    'golpes directos. Cita 2 o 3 frases suyas muy cortas como evidencia y rematalas con burla. '
+    'Sube la intensidad frase a frase y cierra con una sentencia final demoledora y un emoji de calavera. '
+    'Tono fuerte, seguro y sin piedad, nada tibio ni amable. '
+    'NO menciones cuantos dias lleva en el servidor, su fecha de union, su edad de cuenta ni su nivel de XP. '
+    'Usa SOLO lo que se desprenda de sus mensajes y del perfil: puedes exagerar la interpretacion pero NO inventar hechos. '
+    'PROHIBIDO: slurs o groserias fuertes, atacar fisico, familia, origen, genero, orientacion, religion o salud, '
+    'ni hablar de nada fuera de este servidor. En el idioma de la persona, sin markdown.'
 )
 
 # Palabras que SI se bloquean en el bardeo (insultos graves / slurs). Lo suave como "payaso" o "noob" se permite.
@@ -4736,29 +4742,48 @@ BARDEAR_BLOCK = {
 
 
 def local_roast(member, history, said):
-    """Bardeo sin IA: arma una burla con los datos que Jarvis conoce (plan B si Groq falla)."""
-    now = datetime.now(timezone.utc)
+    """Bardeo sin IA: arma una burla con SUS mensajes (con frases variadas) si Groq falla."""
+    name = member.display_name
     guild = member.guild
+    quotes = [h.split('] ', 1)[-1] for h in history][:3]
+    if not quotes and said:
+        quotes = [said[-1]]
     bits = []
-    xp = xp_data.get(str(guild.id), {}).get(str(member.id))
-    if xp is not None:
-        lvl = level_from_xp(xp['xp'])
-        bits.append(f'Nivel {lvl} con {xp["messages"]} mensajes contados y aun asi viene a opinar? He visto tostadoras con mas trayectoria.'
-                    if lvl < 8 else f'Nivel {lvl}: tantas horas aqui y la sabiduria no llego.')
+    openers = [
+        '{n} escribe "{q}" con una seguridad que ni los hechos le han dado.',
+        'Hay que reconocerle a {n} que dice "{q}" sin sonrojarse, y eso ya es un talento raro.',
+        'Cuando {n} suelta "{q}", hasta el silencio se pone incomodo.',
+        '{n} tiro un "{q}" y esperaba aplausos; lo unico que llego fue el eco.',
+    ]
+    seconds = [
+        'Despues remata con "{q}", como quien se dispara en el pie y se felicita por la punteria.',
+        'Y no contento, agrega "{q}": el segundo error para que el primero no se sienta solo.',
+        'Luego viene "{q}", prueba de que la constancia tambien se aplica a equivocarse.',
+    ]
+    thirds = [
+        'Y para cerrar el espectaculo, "{q}". Un artista del autogol.',
+        'Incluso "{q}" tuvo su momento de gloria en esta funcion.',
+    ]
+    if quotes:
+        bits.append(pick(openers).format(n=name, q=quotes[0][:80]))
+    if len(quotes) > 1:
+        bits.append(pick(seconds).format(n=name, q=quotes[1][:80]))
+    if len(quotes) > 2:
+        bits.append(pick(thirds).format(n=name, q=quotes[2][:80]))
     warns = get_warnings(guild.id, member.id)
     if warns:
-        bits.append(f'{len(warns)} advertencia(s) en el historial y todavia se siente con moral de debatir. Admirable el descaro.')
-    if member.joined_at:
-        d = (now - member.joined_at).days
-        bits.append(f'{d} dias en el servidor y ya se cree con autoridad, que fuerte.' if d < 60
-                    else f'{d} dias en el servidor y ese es el nivel de argumento? Pagaria por devolver el tiempo.')
-    if history:
-        q = history[0].split('] ', 1)[-1][:70]
-        bits.append(f'Y ese "{q}" que escribio... orgullo ajeno puro.')
-    elif said:
-        bits.append(f'Y ese "{said[-1][:70]}"... orgullo ajeno puro.')
-    random.shuffle(bits)
-    return ' '.join(bits[:3]) if bits else pick(BARDEAR_FALLBACKS)
+        bits.append(pick([
+            f'Con {len(warns)} advertencia(s) en el historial, {name} sigue opinando como si tuviera la hoja de vida limpia.',
+            f'{len(warns)} advertencia(s) y cero aprendizaje: eso si es coherencia.',
+        ]))
+    if not bits:
+        return pick(BARDEAR_FALLBACKS)
+    bits.append(pick([
+        f'Resumen: {name} es lo que pasa cuando la confianza llega antes que las ideas. \U0001F480',
+        f'Veredicto final: {name} habla como si lo estuvieran grabando para la historia, y la historia ya cambio de canal. \U0001F480',
+        f'Moraleja: {name} no pierde discusiones, las abandona antes de entender de que iban. \U0001F480',
+    ]))
+    return ' '.join(bits)
 
 
 def _save_tempnicks():
@@ -4797,7 +4822,7 @@ def tempnick_resume():
         schedule_tempnick(e)
 
 
-async def collect_member_messages(guild, member, current_channel, max_msgs=15):
+async def collect_member_messages(guild, member, current_channel, max_msgs=40):
     """Mensajes recientes de esa persona: canal actual + otros canales activos que ELLA tambien puede ver."""
     async def scan(ch, limit):
         out = []
@@ -4805,7 +4830,7 @@ async def collect_member_messages(guild, member, current_channel, max_msgs=15):
             async for m in ch.history(limit=limit):
                 txt = (m.clean_content or '').replace('\n', ' ').strip()
                 if m.author.id == member.id and txt:
-                    out.append((m.created_at, ch.name, txt[:200]))
+                    out.append((m.created_at, ch.name, txt[:250]))
         except Exception:
             pass
         return out
@@ -4818,9 +4843,9 @@ async def collect_member_messages(guild, member, current_channel, max_msgs=15):
         and c.permissions_for(member).view_channel          # nunca leer canales que esa persona no ve
     ]
     others.sort(key=lambda c: c.last_message_id or 0, reverse=True)
-    jobs = [scan(current_channel, 300)] + [scan(c, 100) for c in others[:6]]
+    jobs = [scan(current_channel, 500)] + [scan(c, 200) for c in others[:8]]
     try:
-        results = await asyncio.wait_for(asyncio.gather(*jobs), timeout=12)
+        results = await asyncio.wait_for(asyncio.gather(*jobs), timeout=15)
     except Exception:
         results = []
     allm = sorted((x for r in results for x in r), key=lambda x: x[0], reverse=True)[:max_msgs]
@@ -4829,16 +4854,7 @@ async def collect_member_messages(guild, member, current_channel, max_msgs=15):
 
 
 def build_member_profile(guild, member):
-    now = datetime.now(timezone.utc)
-    lines = [f'Nombre: {member.display_name} (@{member.name})',
-             f'Cuenta de Discord creada hace {(now - member.created_at).days} dias']
-    if member.joined_at:
-        lines.append(f'En este servidor hace {(now - member.joined_at).days} dias')
-    roles = [r.name for r in sorted(member.roles, key=lambda r: -r.position) if r.name != '@everyone'][:8]
-    lines.append('Roles: ' + (', '.join(roles) if roles else 'ninguno'))
-    xp = xp_data.get(str(guild.id), {}).get(str(member.id))
-    if xp:
-        lines.append(f'Nivel de XP: {level_from_xp(xp["xp"])} ({xp["messages"]} mensajes contados)')
+    lines = [f'Nombre: {member.display_name} (@{member.name})']
     warns = get_warnings(guild.id, member.id)
     if warns:
         lines.append(f'Advertencias: {len(warns)} (motivos: ' + '; '.join(w['reason'][:60] for w in warns[-3:]) + ')')
@@ -4878,8 +4894,8 @@ async def act_bardear(ctx, t, intent):
                   + ('\n'.join(f'- {x}' for x in history) if history else '(no encontre mensajes suyos)')
                   + '\n\nLO ULTIMO QUE DIJO EN ESTE CHAT (lo que te esta molestando):\n'
                   + ('\n'.join(f'- {x[:150]}' for x in said) if said else '(nada reciente)')
-                  + '\n\nResponde con tu bardeo.')
-        reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM, max_tokens=1800, low_effort=True) or '').strip()
+                  + '\n\nEscribe tu bardeo en un solo parrafo.')
+        reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM, max_tokens=1800, low_effort=True, temperature=1.0) or '').strip()
         low = normalize_for_compare(reply)
         if (not reply or reply.startswith(('Error', 'No hay', 'Demasiadas', 'Sin respuesta'))
                 or set(low.split()) & BARDEAR_BLOCK):
@@ -4887,7 +4903,7 @@ async def act_bardear(ctx, t, intent):
             reply = None
     if not reply:
         reply = local_roast(t.member, profile_history, said)
-    reply = reply[:600]
+    reply = reply[:1500]
 
     # apodo temporal (se restaura solo); si no se puede, solo se manda la respuesta
     me, member = ctx.me, t.member
@@ -4907,7 +4923,7 @@ async def act_bardear(ctx, t, intent):
             schedule_tempnick(entry)
         except Exception:
             pass
-    return simple_embed(f'{ctx.author.display_name} se defiende'[:256], f'{member.mention} {reply}', 0x9b59b6)
+    return simple_embed(f'{ctx.author.display_name} se defiende'[:256], reply, 0x9b59b6)
 
 
 TARGET_ACTIONS.add('bardear')
