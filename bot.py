@@ -1,3 +1,4 @@
+import sys
 import os
 import re
 import json
@@ -7829,6 +7830,11 @@ async def slash_clearqueue(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def slash_leave(interaction: discord.Interaction):
     await music_slash(interaction, music_leave(interaction.guild, interaction.user))
+
+
+import jarvis_imagenes
+jarvis_imagenes.install(sys.modules[__name__])
+
 # ============================================================================
 # KEEPALIVE
 # ============================================================================
