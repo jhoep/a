@@ -4297,7 +4297,7 @@ def build_help_embed():
               '`/antialt activar|desactivar|estado|permitir|quitar_permiso`',
         inline=False,
     )
-    embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que ha escrito esa persona en el servidor (un parrafo de burla con sus propios mensajes), sin insultos graves, y le pongo un apodo temporal de 5 min que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
+    embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que ha escrito esa persona en el servidor (un parrafo de burla con sus propios mensajes), sin insultos graves, y le pongo un apodo temporal de 30 segundos que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
     embed.add_field(name='Whitelist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (anadir/quitar: solo owner)', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
@@ -4708,7 +4708,7 @@ TEMPNICK_FILE = DATA_DIR / 'temp_nicks.json'
 temp_nicks = load_json(TEMPNICK_FILE, [])   # [{guildId, userId, oldNick, newNick, until}]
 _tempnick_resumed = False
 BARDEAR_COOLDOWN = {}
-BARDEAR_NICK_SECS = 300
+BARDEAR_NICK_SECS = 30
 BARDEAR_NICK_PREFIX = 'Rendido ante '   # + nombre de quien dio la orden (maximo 32 caracteres en total)
 BARDEAR_FALLBACKS = [
     'Tranqui, yo solo me defiendo. Si quieres paz, avisa.',
