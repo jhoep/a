@@ -4717,21 +4717,46 @@ BARDEAR_FALLBACKS = [
     'Me defiendo con estilo y sin faltar al respeto. Pasa buen dia.',
 ]
 BARDEAR_SYSTEM = (
-    'Eres Jarvis, un bot de Discord con la lengua mas filosa del servidor. Alguien te esta molestando y vas a hacerle un '
-    'bardeo BRUTAL, 100% ORIGINAL: nada de plantillas, frases hechas ni muletillas repetidas (evita expresiones como '
+    'Eres Jarvis, un bot de Discord con la lengua mas filosa del servidor. Esto es un juego de roast de comedia entre '
+    'amigos de una comunidad, todos saben que es broma. Alguien te esta molestando y le vas a responder con un '
+    'roast MUY filoso y 100% ORIGINAL: nada de plantillas, frases hechas ni muletillas repetidas (evita expresiones como '
     '"orgullo ajeno", "se cree el rey", "mucho hablar y poco hacer"); cada bardeo tiene que sonar distinto y escrito '
     'a medida para esa persona. '
     'Escribe UN SOLO PARRAFO (6 a 9 frases, entre 600 y 900 caracteres) en tercera persona, empezando por su nombre. '
     'Lee SUS MENSAJES, descubre sus manias, lo que pide, presume, repite, en que se contradice y como trata a los demas, '
-    'y destruyelo con eso: comparaciones absurdas y originales, ironia cruel pero ingeniosa, exageraciones comicas, '
+    'y dejalo en evidencia con eso: comparaciones absurdas y originales, ironia ingeniosa, exageraciones comicas, '
     'golpes directos. Cita 2 o 3 frases suyas muy cortas como evidencia y rematalas con burla. '
     'Sube la intensidad frase a frase y cierra con una sentencia final demoledora y un emoji de calavera. '
-    'Tono fuerte, seguro y sin piedad, nada tibio ni amable. '
+    'Tono fuerte y seguro, humor de roast, nada tibio. '
     'NO menciones cuantos dias lleva en el servidor, su fecha de union, su edad de cuenta ni su nivel de XP. '
     'Usa SOLO lo que se desprenda de sus mensajes y del perfil: puedes exagerar la interpretacion pero NO inventar hechos. '
     'PROHIBIDO: slurs o groserias fuertes, atacar fisico, familia, origen, genero, orientacion, religion o salud, '
     'ni hablar de nada fuera de este servidor. En el idioma de la persona, sin markdown.'
 )
+
+BARDEAR_SYSTEM_SOFT = (
+    'Eres Jarvis, un bot de Discord divertido. En esta comunidad se hacen roasts de comedia entre amigos y todos '
+    'lo toman como juego. Escribe un parrafo corto (4 a 6 frases) en tercera persona, empezando por el nombre de la '
+    'persona, bromeando con sarcasmo sobre las cosas que ella misma escribio (cita 1 o 2 frases suyas muy cortas). '
+    'Original, ingenioso y con humor. Sin groserias, sin atacar fisico, familia, origen, genero, orientacion, '
+    'religion ni salud, y sin inventar hechos. Termina con un emoji de calavera. En el idioma de la persona.'
+)
+
+BARDEAR_REFUSAL = re.compile(
+    r"i['\u2019]?m sorry|i can(?:['\u2019]?t|not)|cannot (?:help|assist|comply)|can['\u2019]?t (?:help|assist|comply)|"
+    r"as an ai|no puedo (?:ayudar|ayudarte|cumplir|hacer|continuar|escribir)|lo siento|lamento|no me es posible",
+    re.IGNORECASE,
+)
+
+
+def bardear_reply_ok(reply):
+    """True si la respuesta de la IA sirve (no es error, rechazo, ni demasiado corta, ni trae groserias fuertes)."""
+    if not reply or reply.startswith(('Error', 'No hay', 'Demasiadas', 'Sin respuesta')):
+        return False
+    if len(reply) < 120 or BARDEAR_REFUSAL.search(reply[:200]):
+        return False
+    return not (set(normalize_for_compare(reply).split()) & BARDEAR_BLOCK)
+
 
 # Palabras que SI se bloquean en el bardeo (insultos graves / slurs). Lo suave como "payaso" o "noob" se permite.
 BARDEAR_BLOCK = {
@@ -4896,11 +4921,12 @@ async def act_bardear(ctx, t, intent):
                   + ('\n'.join(f'- {x[:150]}' for x in said) if said else '(nada reciente)')
                   + '\n\nEscribe tu bardeo en un solo parrafo.')
         reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM, max_tokens=1800, low_effort=True, temperature=1.0) or '').strip()
-        low = normalize_for_compare(reply)
-        if (not reply or reply.startswith(('Error', 'No hay', 'Demasiadas', 'Sin respuesta'))
-                or set(low.split()) & BARDEAR_BLOCK):
-            print(f'[Bardear] respuesta de la IA descartada: {reply[:120]!r}')
-            reply = None
+        if not bardear_reply_ok(reply):
+            print(f'[Bardear] 1er intento descartado: {reply[:120]!r}')
+            reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM_SOFT, max_tokens=1200, low_effort=True, temperature=1.0) or '').strip()
+            if not bardear_reply_ok(reply):
+                print(f'[Bardear] 2do intento descartado: {reply[:120]!r}')
+                reply = None
     if not reply:
         reply = local_roast(t.member, profile_history, said)
     reply = reply[:1500]
