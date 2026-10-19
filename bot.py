@@ -4698,7 +4698,7 @@ async def act_bardear(ctx, t, intent):
         reply = pick(BARDEAR_FALLBACKS)
     reply = reply[:250]
 
-    footer = None
+    # apodo temporal (se restaura solo); si no se puede, solo se manda la respuesta
     me, member = ctx.me, t.member
     if (me is not None and me.guild_permissions.manage_nicknames and me.top_role > member.top_role
             and member.id != ctx.guild.owner_id
@@ -4712,13 +4712,9 @@ async def act_bardear(ctx, t, intent):
             temp_nicks.append(entry)
             _save_tempnicks()
             schedule_tempnick(entry)
-            footer = f'Apodo temporal por {BARDEAR_NICK_SECS // 60} min, luego se restaura solo.'
         except Exception:
             pass
-    embed = simple_embed('Jarvis se defiende', f'{member.mention} {reply}', 0x9b59b6)
-    if footer:
-        embed.set_footer(text=footer)
-    return embed
+    return simple_embed('Jarvis se defiende', f'{member.mention} {reply}', 0x9b59b6)
 
 
 TARGET_ACTIONS.add('bardear')
