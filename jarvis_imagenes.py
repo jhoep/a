@@ -59,7 +59,9 @@ IMAGE_MAX_BYTES      = 9 * 1024 * 1024
 IMAGE_SIZES = {'cuadrada': (1024, 1024), 'horizontal': (1280, 720), 'vertical': (720, 1280)}
 
 IMAGE_BLOCK_RE = re.compile(
-    r'\b(?:porn\w*|nsfw|desnud\w*|nud[eo]s?|naked|hentai|sexual\w*|sexo|erotic\w*|gore|decapit\w*|lolit\w*|shota)\b',
+    r'\b(?:porn\w*|nsfw|desnud\w*|nud[eo]s?|naked|hentai|sexual\w*|sexo|erotic\w*|gore|decapit\w*|lolit\w*|shota|'
+    r'tet(?:a|as|ita|itas)|senos?|pezon\w*|culo|culos|verga|pene|penes|vagina\w*|boobs?|tits?|nipples?|'
+    r'penis|dick|pussy|ass)\b',
     re.IGNORECASE,
 )
 IMAGE_ENHANCE_SYSTEM = (
