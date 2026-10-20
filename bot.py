@@ -7838,6 +7838,9 @@ jarvis_imagenes.install(sys.modules[__name__])
 import jarvis_resumen
 jarvis_resumen.install(sys.modules[__name__])
 
+import jarvis_roles
+jarvis_roles.install(sys.modules[__name__])
+
 # ============================================================================
 # KEEPALIVE
 # ============================================================================
