@@ -11,6 +11,7 @@ USO
     /suplantar usuario:@pepe mensaje:hola a todos            -> el mensaje sale con el nombre y el avatar de pepe
     /suplantar usuario:@pepe mensaje:... canal:#general con_banner:True
     /nosuplantar activar:True                                 -> cualquier persona puede pedir que NO la suplanten
+    /suplantarshow [cantidad] [usuario] [suplantado]         -> historial de usos (SOLO el owner del bot)
 
 COMO FUNCIONA
   Usa un webhook del canal (el bot lo crea solo; necesita el permiso "Gestionar webhooks"). Un webhook solo puede cambiar
@@ -54,7 +55,8 @@ DEFAULT_MOD_PERMS = ('administrator', 'moderate_members', 'ban_members', 'kick_m
 HELP_FIELD_NAME = 'Suplantar (broma)'
 HELP_FIELD_VALUE = ('`/suplantar usuario mensaje [canal] [con_banner]` - envia un mensaje con el nombre y avatar de otro miembro '
                     '(queda registrado; a staff solo lo puede suplantar el owner del bot)\n'
-                    '`/nosuplantar` - pide que a ti no te suplanten')
+                    '`/nosuplantar` - pide que a ti no te suplanten\n'
+                    '`/suplantarshow` - historial de usos (solo owner del bot)')
 
 _NEEDED = ('client', 'JARVIS_WHITELIST', 'OWNER_ID', 'load_json', 'save_json', 'DATA_DIR', 'short_error')
 
@@ -212,9 +214,10 @@ async def send_as(guild, channel, requester, target, text, with_banner=False):
 # ----------------------------------------------------------------------------
 async def _record(guild, channel, requester, target, text, sent):
     entry = {
-        'ts': time.time(), 'guildId': str(guild.id), 'channelId': str(channel.id),
-        'requesterId': str(requester.id), 'requesterName': str(requester),
-        'targetId': str(target.id), 'targetName': str(target),
+        'ts': time.time(), 'guildId': str(guild.id), 'guildName': getattr(guild, 'name', '') or '',
+        'channelId': str(channel.id),
+        'requesterId': str(requester.id), 'requesterName': str(getattr(requester, 'name', None) or requester)[:40],
+        'targetId': str(target.id), 'targetName': str(getattr(target, 'name', None) or target)[:40],
         'messageId': str(getattr(sent, 'id', '')), 'text': text,
     }
     _log.append(entry)
@@ -272,6 +275,43 @@ def _register_slash_commands():
         where = (canal or interaction.channel).mention
         extra = f'\n{notice}' if notice else ''
         await interaction.followup.send(f'Enviado como **{usuario.display_name}** en {where}.{extra}', ephemeral=True)
+
+    @client.tree.command(name='suplantarshow', description='Ver quien uso /suplantar y que mando (solo owner del bot)')
+    @app_commands.describe(cantidad='Cuantos mostrar (1-25, por defecto 10)',
+                           usuario='Filtrar por quien lo uso (opcional)',
+                           suplantado='Filtrar por a quien suplanto (opcional)')
+    async def slash_suplantarshow(interaction: discord.Interaction,
+                                  cantidad: app_commands.Range[int, 1, 25] = 10,
+                                  usuario: discord.User = None, suplantado: discord.User = None):
+        if str(interaction.user.id) != str(OWNER_ID):
+            return await interaction.response.send_message('Solo el owner del bot puede usar este comando.', ephemeral=True)
+        rows = [e for e in _log
+                if (not usuario or e.get('requesterId') == str(usuario.id))
+                and (not suplantado or e.get('targetId') == str(suplantado.id))]
+        if not rows:
+            return await interaction.response.send_message('Nadie ha usado /suplantar todavia (con ese filtro).', ephemeral=True)
+        lines = []
+        for e in reversed(rows[-cantidad:]):
+            gname = e.get('guildName') or ''
+            if not gname:
+                g = getattr(client, 'get_guild', lambda _i: None)(int(e['guildId'])) if e.get('guildId', '').isdigit() else None
+                gname = getattr(g, 'name', None) or f'servidor {e.get("guildId", "?")}'
+            txt = discord.utils.escape_mentions((e.get('text') or '').replace('\n', ' '))
+            if len(txt) > 150:
+                txt = txt[:149] + '\u2026'
+            link = ''
+            if e.get('messageId') and e.get('guildId') and e.get('channelId'):
+                link = f' [ver](https://discord.com/channels/{e["guildId"]}/{e["channelId"]}/{e["messageId"]})'
+            lines.append(f'<t:{int(e["ts"])}:R> <@{e["requesterId"]}> (`{str(e.get("requesterName", "?"))[:40]}`) como '
+                         f'<@{e["targetId"]}> (`{str(e.get("targetName", "?"))[:40]}`) en **{str(gname)[:60]}** <#{e["channelId"]}>{link}\n> {txt}')
+        desc = ''
+        for ln in lines:
+            if len(desc) + len(ln) + 2 > 4000:
+                break
+            desc += ln + '\n\n'
+        emb = discord.Embed(title=f'Usos de /suplantar ({len(rows)} guardados)', description=desc.strip(), color=0xe67e22)
+        emb.set_footer(text=f'Se guardan los ultimos {LOG_MAX} usos.')
+        await interaction.response.send_message(embed=emb, ephemeral=True)
 
     @client.tree.command(name='nosuplantar', description='Pide que nadie pueda suplantarte con /suplantar')
     @app_commands.describe(activar='True = protegerme, False = permitir de nuevo')
