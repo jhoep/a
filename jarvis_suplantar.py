@@ -1,4 +1,3 @@
-
 import os
 import time
 from datetime import datetime, timezone
@@ -10,9 +9,7 @@ from discord import app_commands
 # Configuracion
 # ----------------------------------------------------------------------------
 _TRUE = ('1', 'true', 'si', 'yes', 'on')
-FOOTER_ON       = os.environ.get('IMPERSONATE_FOOTER', '0').strip().lower() in _TRUE          # nota para TODOS (apagada)
 PUBLIC_ON       = os.environ.get('IMPERSONATE_PUBLIC', '1').strip().lower() in _TRUE          # 1 = lo puede usar cualquiera
-PUBLIC_FOOTER   = os.environ.get('IMPERSONATE_PUBLIC_FOOTER', '1').strip().lower() in _TRUE   # nota solo a quien NO es whitelist
 COOLDOWN_SECS   = 10                 # whitelist y owner
 PUBLIC_COOLDOWN = 30                 # resto de personas
 MAX_TEXT        = 1800
@@ -105,12 +102,8 @@ async def _get_webhook(parent):
 
 
 def _build_content(text, requester):
-    text = text.strip()
-    if FOOTER_ON or (PUBLIC_FOOTER and not _trusted(requester.id)):
-        who = discord.utils.escape_markdown(discord.utils.escape_mentions(requester.display_name))[:40]
-        footer = f'\n-# enviado por {who} con Jarvis'
-        return text[:2000 - len(footer)] + footer
-    return text[:2000]
+    """El mensaje sale tal cual lo escribio quien uso el comando: sin ninguna nota al final."""
+    return text.strip()[:2000]
 
 
 async def send_as(guild, channel, requester, target, text, with_banner=False):
@@ -344,5 +337,4 @@ def install(main):
         main.build_help_embed = build_help_embed_with_suplantar
 
     _register_slash_commands()
-    print(f'[Suplantar] Listo | acceso={"todos" if PUBLIC_ON else "solo whitelist"} | {len(_optout)} persona(s) protegidas | '
-          f'nota_al_final={"todos" if FOOTER_ON else ("solo no-whitelist" if PUBLIC_FOOTER else "NO")}')
+    print(f'[Suplantar] Listo | acceso={"todos" if PUBLIC_ON else "solo whitelist"} | {len(_optout)} persona(s) protegidas')
