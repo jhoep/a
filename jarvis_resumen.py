@@ -1,31 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-jarvis_resumen.py  -  "jarvis resume lo que paso" para el bot de Jarvis.
 
-INSTALACION (2 lineas en tu archivo principal, junto a la de jarvis_imagenes, antes de "# KEEPALIVE"):
-
-    import jarvis_resumen
-    jarvis_resumen.install(sys.modules[__name__])
-
-Ejemplos de uso:
-    jarvis resume lo que paso                      -> ultimos 100 mensajes del canal
-    jarvis resume la ultima hora                   -> periodo (30 min, 2 horas, hoy, 1d...)
-    jarvis resume los ultimos 50 mensajes
-    jarvis que me perdi                            -> desde TU ultimo mensaje en el canal
-    jarvis ponme al dia en #general
-    jarvis resume lo que paso hoy en #anuncios
-    /resumen canal periodo mensajes desde_mi_ultimo_mensaje
-
-Notas:
-  - Solo la whitelist de Jarvis lo puede usar (SUMMARY_PUBLIC=1 para abrirlo a todos en el slash command).
-  - Solo lee canales que la persona que lo pide TAMBIEN puede ver y leer.
-  - Los mensajes del chat se tratan como datos no confiables (se ignoran instrucciones escritas dentro).
-  - Si la IA no esta disponible, responde con estadisticas basicas (cuantos mensajes y quienes hablaron mas).
-  - "jarvis resume" a secas sigue siendo "reanudar la musica"; para resumir el chat di "resume lo que paso".
-
-Variables de entorno (opcionales):
-  SUMMARY_PUBLIC   1 = /resumen para cualquiera, 0 = solo whitelist (defecto)
-"""
 import os
 import re
 import time
