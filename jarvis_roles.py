@@ -1,38 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-jarvis_roles.py  -  Jarvis recuerda los roles de la gente y se los devuelve cuando tu se lo pidas.
 
-INSTALACION (2 lineas en tu archivo principal, junto a las de los otros modulos, antes de "# KEEPALIVE"):
-
-    import jarvis_roles
-    jarvis_roles.install(sys.modules[__name__])
-
-COMO FUNCIONA
-  - Automatico: cada vez que alguien SALE del servidor (se va solo, lo expulsan o lo banean), Jarvis guarda los roles
-    que tenia en ese momento. Si el bot tiene el permiso "Ver registro de auditoria" tambien anota si fue
-    expulsado o baneado.
-  - Manual: puedes guardar los roles de alguien (o de todos) cuando quieras, por si el bot estaba apagado.
-  - Cuando vuelva (o cuando tu quieras), le dices a Jarvis que se los devuelva. NUNCA se los da solo.
-
-EJEMPLOS
-    jarvis devuelvele los roles a @pepe          (@menciona, ID, nombre o responde a un mensaje suyo)
-    jarvis devuelvele los roles al ultimo que se fue
-    jarvis restaura los roles que tenia pepe
-    jarvis que roles tenia pepe                  -> ver lo que hay guardado
-    jarvis roles guardados                       -> lista de los que se fueron con roles guardados
-    jarvis guarda los roles de @pepe
-    jarvis guarda los roles de todos
-    /roles ver | /roles devolver | /roles guardar
-
-SEGURIDAD
-  - Solo la whitelist de Jarvis. Los roles con permisos de moderacion SOLO los devuelve el owner del bot.
-  - Nunca se dan roles por encima del rol del bot, roles de integracion (bots, boosters) ni roles que ya no existen:
-    el resultado te dice cuales se saltó y por que.
-
-RESPALDO
-  Los datos se guardan en data/saved_roles.json y ademas se respaldan en Discord (en tu DM, o en el canal de la
-  variable JARVIS_STORAGE_CHANNEL), por si tu host borra la carpeta al reiniciar. Pon ROLES_BACKUP=0 para desactivarlo.
-"""
 import io
 import os
 import re
