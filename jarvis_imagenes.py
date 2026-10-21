@@ -1,35 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-jarvis_imagenes.py  -  Modulo de IMAGENES para el bot de Jarvis (generar con IA y enviar).
 
-INSTALACION (2 lineas en tu archivo principal del bot):
-
-  1) Deja este archivo en la misma carpeta que tu bot.
-  2) En tu archivo principal, justo ANTES de la seccion  "# KEEPALIVE"  (o antes de  async def main), pon:
-
-        import jarvis_imagenes
-        jarvis_imagenes.install(sys.modules[__name__])
-
-     (si no tienes `import sys` arriba del todo, agregalo).
-
-Eso es todo: el modulo se encarga solo de
-  - ensenarle al cerebro de Jarvis las acciones nuevas (image_generate / image_send),
-  - agregar el atajo por patrones ("jarvis dibuja ...", "jarvis manda esta imagen ..."),
-  - agregar los comandos /imagen y /enviar_imagen,
-  - agregar la seccion "Imagenes" a la ayuda.
-
-Variables de entorno (todas opcionales):
-  IMAGE_PROVIDER        pollinations (defecto) | together
-  POLLINATIONS_TOKEN    token de Pollinations (si te lo piden o quieres mas limite)
-  POLLINATIONS_MODEL    flux (defecto), turbo...
-  TOGETHER_API_KEY      key de Together AI (si usas together)
-  TOGETHER_IMAGE_MODEL  black-forest-labs/FLUX.1-schnell (defecto)
-  IMAGE_ENHANCE         1 = Jarvis mejora/traduce el prompt con Groq (defecto), 0 = no
-  IMAGE_PUBLIC          1 = /imagen para cualquiera, 0 = solo whitelist (defecto)
-
-Nota: los proveedores gratuitos cambian sus limites y condiciones seguido (Pollinations en particular
-ha ido pidiendo token). Si falla, prueba IMAGE_PROVIDER=together con TOGETHER_API_KEY.
-"""
 import io
 import os
 import re
