@@ -1,44 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-jarvis_suplantar.py  -  /suplantar: manda un mensaje con el nombre y el avatar de otro miembro (broma entre amigos).
 
-INSTALACION (2 lineas en tu archivo principal, junto a las de los otros modulos, antes de "# KEEPALIVE"):
-
-    import jarvis_suplantar
-    jarvis_suplantar.install(sys.modules[__name__])
-
-USO
-    /suplantar usuario:@pepe mensaje:hola a todos            -> el mensaje sale con el nombre y el avatar de pepe
-    /suplantar usuario:@pepe mensaje:... canal:#general con_banner:True
-    /nosuplantar activar:True                                 -> cualquier persona puede pedir que NO la suplanten
-    /suplantarshow [cantidad] [usuario] [suplantado]         -> historial de usos (SOLO el owner del bot)
-
-COMO FUNCIONA
-  Usa un webhook del canal (el bot lo crea solo; necesita el permiso "Gestionar webhooks"). Un webhook solo puede cambiar
-  el NOMBRE y el AVATAR de quien envia: usa el apodo del servidor y el avatar del servidor de la persona.
-  El BANNER no se puede cambiar en un mensaje (Discord no lo permite), asi que con `con_banner:True` se agrega debajo
-  como una imagen aparte (solo si la persona tiene banner).
-  Discord siempre marca estos mensajes con la etiqueta APP.
-
-PROTECCIONES (para que sea una broma y no una forma de meter en problemas a alguien)
-  - Lo puede usar CUALQUIERA (IMPERSONATE_PUBLIC=0 lo limita a la whitelist de Jarvis).
-  - Nadie puede suplantar a: bots ni a quien haya activado /nosuplantar (eso se respeta siempre, tambien con el owner).
-  - Las demas personas de la whitelist tampoco pueden suplantar al dueno del servidor, a moderadores/administradores
-    ni al owner del bot. El OWNER DEL BOT si puede suplantar a cualquiera de ellos.
-  - Solo puedes usarlo en canales donde TU podrias escribir.
-  - No hace ping a @everyone, @here ni roles.
-  - Opcional: IMPERSONATE_FOOTER=1 agrega una linea pequena al final: "enviado por <quien> con Jarvis" (apagado por defecto).
-  - Todo queda registrado: archivo data/impersonate_log.json, el canal de mod log (si lo tienes) y un DM al owner del bot
-    cuando lo usa otra persona.
-  - Cooldown: 10 segundos para la whitelist y el owner, 30 segundos para el resto.
-  - Cuando lo usa alguien que NO es de la whitelist, el mensaje lleva una linea pequena al final
-    "enviado por <quien> con Jarvis" (IMPERSONATE_PUBLIC_FOOTER=0 la quita). La whitelist y el owner no la llevan.
-
-Variables de entorno (opcionales):
-  IMPERSONATE_PUBLIC          1 = cualquiera puede usar /suplantar (defecto), 0 = solo whitelist
-  IMPERSONATE_PUBLIC_FOOTER   1 = nota "enviado por ..." cuando lo usa alguien fuera de la whitelist (defecto), 0 = no
-  IMPERSONATE_FOOTER          1 = esa nota para TODOS, incluida la whitelist, 0 = no (defecto)
-"""
 import os
 import time
 from datetime import datetime, timezone
