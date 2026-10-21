@@ -1,4 +1,38 @@
+# -*- coding: utf-8 -*-
+"""
+jarvis_suplantar.py  -  /suplantar: manda un mensaje con el nombre y el avatar de otro miembro (broma entre amigos).
 
+INSTALACION (2 lineas en tu archivo principal, junto a las de los otros modulos, antes de "# KEEPALIVE"):
+
+    import jarvis_suplantar
+    jarvis_suplantar.install(sys.modules[__name__])
+
+USO
+    /suplantar usuario:@pepe mensaje:hola a todos            -> el mensaje sale con el nombre y el avatar de pepe
+    /suplantar usuario:@pepe mensaje:... canal:#general con_banner:True
+    /nosuplantar activar:True                                 -> cualquier persona puede pedir que NO la suplanten
+
+COMO FUNCIONA
+  Usa un webhook del canal (el bot lo crea solo; necesita el permiso "Gestionar webhooks"). Un webhook solo puede cambiar
+  el NOMBRE y el AVATAR de quien envia: usa el apodo del servidor y el avatar del servidor de la persona.
+  El BANNER no se puede cambiar en un mensaje (Discord no lo permite), asi que con `con_banner:True` se agrega debajo
+  como una imagen aparte (solo si la persona tiene banner).
+  Discord siempre marca estos mensajes con la etiqueta APP.
+
+PROTECCIONES (para que sea una broma y no una forma de meter en problemas a alguien)
+  - Solo la whitelist de Jarvis puede usarlo.
+  - No se puede suplantar a: bots, al dueno del servidor, a moderadores/administradores, al owner del bot (salvo que
+    sea el mismo owner), ni a quien haya activado /nosuplantar.
+  - Solo puedes usarlo en canales donde TU podrias escribir.
+  - No hace ping a @everyone, @here ni roles.
+  - Opcional: IMPERSONATE_FOOTER=1 agrega una linea pequena al final: "enviado por <quien> con Jarvis" (apagado por defecto).
+  - Todo queda registrado: archivo data/impersonate_log.json, el canal de mod log (si lo tienes) y un DM al owner del bot
+    cuando lo usa otra persona.
+  - Cooldown de 10 segundos por persona.
+
+Variables de entorno (opcionales):
+  IMPERSONATE_FOOTER   1 = agrega la linea "enviado por ... con Jarvis", 0 = no (defecto)
+"""
 import os
 import time
 from datetime import datetime, timezone
@@ -9,7 +43,7 @@ from discord import app_commands
 # ----------------------------------------------------------------------------
 # Configuracion
 # ----------------------------------------------------------------------------
-FOOTER_ON       = os.environ.get('IMPERSONATE_FOOTER', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+FOOTER_ON       = os.environ.get('IMPERSONATE_FOOTER', '0').strip().lower() in ('1', 'true', 'si', 'yes', 'on')
 COOLDOWN_SECS   = 10
 MAX_TEXT        = 1800
 LOG_MAX         = 200
