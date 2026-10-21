@@ -21,7 +21,7 @@ COMO FUNCIONA
   Discord siempre marca estos mensajes con la etiqueta APP.
 
 PROTECCIONES (para que sea una broma y no una forma de meter en problemas a alguien)
-  - Solo la whitelist de Jarvis puede usarlo.
+  - Lo puede usar CUALQUIERA (IMPERSONATE_PUBLIC=0 lo limita a la whitelist de Jarvis).
   - Nadie puede suplantar a: bots ni a quien haya activado /nosuplantar (eso se respeta siempre, tambien con el owner).
   - Las demas personas de la whitelist tampoco pueden suplantar al dueno del servidor, a moderadores/administradores
     ni al owner del bot. El OWNER DEL BOT si puede suplantar a cualquiera de ellos.
@@ -30,10 +30,14 @@ PROTECCIONES (para que sea una broma y no una forma de meter en problemas a algu
   - Opcional: IMPERSONATE_FOOTER=1 agrega una linea pequena al final: "enviado por <quien> con Jarvis" (apagado por defecto).
   - Todo queda registrado: archivo data/impersonate_log.json, el canal de mod log (si lo tienes) y un DM al owner del bot
     cuando lo usa otra persona.
-  - Cooldown de 10 segundos por persona.
+  - Cooldown: 10 segundos para la whitelist y el owner, 30 segundos para el resto.
+  - Cuando lo usa alguien que NO es de la whitelist, el mensaje lleva una linea pequena al final
+    "enviado por <quien> con Jarvis" (IMPERSONATE_PUBLIC_FOOTER=0 la quita). La whitelist y el owner no la llevan.
 
 Variables de entorno (opcionales):
-  IMPERSONATE_FOOTER   1 = agrega la linea "enviado por ... con Jarvis", 0 = no (defecto)
+  IMPERSONATE_PUBLIC          1 = cualquiera puede usar /suplantar (defecto), 0 = solo whitelist
+  IMPERSONATE_PUBLIC_FOOTER   1 = nota "enviado por ..." cuando lo usa alguien fuera de la whitelist (defecto), 0 = no
+  IMPERSONATE_FOOTER          1 = esa nota para TODOS, incluida la whitelist, 0 = no (defecto)
 """
 import os
 import time
@@ -45,15 +49,19 @@ from discord import app_commands
 # ----------------------------------------------------------------------------
 # Configuracion
 # ----------------------------------------------------------------------------
-FOOTER_ON       = os.environ.get('IMPERSONATE_FOOTER', '0').strip().lower() in ('1', 'true', 'si', 'yes', 'on')
-COOLDOWN_SECS   = 10
+_TRUE = ('1', 'true', 'si', 'yes', 'on')
+FOOTER_ON       = os.environ.get('IMPERSONATE_FOOTER', '0').strip().lower() in _TRUE          # nota para TODOS (apagada)
+PUBLIC_ON       = os.environ.get('IMPERSONATE_PUBLIC', '1').strip().lower() in _TRUE          # 1 = lo puede usar cualquiera
+PUBLIC_FOOTER   = os.environ.get('IMPERSONATE_PUBLIC_FOOTER', '1').strip().lower() in _TRUE   # nota solo a quien NO es whitelist
+COOLDOWN_SECS   = 10                 # whitelist y owner
+PUBLIC_COOLDOWN = 30                 # resto de personas
 MAX_TEXT        = 1800
 LOG_MAX         = 200
 WEBHOOK_NAME    = 'Jarvis'
 DEFAULT_MOD_PERMS = ('administrator', 'moderate_members', 'ban_members', 'kick_members', 'manage_messages',
                      'manage_channels', 'manage_guild', 'manage_roles', 'mute_members', 'deafen_members', 'move_members')
 HELP_FIELD_NAME = 'Suplantar (broma)'
-HELP_FIELD_VALUE = ('`/suplantar usuario mensaje [canal] [con_banner]` - envia un mensaje con el nombre y avatar de otro miembro '
+HELP_FIELD_VALUE = ('`/suplantar usuario mensaje [canal] [con_banner]` - envia un mensaje con el nombre y avatar de otro miembro (para todos) '
                     '(queda registrado; a staff solo lo puede suplantar el owner del bot)\n'
                     '`/nosuplantar` - pide que a ti no te suplanten\n'
                     '`/suplantarshow` - historial de usos (solo owner del bot)')
@@ -98,11 +106,16 @@ def protected_reason(guild, target, requester):
     return None
 
 
+def _trusted(user_id):
+    return str(user_id) == str(OWNER_ID) or str(user_id) in JARVIS_WHITELIST
+
+
 def _check_cooldown(user_id):
     if str(user_id) == str(OWNER_ID):
         return
     now = time.time()
-    left = COOLDOWN_SECS - (now - _cooldown.get(user_id, 0))
+    wait = COOLDOWN_SECS if _trusted(user_id) else PUBLIC_COOLDOWN
+    left = wait - (now - _cooldown.get(user_id, 0))
     if left > 0:
         raise _Refused(f'Espera {left:.0f}s antes de volver a usarlo.')
     _cooldown[user_id] = now
@@ -133,7 +146,7 @@ async def _get_webhook(parent):
 
 def _build_content(text, requester):
     text = text.strip()
-    if FOOTER_ON:
+    if FOOTER_ON or (PUBLIC_FOOTER and not _trusted(requester.id)):
         who = discord.utils.escape_markdown(discord.utils.escape_mentions(requester.display_name))[:40]
         footer = f'\n-# enviado por {who} con Jarvis'
         return text[:2000 - len(footer)] + footer
@@ -259,7 +272,7 @@ def _register_slash_commands():
     async def slash_suplantar(interaction: discord.Interaction, usuario: discord.Member,
                               mensaje: app_commands.Range[str, 1, MAX_TEXT],
                               canal: discord.TextChannel = None, con_banner: bool = False):
-        if str(interaction.user.id) not in JARVIS_WHITELIST:
+        if not (PUBLIC_ON or _trusted(interaction.user.id)):
             return await interaction.response.send_message(
                 'Solo la whitelist de Jarvis puede usar este comando.', ephemeral=True)
         await interaction.response.defer(ephemeral=True)
@@ -371,4 +384,5 @@ def install(main):
         main.build_help_embed = build_help_embed_with_suplantar
 
     _register_slash_commands()
-    print(f'[Suplantar] Listo | {len(_optout)} persona(s) protegidas | nota_al_final={"SI" if FOOTER_ON else "NO"}')
+    print(f'[Suplantar] Listo | acceso={"todos" if PUBLIC_ON else "solo whitelist"} | {len(_optout)} persona(s) protegidas | '
+          f'nota_al_final={"todos" if FOOTER_ON else ("solo no-whitelist" if PUBLIC_FOOTER else "NO")}')
