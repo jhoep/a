@@ -21,8 +21,9 @@ COMO FUNCIONA
 
 PROTECCIONES (para que sea una broma y no una forma de meter en problemas a alguien)
   - Solo la whitelist de Jarvis puede usarlo.
-  - No se puede suplantar a: bots, al dueno del servidor, a moderadores/administradores, al owner del bot (salvo que
-    sea el mismo owner), ni a quien haya activado /nosuplantar.
+  - Nadie puede suplantar a: bots ni a quien haya activado /nosuplantar (eso se respeta siempre, tambien con el owner).
+  - Las demas personas de la whitelist tampoco pueden suplantar al dueno del servidor, a moderadores/administradores
+    ni al owner del bot. El OWNER DEL BOT si puede suplantar a cualquiera de ellos.
   - Solo puedes usarlo en canales donde TU podrias escribir.
   - No hace ping a @everyone, @here ni roles.
   - Opcional: IMPERSONATE_FOOTER=1 agrega una linea pequena al final: "enviado por <quien> con Jarvis" (apagado por defecto).
@@ -52,7 +53,7 @@ DEFAULT_MOD_PERMS = ('administrator', 'moderate_members', 'ban_members', 'kick_m
                      'manage_channels', 'manage_guild', 'manage_roles', 'mute_members', 'deafen_members', 'move_members')
 HELP_FIELD_NAME = 'Suplantar (broma)'
 HELP_FIELD_VALUE = ('`/suplantar usuario mensaje [canal] [con_banner]` - envia un mensaje con el nombre y avatar de otro miembro '
-                    '(queda registrado, no vale con staff ni bots)\n'
+                    '(queda registrado; a staff solo lo puede suplantar el owner del bot)\n'
                     '`/nosuplantar` - pide que a ti no te suplanten')
 
 _NEEDED = ('client', 'JARVIS_WHITELIST', 'OWNER_ID', 'load_json', 'save_json', 'DATA_DIR', 'short_error')
@@ -80,12 +81,14 @@ def protected_reason(guild, target, requester):
         return 'es un bot'
     if target.id == requester.id:
         return None
+    if str(target.id) in _optout:                       # quien pidio no ser suplantado se respeta SIEMPRE
+        return 'pidio que no lo suplanten'
+    if str(requester.id) == str(OWNER_ID):              # el owner del bot puede suplantar a cualquiera (staff incluido)
+        return None
     if target.id == guild.owner_id:
         return 'es el dueno del servidor'
     if str(target.id) == str(OWNER_ID):
         return 'es el owner del bot'
-    if str(target.id) in _optout:
-        return 'pidio que no lo suplanten'
     perms = target.guild_permissions
     for p in MOD_PERMS:
         if getattr(perms, p, False):
