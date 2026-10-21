@@ -7841,6 +7841,8 @@ jarvis_resumen.install(sys.modules[__name__])
 import jarvis_roles
 jarvis_roles.install(sys.modules[__name__])
 
+import jarvis_roblox
+jarvis_roblox.install(sys.modules[__name__])
 # ============================================================================
 # KEEPALIVE
 # ============================================================================
