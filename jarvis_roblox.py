@@ -1,33 +1,4 @@
-# -*- coding: utf-8 -*-
-"""
-jarvis_roblox.py  -  Comando /roblox: busca un usuario de Roblox por nombre, ID o link del perfil.
 
-INSTALACION (2 lineas en tu archivo principal, junto a las de los otros modulos, antes de "# KEEPALIVE"):
-
-    import jarvis_roblox
-    jarvis_roblox.install(sys.modules[__name__])
-
-USO
-    /roblox usuario:Builderman                 (nombre, ID o link: roblox.com/users/156/profile)
-    /roblox usuario:156 seccion:Outfits
-    jarvis roblox Builderman                   (tambien: "jarvis busca roblox Builderman")
-
-El resultado trae botones para cambiar de seccion:
-    Perfil      nombre, ID, descripcion, fecha de creacion, amigos/seguidores/siguiendo, nombres anteriores, avatar
-    Avatar      imagen grande, R6/R15, medidas y todo lo que lleva puesto ahora (con link al catalogo)
-    Outfits     sus outfits guardados + menu para ver uno (imagen grande y sus items)
-    Creaciones  experiencias (juegos) que ha creado con visitas, jugadores y % de likes, e items que vende en el catalogo
-    Grupos      grupos en los que esta, su rango y cuantos miembros tienen
-    Limiteds    coleccionables (Limiteds), valor aproximado (RAP) y los mas caros   (solo si su inventario es publico)
-
-Todo sale de las APIs publicas de Roblox (no necesita cuenta ni API key). Cada seccion es independiente: si una
-falla o la persona la tiene privada, te lo dice y las demas siguen funcionando.
-
-Variables de entorno (opcionales):
-  ROBLOX_API_DOMAIN        roblox.com (defecto). Si Roblox bloquea la IP de tu host, puedes probar con un proxy
-                           publico como roproxy.com (es de terceros: ellos ven las consultas; los datos son publicos).
-  ROBLOX_WHITELIST_ONLY    1 = solo la whitelist de Jarvis puede usar /roblox (defecto 0: cualquiera, con cooldown)
-"""
 import os
 import re
 import time
