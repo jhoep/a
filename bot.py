@@ -3217,7 +3217,9 @@ REGLAS
 18. "anti raid" / "antiraid" SIEMPRE son acciones antiraid_*, nunca voice_autokick ni ban. "activa el anti raid con 5 joins en 10s" = {"actions":[{"action":"antiraid_on"},{"action":"antiraid_config","setting":"joins","value":5},{"action":"antiraid_config","setting":"ventana","value":10}]}
 19. "anti alt" / "antialt" (bloquear cuentas de Discord nuevas al entrar) SIEMPRE son acciones antialt_*, nunca antiraid_*. "activa el anti alt de 265 dias" = {"action":"antialt_on","value":265}. "deja entrar a 123456789012345678 aunque su cuenta sea nueva" = {"action":"antialt_allow","target_query":"123456789012345678"}.
 20. Cualquier "por X tiempo", "durante X", "X segundos/minutos", "un ratito" en role_add/role_remove significa TEMPORAL: pon duration y Jarvis lo revierte solo. Palabras de relleno como "completos", "enteros" no son parte del nombre del rol.
-21. bardear NUNCA es insultar: es defenderse con humor sano. Si el JEFE no nombra a nadie, elige a quien estuvo molestando a Jarvis o al JEFE en el HISTORIAL (o el autor del REPLY)."""
+21. bardear NUNCA es insultar: es defenderse con humor sano. Si el JEFE no nombra a nadie, elige a quien estuvo molestando a Jarvis o al JEFE en el HISTORIAL (o el autor del REPLY).
+22. whitelist_add / whitelist_remove: si el JEFE escribe un ID numerico (17 a 20 digitos) o una @mencion, usalo tal cual en target_ids, aunque esa persona no este en el servidor ni en el chat. "quitale la whitelist a 123456789012345678", "saca a 123456789012345678 de la whitelist" o "ya no tiene whitelist 123456789012345678" = whitelist_remove. "dale whitelist a 123456789012345678" = whitelist_add. Si dan un nombre en vez de ID, ponlo en target_query.
+"""
 
 
 def format_chat_line(ln, people):
@@ -3467,6 +3469,33 @@ async def find_banned_user(guild, query):
     return partial
 
 
+async def find_whitelisted_user(guild, query, prefer=None):
+    """Busca por nombre SOLO entre los que estan en la whitelist (para 'jarvis quitale la whitelist a pepito').
+    Sirve incluso si esa persona ya no esta en el servidor. Devuelve su ID (int) o None."""
+    q = normalize_for_compare(query or '')
+    if not q:
+        return None
+    best = None
+    for uid in sorted(JARVIS_WHITELIST):
+        if uid == str(OWNER_ID) or not uid.isdigit():
+            continue
+        user = guild.get_member(int(uid)) or client.get_user(int(uid))
+        if user is None:
+            try:
+                user = await client.fetch_user(int(uid))
+            except Exception:
+                continue
+        names = [normalize_for_compare(n) for n in (
+            getattr(user, 'name', '') or '', getattr(user, 'global_name', None) or '',
+            getattr(user, 'display_name', '') or '') if n]
+        names = [n for n in names if n]
+        if q in names:
+            return int(uid)
+        if best is None and len(q) >= 3 and any(n.startswith(q) or q in n for n in names):
+            best = int(uid)
+    return best
+
+
 async def resolve_targets(ctx, intent, chat):
     """Convierte lo que dijo la IA / el patron en personas reales. Devuelve (lista_de_Target, error|None)."""
     guild, author = ctx.guild, ctx.author
@@ -3533,6 +3562,12 @@ async def resolve_targets(ctx, intent, chat):
             u = await find_banned_user(guild, q)
             if u:
                 await add(u.id, 'explicit')
+            else:
+                not_found_q = q
+        elif intent.action == 'whitelist_remove':
+            wl_uid = await find_whitelisted_user(guild, q, chat.recency)
+            if wl_uid:
+                await add(wl_uid, 'explicit')
             else:
                 not_found_q = q
         else:
@@ -4165,7 +4200,7 @@ async def act_whitelist_add(ctx, t, intent):
     if uid in JARVIS_WHITELIST:
         raise JarvisError(f'<@{uid}> ya esta en la whitelist.')
     whitelist_add(uid)
-    return simple_embed('Anadido a Whitelist', f'<@{uid}> ahora puede usar comandos de Jarvis.', 0x2ecc71)
+    return simple_embed('Anadido a Whitelist', f'**{t.name}** (`{uid}`) ahora puede usar comandos de Jarvis.', 0x2ecc71)
 
 
 async def act_whitelist_remove(ctx, t, intent):
@@ -4175,7 +4210,7 @@ async def act_whitelist_remove(ctx, t, intent):
     if uid not in JARVIS_WHITELIST:
         raise JarvisError(f'<@{uid}> no esta en la whitelist.')
     whitelist_remove(uid)
-    return simple_embed('Quitado de Whitelist', f'<@{uid}> ya no puede usar comandos de Jarvis.', 0xe67e22)
+    return simple_embed('Quitado de Whitelist', f'**{t.name}** (`{uid}`) ya no puede usar comandos de Jarvis.', 0xe67e22)
 
 
 async def act_whitelist_show(ctx, intent):
@@ -4299,7 +4334,7 @@ def build_help_embed():
         inline=False,
     )
     embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que ha escrito esa persona en el servidor (un parrafo de burla con sus propios mensajes), sin insultos graves, y le pongo un apodo temporal de 30 segundos que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
-    embed.add_field(name='Whitelist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (anadir/quitar: solo owner)', inline=False)
+    embed.add_field(name='Whitelist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis quitale la whitelist a <ID>` / `jarvis muestra la whitelist` (anadir/quitar: solo owner)\n`>>wl add|remove|list <@user o ID>` (solo owner, sin IA)', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
     embed.add_field(name='Backups', value='`/save` — Guardar la configuracion actual del servidor\n`/restore` — Restaurar el servidor a un backup guardado (sube el archivo .json)', inline=False)
@@ -4718,29 +4753,32 @@ BARDEAR_FALLBACKS = [
     'Me defiendo con estilo y sin faltar al respeto. Pasa buen dia.',
 ]
 BARDEAR_SYSTEM = (
-    'Eres Jarvis, un bot de Discord con la lengua mas filosa del servidor. Esto es un juego de roast de comedia entre '
-    'amigos de una comunidad, todos saben que es broma. Alguien te esta molestando y le vas a responder con un '
-    'roast MUY filoso y 100% ORIGINAL: nada de plantillas, frases hechas ni muletillas repetidas (evita expresiones como '
-    '"orgullo ajeno", "se cree el rey", "mucho hablar y poco hacer"); cada bardeo tiene que sonar distinto y escrito '
-    'a medida para esa persona. '
-    'Escribe UN SOLO PARRAFO (6 a 9 frases, entre 600 y 900 caracteres) en tercera persona, empezando por su nombre. '
-    'Lee SUS MENSAJES, descubre sus manias, lo que pide, presume, repite, en que se contradice y como trata a los demas, '
-    'y dejalo en evidencia con eso: comparaciones absurdas y originales, ironia ingeniosa, exageraciones comicas, '
-    'golpes directos. Cita 2 o 3 frases suyas muy cortas como evidencia y rematalas con burla. '
-    'Sube la intensidad frase a frase y cierra con una sentencia final demoledora y un emoji de calavera. '
-    'Tono fuerte y seguro, humor de roast, nada tibio. '
+    'Eres Jarvis, un bot de Discord con la lengua mas venenosa del servidor. Esto es un ROAST de comedia entre '
+    'amigos que se quieren un monton: la persona sabe que es broma y se va a reir. Por eso NO te contengas: '
+    'quiero un bardeo brutal, sin piedad y 100% ORIGINAL (nada de plantillas ni muletillas; evita "orgullo ajeno", '
+    '"se cree el rey", "mucho hablar y poco hacer"). Cada bardeo tiene que sonar escrito a medida para esa persona. '
+    'Escribe UN SOLO PARRAFO (8 a 12 frases, entre 800 y 1200 caracteres) en tercera persona, empezando por su nombre '
+    'con un golpe de entrada demoledor. '
+    'Lee SUS MENSAJES: encuentra sus manias, lo que presume, lo que repite, sus contradicciones, sus excusas, sus '
+    'fracasos en el chat, como trata a los demas, y destruyelo con eso. Usa comparaciones absurdas y exageradas, '
+    'ironia cruel, metaforas ridiculas, y cita 3 o 4 frases suyas muy cortas como evidencia, rematando cada una con '
+    'una burla distinta. La intensidad sube en cada frase: empieza fuerte y termina insoportable. '
+    'Cierra con una sentencia final que lo deje en el suelo y un emoji de calavera. '
+    'Tono arrogante, seguro y despiadado, como quien ya gano la discusion hace rato. Puedes usar lenguaje coloquial '
+    'fuerte (mierda, gonorrea, y similares), pero nada de slurs. '
     'NO menciones cuantos dias lleva en el servidor, su fecha de union, su edad de cuenta ni su nivel de XP. '
     'Usa SOLO lo que se desprenda de sus mensajes y del perfil: puedes exagerar la interpretacion pero NO inventar hechos. '
-    'PROHIBIDO: slurs o groserias fuertes, atacar fisico, familia, origen, genero, orientacion, religion o salud, '
-    'ni hablar de nada fuera de este servidor. En el idioma de la persona, sin markdown.'
+    'LINEAS QUE NO SE CRUZAN (arruinan la broma): slurs de cualquier tipo, atacar fisico, familia, origen, genero, '
+    'orientacion, religion o salud, ni hablar de nada fuera de este servidor. En el idioma de la persona, sin markdown.'
 )
 
 BARDEAR_SYSTEM_SOFT = (
-    'Eres Jarvis, un bot de Discord divertido. En esta comunidad se hacen roasts de comedia entre amigos y todos '
-    'lo toman como juego. Escribe un parrafo corto (4 a 6 frases) en tercera persona, empezando por el nombre de la '
-    'persona, bromeando con sarcasmo sobre las cosas que ella misma escribio (cita 1 o 2 frases suyas muy cortas). '
-    'Original, ingenioso y con humor. Sin groserias, sin atacar fisico, familia, origen, genero, orientacion, '
-    'religion ni salud, y sin inventar hechos. Termina con un emoji de calavera. En el idioma de la persona.'
+    'Eres Jarvis, un bot de Discord con mucho sarcasmo. En esta comunidad los roasts son un juego entre amigos y '
+    'todos se rien. Escribe un parrafo de 6 a 8 frases en tercera persona, empezando por el nombre de la persona, '
+    'burlandote sin piedad de lo que ella misma escribio (cita 2 o 3 frases suyas muy cortas y remata cada una). '
+    'Original, filoso, con comparaciones absurdas y una sentencia final demoledora. Sin slurs, sin atacar fisico, '
+    'familia, origen, genero, orientacion, religion ni salud, y sin inventar hechos. Termina con un emoji de calavera. '
+    'En el idioma de la persona.'
 )
 
 BARDEAR_REFUSAL = re.compile(
@@ -4762,8 +4800,8 @@ def bardear_reply_ok(reply):
 # Palabras que SI se bloquean en el bardeo (insultos graves / slurs). Lo suave como "payaso" o "noob" se permite.
 BARDEAR_BLOCK = {
     'hp', 'hpta', 'hijueputa', 'hijueputas', 'hijoeputa', 'hdp', 'malparido', 'malparidos', 'marica', 'maricas',
-    'maricon', 'puta', 'puto', 'perra', 'zorra', 'mierda', 'cabron', 'gonorrea', 'gonorreas', 'culicagado',
-    'fuck', 'shit', 'bitch', 'nigger', 'nigga', 'retrasado', 'mongolico', 'subnormal',
+    'maricon', 'puta', 'puto', 'perra', 'zorra',
+    'nigger', 'nigga', 'retrasado', 'mongolico', 'subnormal',
 }
 
 
@@ -4776,19 +4814,20 @@ def local_roast(member, history, said):
         quotes = [said[-1]]
     bits = []
     openers = [
-        '{n} escribe "{q}" con una seguridad que ni los hechos le han dado.',
-        'Hay que reconocerle a {n} que dice "{q}" sin sonrojarse, y eso ya es un talento raro.',
-        'Cuando {n} suelta "{q}", hasta el silencio se pone incomodo.',
-        '{n} tiro un "{q}" y esperaba aplausos; lo unico que llego fue el eco.',
+        '{n} escribe "{q}" con una seguridad que ni su propia trayectoria justifica.',
+        'Hay que tener valor para soltar "{q}" y seguir conectado como si nada, {n} lo tiene y le sobra.',
+        'Cuando {n} suelta "{q}", hasta el servidor se queda en silencio por respeto a la tragedia.',
+        '{n} tiro un "{q}" esperando aplausos y lo unico que llego fue el eco y un par de ojos en blanco.',
+        'Escuchar a {n} decir "{q}" es como ver a alguien explicar con orgullo que se equivoco de puerta.',
     ]
     seconds = [
-        'Despues remata con "{q}", como quien se dispara en el pie y se felicita por la punteria.',
-        'Y no contento, agrega "{q}": el segundo error para que el primero no se sienta solo.',
-        'Luego viene "{q}", prueba de que la constancia tambien se aplica a equivocarse.',
+        'Y como no le alcanzo con eso, remata con "{q}": se disparo en el pie y todavia se felicito por la punteria.',
+        'Despues viene "{q}", el segundo error, para que el primero no se sienta solo en su funeral.',
+        'Luego suelta "{q}", prueba de que la constancia tambien aplica para equivocarse.',
     ]
     thirds = [
-        'Y para cerrar el espectaculo, "{q}". Un artista del autogol.',
-        'Incluso "{q}" tuvo su momento de gloria en esta funcion.',
+        'Y para cerrar el show, "{q}". Un artista del autogol, aplausos de pie para nadie.',
+        'Incluso "{q}" fue un intento de gloria que termino en documental de errores.',
     ]
     if quotes:
         bits.append(pick(openers).format(n=name, q=quotes[0][:80]))
@@ -4805,9 +4844,9 @@ def local_roast(member, history, said):
     if not bits:
         return pick(BARDEAR_FALLBACKS)
     bits.append(pick([
-        f'Resumen: {name} es lo que pasa cuando la confianza llega antes que las ideas. \U0001F480',
-        f'Veredicto final: {name} habla como si lo estuvieran grabando para la historia, y la historia ya cambio de canal. \U0001F480',
-        f'Moraleja: {name} no pierde discusiones, las abandona antes de entender de que iban. \U0001F480',
+        f'Veredicto: {name} es lo que pasa cuando la confianza llega mucho antes que las ideas, y las ideas nunca llegaron. \U0001F480',
+        f'Sentencia final: {name} habla como si lo grabaran para la historia, y la historia ya cambio de canal. \U0001F480',
+        f'Moraleja: {name} no pierde discusiones, las abandona antes de entender de que iban, y asi se llama a eso victoria. \U0001F480',
     ]))
     return ' '.join(bits)
 
@@ -4921,16 +4960,16 @@ async def act_bardear(ctx, t, intent):
                   + '\n\nLO ULTIMO QUE DIJO EN ESTE CHAT (lo que te esta molestando):\n'
                   + ('\n'.join(f'- {x[:150]}' for x in said) if said else '(nada reciente)')
                   + '\n\nEscribe tu bardeo en un solo parrafo.')
-        reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM, max_tokens=1800, low_effort=True, temperature=1.0) or '').strip()
+        reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM, max_tokens=2400, low_effort=True, temperature=1.0) or '').strip()
         if not bardear_reply_ok(reply):
             print(f'[Bardear] 1er intento descartado: {reply[:120]!r}')
-            reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM_SOFT, max_tokens=1200, low_effort=True, temperature=1.0) or '').strip()
+            reply = (await ask_groq(prompt, False, system=BARDEAR_SYSTEM_SOFT, max_tokens=1600, low_effort=True, temperature=1.0) or '').strip()
             if not bardear_reply_ok(reply):
                 print(f'[Bardear] 2do intento descartado: {reply[:120]!r}')
                 reply = None
     if not reply:
         reply = local_roast(t.member, profile_history, said)
-    reply = reply[:1500]
+    reply = reply[:2000]
 
     # apodo temporal (se restaura solo); si no se puede, solo se manda la respuesta
     me, member = ctx.me, t.member
@@ -5960,18 +5999,28 @@ def regex_parse_intent(ctx):
 
     # -- whitelist (primero: "saca a X de la whitelist" no es un kick)
     if re.search(r'\b(?:whitelist|lista\s*blanca)\b', norm, F):
-        m = re.search(
-            r'\b(?:a[\u00f1n]ade(?:le)?|a[\u00f1n]adir|agrega(?:r|le|lo|la)?|autoriza(?:r|lo|la)?|add|incluye|mete(?:lo|la)?|pon(?:lo|la|le)?)\b'
-            r'\s*(?P<who>.*?)\s*(?:a\s+|en\s+)?(?:la\s+)?(?:whitelist|lista\s*blanca)\b', norm, F)
-        if m:
-            ids, q, only = parse_target_phrase(m.group('who'))
-            return Intent(action='whitelist_add', source='regex', targets=ids, target_query=q, explicit=bool(ids) and only)
-        m = re.search(
-            r'\b(?:quita(?:r|le|lo|la)?|remueve(?:lo|la)?|elimina(?:r|lo|la)?|saca(?:r|lo|la)?|borra(?:r|lo|la)?)\b'
-            r'\s*(?P<who>.*?)\s*(?:de\s+|en\s+)?(?:la\s+)?(?:whitelist|lista\s*blanca)\b', norm, F)
-        if m:
-            ids, q, only = parse_target_phrase(m.group('who'))
-            return Intent(action='whitelist_remove', source='regex', targets=ids, target_query=q, explicit=bool(ids) and only)
+        # ID, @mencion o nombre, en cualquier orden: "quitale la whitelist a <ID>", "quita <ID> de la whitelist"...
+        wl_nn = normalize_for_compare(text)
+        wl_ids = list(dict.fromkeys(a or b for a, b in REF_RE.findall(text)))
+        wl_remove = re.search(
+            r'\b(?:quita\w*|kita\w*|remueve\w*|remover\w*|elimina\w*|saca\w*|borra\w*|revoca\w*|retira\w*|'
+            r'excluye\w*|fuera|ya\s+no\s+(?:esta|tiene|va|puede))\b', wl_nn, F)
+        wl_add = re.search(
+            r'\b(?:anade\w*|agrega\w*|autoriza\w*|add|incluye\w*|mete\w*|pon\w*|da(?:r|le|lo|la)?|otorga\w*|'
+            r'permite\w*|habilita\w*)\b', wl_nn, F)
+        if wl_remove or wl_add:
+            wl_action = 'whitelist_remove' if wl_remove else 'whitelist_add'
+            wl_q = None
+            if not wl_ids:
+                wl_q = re.sub(
+                    r'\b(?:jarvis|quita\w*|kita\w*|remueve\w*|remover\w*|elimina\w*|saca\w*|borra\w*|revoca\w*|'
+                    r'retira\w*|excluye\w*|anade\w*|agrega\w*|autoriza\w*|add|incluye\w*|mete\w*|pon\w*|'
+                    r'da(?:r|le|lo|la)?|otorga\w*|permite\w*|habilita\w*|fuera|ya|no|esta|tiene|va|puede|'
+                    r'la|el|los|las|de|del|a|al|en|para|por|favor|porfa|whitelist|lista|blanca|usuario|persona)\b',
+                    ' ', wl_nn, flags=F)
+                wl_q = re.sub(r'\s+', ' ', wl_q).strip() or None
+            return Intent(action=wl_action, source='regex', targets=wl_ids, target_query=wl_q,
+                          explicit=bool(wl_ids) and nwords <= 16)
         return Intent(action='whitelist_show', source='regex', explicit=True)
 
     # -- roles (separando la duracion del nombre del rol)
@@ -6529,6 +6578,38 @@ async def handle_command(message: discord.Message):
         except Exception as e:
             await message.reply(f'Error: {short_error(e)}')
         return
+
+    # WHITELIST (solo owner, sin IA): >>wl add|remove|list <@usuario o ID ...>
+    if cmd in ('whitelist', 'wl'):
+        if str(message.author.id) != OWNER_ID:
+            return await message.reply('Solo el owner puede usar este comando.')
+        sub = args[0].lower() if args else 'list'
+        if sub in ('list', 'lista', 'ver', 'show'):
+            users = [f'<@{u}> (`{u}`)' for u in sorted(JARVIS_WHITELIST)]
+            return await message.reply(embed=simple_embed('Whitelist de Jarvis', '\n'.join(users) or 'Vacia.'))
+        adding = sub in ('add', 'agregar', 'anadir', 'a\u00f1adir', '+')
+        removing = sub in ('remove', 'rm', 'del', 'delete', 'quitar', 'quita', 'borrar', 'eliminar', '-')
+        if not (adding or removing):
+            return await message.reply('Uso: `>>wl add|remove|list <@usuario o ID>`')
+        wl_ids = list(dict.fromkeys(a or b for a, b in REF_RE.findall(message.content)))
+        if not wl_ids:
+            return await message.reply('Dame al menos un ID o una mencion. Ej: `>>wl remove 123456789012345678`')
+        lines = []
+        for uid in wl_ids[:20]:
+            if adding:
+                if uid in JARVIS_WHITELIST:
+                    lines.append(f'`{uid}` ya estaba en la whitelist.')
+                else:
+                    whitelist_add(uid)
+                    lines.append(f'`{uid}` anadido a la whitelist.')
+            elif uid == str(OWNER_ID):
+                lines.append(f'`{uid}` es el owner, no se puede quitar.')
+            elif uid not in JARVIS_WHITELIST:
+                lines.append(f'`{uid}` no estaba en la whitelist.')
+            else:
+                whitelist_remove(uid)
+                lines.append(f'`{uid}` quitado de la whitelist.')
+        return await message.reply('\n'.join(lines))
 
     # PING
     if cmd == 'ping':
