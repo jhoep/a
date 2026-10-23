@@ -1128,19 +1128,22 @@ async def end_poll(client, message_id, channel):
 # ============================================================================
 # VOICE JAIL
 # ============================================================================
+VOICEJAIL_FILE = DATA_DIR / 'voice_jail.json'
 voice_jail_tracker = {}
 voice_jail_tasks = {}
+_voice_jail_resumed = False
 
 
 class VoiceJailEntry:
-    def __init__(self, user_id, guild_id, channel_id, duration_seconds, requester_id):
+    def __init__(self, user_id, guild_id, channel_id, duration_seconds, requester_id,
+                 start_time=None, end_time=None):
         self.user_id = user_id
         self.guild_id = guild_id
         self.channel_id = channel_id
-        self.duration_seconds = duration_seconds
+        self.start_time = start_time or time.time()
+        self.end_time = end_time or self.start_time + duration_seconds
+        self.duration_seconds = max(0, self.end_time - self.start_time)
         self.requester_id = requester_id
-        self.start_time = time.time()
-        self.end_time = self.start_time + duration_seconds
         self.is_active = True
         self.original_roles = []
 
@@ -1173,6 +1176,18 @@ def get_jail_entry(g_id, u_id):
 
 def add_jail_entry(e):
     voice_jail_tracker[jail_key(e.guild_id, e.user_id)] = e
+    save_voice_jail()
+
+
+def save_voice_jail():
+    entries = [
+        {
+            'userId': str(e.user_id), 'guildId': str(e.guild_id), 'channelId': str(e.channel_id),
+            'requesterId': str(e.requester_id), 'startTime': e.start_time, 'endTime': e.end_time,
+        }
+        for e in voice_jail_tracker.values() if e.is_active and not e.is_expired()
+    ]
+    save_json(VOICEJAIL_FILE, entries)
 
 
 def remove_jail_entry(g_id, u_id):
@@ -1185,19 +1200,66 @@ def remove_jail_entry(g_id, u_id):
     if t:
         t.cancel()
         voice_jail_tasks.pop(key, None)
+    save_voice_jail()
+
+
+async def resume_voice_jails():
+    global _voice_jail_resumed
+    if not _voice_jail_resumed:
+        _voice_jail_resumed = True
+        saved_entries = load_json(VOICEJAIL_FILE, [])
+        if isinstance(saved_entries, list):
+            for saved in saved_entries:
+                if not isinstance(saved, dict):
+                    continue
+                try:
+                    entry = VoiceJailEntry(
+                        int(saved['userId']), int(saved['guildId']), int(saved['channelId']), 0,
+                        int(saved.get('requesterId') or 0), float(saved['startTime']), float(saved['endTime']),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not entry.is_expired() and client.get_guild(entry.guild_id) is not None:
+                    voice_jail_tracker[jail_key(entry.guild_id, entry.user_id)] = entry
+
+    for entry in list(voice_jail_tracker.values()):
+        if entry.is_expired():
+            remove_jail_entry(entry.guild_id, entry.user_id)
+            continue
+        guild = client.get_guild(entry.guild_id)
+        if guild is None:
+            continue
+        await monitor_voice_jail(entry)
+        member = guild.get_member(entry.user_id)
+        channel = guild.get_channel(entry.channel_id)
+        if member and channel and member.voice and member.voice.channel and member.voice.channel.id != channel.id:
+            try:
+                await member.move_to(channel, reason='[VoiceJail] Reanudado al iniciar el bot')
+            except Exception as e:
+                print(f'[VoiceJail] No pude devolver a {member} al canal de confinamiento: {e}')
+    save_voice_jail()
 
 
 async def monitor_voice_jail(entry):
+    key = jail_key(entry.guild_id, entry.user_id)
+    existing_task = voice_jail_tasks.get(key)
+    if existing_task is not None and not existing_task.done():
+        return
+
     async def _watch():
         await asyncio.sleep(entry.remaining_seconds())
-        voice_jail_tasks.pop(jail_key(entry.guild_id, entry.user_id), None)
         cur = get_jail_entry(entry.guild_id, entry.user_id)
-        if not cur or not cur.is_active:
-            return
-        remove_jail_entry(entry.guild_id, entry.user_id)
+        if cur is entry and cur.is_active:
+            remove_jail_entry(entry.guild_id, entry.user_id)
 
     task = asyncio.create_task(_watch())
-    voice_jail_tasks[jail_key(entry.guild_id, entry.user_id)] = task
+    voice_jail_tasks[key] = task
+
+    def _forget_task(completed_task):
+        if voice_jail_tasks.get(key) is completed_task:
+            voice_jail_tasks.pop(key, None)
+
+    task.add_done_callback(_forget_task)
 # ============================================================================
 # CLIENT (definido aqui para que las funciones de abajo puedan referenciarlo)
 # ============================================================================
@@ -2973,6 +3035,7 @@ TARGET_ACTIONS = {
 PLAIN_ACTIONS = {
     'purge', 'slowmode', 'lock', 'unlock', 'list_roles', 'say', 'whitelist_show', 'members_count',
     'server_info', 'leave_server', 'help', 'join',
+    'blacklist_add', 'blacklist_remove', 'blacklist_show',
     'music_play', 'music_skip', 'music_stop', 'music_pause', 'music_resume', 'music_queue',
     'music_nowplaying', 'music_volume', 'music_loop', 'music_shuffle', 'music_leave',
     'create_channel', 'delete_channel', 'edit_channel', 'create_role', 'delete_role', 'edit_role',
@@ -2988,7 +3051,7 @@ CONFIRM_ACTIONS = {
     'voice_autokick', 'autodelete_on',
 }
 OWNER_ONLY_ACTIONS = {'whitelist_add', 'whitelist_remove', 'leave_server'}
-PLAIN_CONFIRM = {'leave_server', 'delete_channel', 'delete_role'}   # siempre piden confirmacion
+PLAIN_CONFIRM = {'leave_server', 'delete_channel', 'delete_role', 'blacklist_add'}   # siempre piden confirmacion
 # acciones de gestion: piden confirmacion si la IA no esta segura (confianza baja)
 MANAGE_ACTIONS = {
     'create_channel', 'delete_channel', 'edit_channel', 'create_role', 'delete_role', 'edit_role',
@@ -3007,6 +3070,8 @@ ACTION_LABELS = {
     'warns_show': 'Ver advertencias', 'warns_clear': 'Limpiar advertencias',
     'voice_autokick': 'Sacar de voz automaticamente', 'voice_autokick_off': 'Quitar regla de sacar de voz',
     'autodelete_on': 'Borrar sus mensajes automaticamente', 'autodelete_off': 'Dejar de borrar sus mensajes',
+    'blacklist_add': 'Añadir a la blacklist', 'blacklist_remove': 'Quitar de la blacklist',
+    'blacklist_show': 'Ver la blacklist',
 }
 
 REF_RE = re.compile(r'<@!?(\d{15,21})>|(?<!\d)(\d{17,20})(?!\d)')   # @mencion o ID suelto
@@ -3201,6 +3266,7 @@ ACCIONES (action) y sus campos:
 - antiraid_config: setting (joins|ventana|edad_cuenta|accion|spam|mensajes|menciones|lockdown_tiempo) + value (numero; los tiempos van en SEGUNDOS, o usa duration) y/o text (kick|ban|timeout para accion; on|off para spam)
 - antialt_on: activar el ANTI-ALT (expulsa/banea cuentas de Discord mas nuevas que X dias). value = edad minima en DIAS, text = accion opcional (kick|ban|timeout) | antialt_off | antialt_status
 - antialt_allow | antialt_disallow: target_ids (o target_query con el ID): dejar entrar a esa persona aunque su cuenta sea nueva / quitar la excepcion
+- blacklist_add | blacklist_remove: target_query (ID, mencion o tag/nombre exacto del servidor); blacklist_show: ver la lista negra. Anadir banea ahora si el usuario ya esta dentro y tambien al volver a entrar.
 - bardear: target_ids. Jarvis se DEFIENDE de alguien que lo molesta con una respuesta con humor (sin insultos) y un apodo temporal que se restaura solo. Usalo cuando el JEFE diga "bardealo", "bardea a X", "defiendete de ese"
 - music_play: query | music_skip | music_stop | music_pause | music_resume | music_queue | music_nowplaying | music_shuffle | music_leave | music_volume: value (0-200) | music_loop: mode (off|track|queue)
 - chat: el JEFE solo conversa, pregunta o bromea -> escribe en "reply"
@@ -3229,6 +3295,7 @@ REGLAS
 20. Cualquier "por X tiempo", "durante X", "X segundos/minutos", "un ratito" en role_add/role_remove significa TEMPORAL: pon duration y Jarvis lo revierte solo. Palabras de relleno como "completos", "enteros" no son parte del nombre del rol.
 21. bardear NUNCA es insultar: es defenderse con humor sano. Si el JEFE no nombra a nadie, elige a quien estuvo molestando a Jarvis o al JEFE en el HISTORIAL (o el autor del REPLY).
 22. whitelist_add / whitelist_remove: si el JEFE escribe un ID numerico (17 a 20 digitos) o una @mencion, usalo tal cual en target_ids, aunque esa persona no este en el servidor ni en el chat. "quitale la whitelist a 123456789012345678", "saca a 123456789012345678 de la whitelist" o "ya no tiene whitelist 123456789012345678" = whitelist_remove. "dale whitelist a 123456789012345678" = whitelist_add. Si dan un nombre en vez de ID, ponlo en target_query.
+23. blacklist_add / blacklist_remove / blacklist_show: el JEFE puede decir "anade a 123456789012345678 a la lista negra", "blacklist <ID o tag>", "quita <ID> de la blacklist" o "muestra la lista negra". Usa target_query para el ID, mencion o tag/nombre escrito; no confundas blacklist con whitelist.
 """
 
 
@@ -3915,7 +3982,6 @@ def resolve_channel(guild, raw, types=None, strict=True):
     raw = (raw or '').strip()
     if not raw:
         return None
-
     def ok(c):
         return types is None or isinstance(c, types)
 
@@ -4344,7 +4410,7 @@ def build_help_embed():
         inline=False,
     )
     embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que ha escrito esa persona en el servidor (un parrafo de burla con sus propios mensajes), sin insultos graves, y le pongo un apodo temporal de 30 segundos que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
-    embed.add_field(name='Whitelist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis quitale la whitelist a <ID>` / `jarvis muestra la whitelist` (anadir/quitar: solo owner)\n`>>wl add|remove|list <@user o ID>` (solo owner, sin IA)', inline=False)
+    embed.add_field(name='Whitelist / Blacklist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (solo owner)\n`/blacklist add|remove|list` o `jarvis blacklist <ID, mención o tag>` (Manage Server + Ban Members para añadir)', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
     embed.add_field(name='Backups', value='`/save` — Guardar la configuracion actual del servidor\n`/restore` — Restaurar el servidor a un backup guardado (sube el archivo .json)', inline=False)
@@ -4723,6 +4789,47 @@ async def act_rules_show(ctx, intent):
     return simple_embed('Reglas permanentes activas', '\n'.join(lines) or 'No hay reglas activas.')
 
 
+def can_manage_blacklist(user):
+    perms = user.guild_permissions
+    return str(user.id) == OWNER_ID or perms.administrator or perms.manage_guild
+    embed.add_field(name='Whitelist / Blacklist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (solo owner)\n`/blacklist <ID o tag>` / `/blacklist_remove <ID o tag>` / `/blacklist_list` o las órdenes equivalentes con Jarvis (Manage Server; añadir requiere Ban Members)', inline=False)
+
+
+async def act_blacklist_add(ctx, intent):
+    if not can_manage_blacklist(ctx.author) or (
+            str(ctx.author.id) != OWNER_ID and not ctx.author.guild_permissions.administrator
+            and not ctx.author.guild_permissions.ban_members):
+        raise JarvisError('Necesitas Manage Server y Ban Members para administrar la blacklist.')
+    if ctx.me is None or not ctx.me.guild_permissions.ban_members:
+        raise JarvisError('Me falta el permiso Ban Members para aplicar la blacklist.')
+    user_id, name, banned, error = await blacklist_add_user(ctx.guild, intent.target_query, ctx.author.id)
+    if banned:
+        text = f'**{name}** (`{user_id}`) añadido y baneado del servidor.'
+    else:
+        text = f'**{name}** (`{user_id}`) añadido. Se baneará si intenta entrar.'
+        if error:
+            text += f' No pude banearlo ahora: {error}'
+    return simple_embed('Blacklist actualizada', text, 0xe74c3c)
+
+
+async def act_blacklist_remove(ctx, intent):
+    if not can_manage_blacklist(ctx.author):
+        raise JarvisError('Necesitas el permiso Manage Server para administrar la blacklist.')
+    user_id, name = blacklist_remove_user(ctx.guild, intent.target_query)
+    return simple_embed('Blacklist actualizada', f'**{name}** (`{user_id}`) ya no está en la blacklist.', 0x2ecc71)
+
+
+async def act_blacklist_show(ctx, intent):
+    if not can_manage_blacklist(ctx.author):
+        raise JarvisError('Necesitas el permiso Manage Server para ver la blacklist.')
+    entries = blacklist_data.get(str(ctx.guild.id), {})
+    lines = [
+        f'<@{user_id}> (`{user_id}`) - {(entry.get("name") or "Usuario") if isinstance(entry, dict) else "Usuario"}'
+        for user_id, entry in sorted(entries.items())
+    ]
+    return simple_embed('Blacklist del servidor', '\n'.join(lines)[:4000] or 'La blacklist está vacía.', 0xe74c3c)
+
+
 TARGET_HANDLERS = {
     'ban': act_ban, 'kick': act_kick, 'warn': act_warn, 'timeout': act_timeout, 'untimeout': act_untimeout,
     'unban': act_unban, 'voice_disconnect': act_voice_disconnect, 'voice_move': act_voice_move,
@@ -4735,6 +4842,8 @@ PLAIN_HANDLERS = {
     'list_roles': act_list_roles, 'say': act_say, 'whitelist_show': act_whitelist_show,
     'members_count': act_members_count, 'server_info': act_server_info, 'leave_server': act_leave,
     'help': act_help, 'join': act_join,
+    'blacklist_add': act_blacklist_add, 'blacklist_remove': act_blacklist_remove,
+    'blacklist_show': act_blacklist_show,
     'create_channel': act_create_channel, 'delete_channel': act_delete_channel, 'edit_channel': act_edit_channel,
     'create_role': act_create_role, 'delete_role': act_delete_role, 'edit_role': act_edit_role,
     'edit_server': act_edit_server, 'create_invite': act_create_invite,
@@ -5014,6 +5123,10 @@ ACTION_LABELS['bardear'] = 'Bardear (defenderse con humor)'
 # ============================================================================
 ANTIRAID_FILE = DATA_DIR / 'antiraid.json'
 antiraid_data = load_json(ANTIRAID_FILE, {})     # { guildId: {config} }
+BLACKLIST_FILE = DATA_DIR / 'blacklist.json'
+blacklist_data = load_json(BLACKLIST_FILE, {})   # { guildId: { userId: {name, addedBy, addedAt} } }
+if not isinstance(blacklist_data, dict):
+    blacklist_data = {}
 
 ANTIRAID_DEFAULTS = {
     'enabled': False,
@@ -5075,6 +5188,85 @@ antiraid_flush_tasks = {}
 
 def antiraid_save():
     save_json(ANTIRAID_FILE, antiraid_data)
+
+
+def blacklist_save():
+    save_json(BLACKLIST_FILE, blacklist_data)
+
+
+def blacklist_resolve_id(guild, query):
+    raw = (query or '').strip()
+    mention = re.fullmatch(r'<@!?(\d{15,21})>', raw)
+    if mention:
+        return mention.group(1)
+    if re.fullmatch(r'\d{15,21}', raw):
+        return raw
+
+    raw = raw.lstrip('@').strip()
+    normalized = normalize_for_compare(raw)
+    matches = []
+    for member in guild.members:
+        names = {str(member).casefold(), member.name.casefold(), member.display_name.casefold()}
+        global_name = getattr(member, 'global_name', None)
+        if global_name:
+            names.add(global_name.casefold())
+        normalized_names = {normalize_for_compare(name) for name in names}
+        if raw.casefold() in names or (normalized and normalized in normalized_names):
+            matches.append(member)
+    unique = {member.id: member for member in matches}
+    if len(unique) == 1:
+        return str(next(iter(unique)))
+    if len(unique) > 1:
+        raise JarvisError(f'Hay varios usuarios que coinciden con `{query}`. Usa su ID o mención.')
+    raise JarvisError(f'No encontré `{query}`. Usa su ID, mención o tag/nombre exacto de alguien del servidor.')
+
+
+async def blacklist_add_user(guild, query, added_by):
+    user_id = blacklist_resolve_id(guild, query)
+    if int(user_id) == guild.owner_id or (client.user and int(user_id) == client.user.id):
+        raise JarvisError('No puedo añadir al dueño del servidor ni al propio bot a la blacklist.')
+    entries = blacklist_data.setdefault(str(guild.id), {})
+    if user_id in entries:
+        raise JarvisError(f'`{query}` ya está en la blacklist de este servidor.')
+
+    member = guild.get_member(int(user_id))
+    name = member.display_name if member else str(query)
+    entries[user_id] = {'name': name, 'addedBy': str(added_by), 'addedAt': time.time()}
+    blacklist_save()
+
+    if member is None:
+        return user_id, name, False, None
+    try:
+        await member.ban(reason=f'[Jarvis Blacklist] Añadido por {added_by}'[:500], delete_message_seconds=0)
+        return user_id, name, True, None
+    except Exception as e:
+        return user_id, name, False, short_error(e)
+
+
+def blacklist_remove_user(guild, query):
+    user_id = blacklist_resolve_id(guild, query)
+    entries = blacklist_data.get(str(guild.id), {})
+    if user_id not in entries:
+        raise JarvisError(f'`{query}` no está en la blacklist de este servidor.')
+    entry = entries.pop(user_id)
+    if not entries:
+        blacklist_data.pop(str(guild.id), None)
+    blacklist_save()
+    return user_id, entry.get('name') or user_id
+
+
+async def blacklist_on_member_join(member):
+    entry = blacklist_data.get(str(member.guild.id), {}).get(str(member.id))
+    if not entry or member.id == member.guild.owner_id or (client.user and member.id == client.user.id):
+        return False
+    added_by = entry.get('addedBy', 'desconocido') if isinstance(entry, dict) else 'desconocido'
+    try:
+        await member.ban(reason=f'[Jarvis Blacklist] Usuario en lista negra (añadido por {added_by})'[:500], delete_message_seconds=0)
+        print(f'[Blacklist] Baneado {member} ({member.id}) al entrar en {member.guild.id}.')
+        return True
+    except Exception as e:
+        print(f'[Blacklist] No pude banear a {member} ({member.id}): {e}')
+        return False
 
 
 def antiraid_cfg(guild_id):
@@ -5890,6 +6082,62 @@ async def ar_slash_alt_disallow(interaction: discord.Interaction, usuario: disco
 client.tree.add_command(antialt_group)
 
 
+@client.tree.command(name='blacklist', description='Añadir un ID, mención o tag a la blacklist del servidor')
+@app_commands.guild_only()
+@app_commands.describe(usuario='ID, mención o tag/nombre exacto de alguien del servidor')
+async def blacklist_slash_add(interaction: discord.Interaction, usuario: str):
+    if not can_manage_blacklist(interaction.user) or (
+            str(interaction.user.id) != OWNER_ID and not interaction.user.guild_permissions.administrator
+            and not interaction.user.guild_permissions.ban_members):
+        return await interaction.response.send_message(
+            'Necesitas Manage Server y Ban Members para añadir a la blacklist.', ephemeral=True)
+    if interaction.guild.me is None or not interaction.guild.me.guild_permissions.ban_members:
+        return await interaction.response.send_message('Me falta el permiso Ban Members.', ephemeral=True)
+    try:
+        user_id, name, banned, error = await blacklist_add_user(interaction.guild, usuario, interaction.user.id)
+    except JarvisError as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
+    if banned:
+        text = f'**{name}** (`{user_id}`) añadido y baneado del servidor.'
+    else:
+        text = f'**{name}** (`{user_id}`) añadido. Se baneará si intenta entrar.'
+        if error:
+            text += f' No pude banearlo ahora: {error}'
+    await interaction.response.send_message(embed=simple_embed('Blacklist actualizada', text, 0xe74c3c), ephemeral=True)
+
+
+@client.tree.command(name='blacklist_remove', description='Quitar un usuario de la blacklist')
+@app_commands.guild_only()
+@app_commands.describe(usuario='ID, mención o tag/nombre exacto de alguien del servidor')
+async def blacklist_slash_remove(interaction: discord.Interaction, usuario: str):
+    if not can_manage_blacklist(interaction.user):
+        return await interaction.response.send_message('Necesitas el permiso Manage Server.', ephemeral=True)
+    try:
+        user_id, name = blacklist_remove_user(interaction.guild, usuario)
+    except JarvisError as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
+    await interaction.response.send_message(
+        embed=simple_embed('Blacklist actualizada', f'**{name}** (`{user_id}`) ya no está en la blacklist.', 0x2ecc71),
+        ephemeral=True,
+    )
+
+
+@client.tree.command(name='blacklist_list', description='Ver la blacklist del servidor')
+@app_commands.guild_only()
+async def blacklist_slash_list(interaction: discord.Interaction):
+    if not can_manage_blacklist(interaction.user):
+        return await interaction.response.send_message('Necesitas el permiso Manage Server.', ephemeral=True)
+    entries = blacklist_data.get(str(interaction.guild.id), {})
+    lines = [
+        f'<@{user_id}> (`{user_id}`) - {(entry.get("name") or "Usuario") if isinstance(entry, dict) else "Usuario"}'
+        for user_id, entry in sorted(entries.items())
+    ]
+    await interaction.response.send_message(
+        embed=simple_embed('Blacklist del servidor', '\n'.join(lines)[:4000] or 'La blacklist está vacía.', 0xe74c3c),
+        ephemeral=True,
+    )
+
+
 # ------------------------------------------------------ ordenes de varios pasos --
 async def collect_intent_results(ctx, intent):
     """Ejecuta UN paso y devuelve sus resultados (embeds / textos de error) sin enviarlos."""
@@ -5970,6 +6218,46 @@ def parse_target_phrase(tgt):
     return [], (tgt or None), False
 
 
+def blacklist_regex_intent(text, nwords):
+    if not re.search(r'\b(?:blacklist|lista\s+negra)\b', normalize_for_compare(text)):
+        return None
+    if re.search(r'\b(?:muestra|mostrar|ver|listar|list|show|quienes\s+estan)\b', normalize_for_compare(text)):
+        return Intent(action='blacklist_show', source='regex', explicit=True)
+
+    normalized = normalize_for_compare(text)
+    removing = bool(re.search(r'\b(?:quita\w*|remueve\w*|elimina\w*|saca\w*|retira\w*|remove|unblacklist)\b', normalized))
+    starts_with_action = bool(re.match(
+        r'^\s*(?:agrega\w*|anade\w*|añade\w*|mete\w*|pon\w*|blacklistea\w*|quita\w*|remueve\w*|'
+        r'elimina\w*|saca\w*|retira\w*|remove|unblacklist|add|blacklist)\b', text, re.IGNORECASE,
+    ))
+    starts_with_list = bool(re.match(r'^\s*(?:blacklist|lista\s+negra)\b', text, re.IGNORECASE))
+    if not starts_with_action and not starts_with_list:
+        return None
+    ref = REF_RE.search(text)
+    target = ref.group(0) if ref else text
+    if not ref:
+        target = re.sub(
+            r'^(?:agrega\w*|anade\w*|añade\w*|mete\w*|pon\w*|blacklistea\w*|quita\w*|remueve\w*|'
+            r'elimina\w*|saca\w*|retira\w*|remove|unblacklist|add|lista\s+negra|blacklist)\s+',
+            '', target, flags=re.IGNORECASE,
+        )
+        target = re.sub(r'^(?:a|al|la)\s+', '', target, flags=re.IGNORECASE)
+        target = re.sub(r'\s+(?:(?:en|a|de)\s+)?(?:la\s+)?(?:blacklist|lista\s+negra)\s*$', '', target, flags=re.IGNORECASE)
+        target = re.sub(r'^(?:blacklist|lista\s+negra)\s+(?:add|agrega|anade|añade|remove|quita)\s+', '', target, flags=re.IGNORECASE)
+        target = re.sub(r'^(?:add|agrega|anade|añade)\s+', '', target, flags=re.IGNORECASE)
+        target = re.sub(r'^(?:blacklist|lista\s+negra)\s+', '', target, flags=re.IGNORECASE)
+    target = target.strip()
+    if not target or normalize_for_compare(target) in ('blacklist', 'lista negra'):
+        return Intent(action='blacklist_show', source='regex', explicit=True)
+    normalized_target = normalize_for_compare(target)
+    if normalized_target == normalized or re.search(r'\bblacklist\b|\blista\s+negra\b', normalized_target):
+        return None
+    return Intent(
+        action='blacklist_remove' if removing else 'blacklist_add', source='regex',
+        target_query=target, explicit=nwords <= 12,
+    )
+
+
 DURATION_RE = re.compile(
     r'(?:\b(?:por|durante)\s+)?((?:\d+(?:\.\d+)?\s*(?:segundos?|segs?|minutos?|mins?|horas?|hrs?|d[i\u00ed]as?|semanas?|[smhdw])\b\s*)+'
     r'|un\s*rat(?:o|ico)|media\s*hora|(?:un|dos|cinco|diez)\s*minutos?|una\s*hora|dos\s*horas)',
@@ -5993,6 +6281,10 @@ def regex_parse_intent(ctx):
         it = Intent(action=action, source='regex', **kw)
         it.explicit = m.start() == 0 and nwords <= 4
         return it
+
+    blacklist_intent = blacklist_regex_intent(text, nwords)
+    if blacklist_intent is not None:
+        return blacklist_intent
 
     # -- anti-raid (primero: "activa logs de anti raid" no es otra cosa)
     matched, ar_it = antiraid_regex_intent(text, nwords)
@@ -7046,6 +7338,7 @@ async def on_ready():
     antiraid_resume()
     temprole_resume()
     tempnick_resume()
+    await resume_voice_jails()
     if not giveaway_checker_loop.is_running():
         giveaway_checker_loop.start()
 
@@ -7150,9 +7443,12 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             cur = get_jail_entry(guild.id, user_id)
             if not cur or not cur.is_active or cur.is_expired():
                 return
+            current_voice = member.voice
+            if not current_voice or not current_voice.channel or current_voice.channel.id == jail_channel.id:
+                return
             await member.move_to(jail_channel, reason='[VoiceJail] Retornado al canal de confinamiento')
-        except Exception:
-            pass
+        except Exception as e:
+            print(f'[VoiceJail] No pude devolver a {member} al canal de confinamiento: {e}')
 
     asyncio.create_task(_return_to_jail())
 
@@ -7175,6 +7471,9 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 @client.event
 async def on_member_join(member: discord.Member):
+    if await blacklist_on_member_join(member):
+        return
+
     # anti-raid: si el miembro fue sancionado no hace falta el log de "Nuevo miembro"
     try:
         if await antiraid_on_member_join(member):
@@ -7480,11 +7779,15 @@ async def slash_voicejail(interaction: discord.Interaction, usuario: discord.Mem
         return await interaction.response.send_message('No puedes hacer eso.', ephemeral=True)
     guild = interaction.guild
     me = guild.me
+    if me is None or not me.guild_permissions.move_members:
+        return await interaction.response.send_message('Me falta el permiso Move Members para aplicar el voice jail.', ephemeral=True)
     if me and me.top_role <= usuario.top_role and str(interaction.user.id) != str(guild.owner_id):
         return await interaction.response.send_message('No puedes jailear a alguien con rol igual o superior.', ephemeral=True)
 
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     try:
+        if get_jail_entry(guild.id, usuario.id):
+            remove_jail_entry(guild.id, usuario.id)
         entry = VoiceJailEntry(usuario.id, guild.id, canal.id, secs, interaction.user.id)
         add_jail_entry(entry)
         await monitor_voice_jail(entry)
@@ -7500,8 +7803,9 @@ async def slash_voicejail(interaction: discord.Interaction, usuario: discord.Mem
         if usuario.voice and usuario.voice.channel:
             try:
                 await usuario.move_to(canal, reason=f'[VoiceJail] por {interaction.user}')
-            except Exception:
-                pass
+            except Exception as e:
+                remove_jail_entry(guild.id, usuario.id)
+                return await interaction.followup.send(f'No pude mover a {usuario.mention} al canal de jail: {short_error(e)}')
         else:
             embed.add_field(name='Aviso', value='El usuario no esta en voz ahora. Cuando se conecte sera movido automaticamente.')
 
