@@ -21,15 +21,7 @@ from discord import app_commands
 from discord.ext import commands, tasksimport discord
 import aiohttp
 
-class MiBot(discord.Client):
-    async def setup_hook(self):
-        self.session = aiohttp.ClientSession()
 
-    async def close(self):
-        if hasattr(self, "session") and not self.session.closed:
-            await self.session.close()
-
-        await super().close()
 
 # ============================================================================
 # CONFIG
@@ -7995,6 +7987,16 @@ async def main():
             delay = min(30 * 2 ** attempt, 900)
             print(f'[Login] Error (intento {attempt}): {err}. Reintentando en {delay}s...')
             await asyncio.sleep(delay)
+            
+class MiBot(discord.Client):
+    async def setup_hook(self):
+        self.session = aiohttp.ClientSession()
+
+    async def close(self):
+        if hasattr(self, "session") and not self.session.closed:
+            await self.session.close()
+
+        await super().close()
 
 
 if __name__ == '__main__':
