@@ -8022,11 +8022,12 @@ async def slash_save(interaction: discord.Interaction):
 
 
 # ── RESTORE ──
-@client.tree.command(name='restore', description='Restaura el servidor exactamente como estaba en un backup de /save (borra lo que sobre)')
+@client.tree.command(name='restore', description='Restaurar este servidor desde un backup (solo owner del bot)')
+@app_commands.guild_only()
 @app_commands.describe(archivo='Archivo .json generado por /save')
 async def slash_restore(interaction: discord.Interaction, archivo: discord.Attachment):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message('Necesitas permisos de **Administrador** para usar este comando.', ephemeral=True)
+    if str(interaction.user.id) != OWNER_ID:
+        return await interaction.response.send_message('Solo el owner del bot puede restaurar servidores.', ephemeral=True)
 
     if not archivo or not archivo.filename.lower().endswith('.json'):
         return await interaction.response.send_message('Debes adjuntar un archivo `.json` valido generado por `/save`.', ephemeral=True)
@@ -8046,9 +8047,6 @@ async def slash_restore(interaction: discord.Interaction, archivo: discord.Attac
 
     if not backup or not isinstance(backup.get('roles'), list) or not isinstance(backup.get('channels'), list):
         return await interaction.followup.send('El archivo no tiene un formato de backup valido (debe ser generado por `/save`).')
-    if backup.get('guildId') and str(backup['guildId']) != str(guild.id):
-        return await interaction.followup.send('Este backup pertenece a otro servidor. Por seguridad, la restauracion fue cancelada.')
-
     saved_at_ms = None
     if backup.get('savedAt'):
         try:
