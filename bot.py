@@ -839,17 +839,24 @@ _reminder_tasks = {}
 
 
 def schedule_reminder(client, entry):
-    delay = (entry['endTime'] - time.time() * 1000) / 1000
-    if delay <= 0:
-        asyncio.create_task(fire_reminder(client, entry))
+    existing_task = _reminder_tasks.get(entry['id'])
+    if existing_task is not None and not existing_task.done():
         return
 
+    delay = (entry['endTime'] - time.time() * 1000) / 1000
     async def _wait_and_fire():
-        await asyncio.sleep(delay)
+        if delay > 0:
+            await asyncio.sleep(delay)
         await fire_reminder(client, entry)
 
     task = asyncio.create_task(_wait_and_fire())
     _reminder_tasks[entry['id']] = task
+
+    def _forget_task(completed_task):
+        if _reminder_tasks.get(entry['id']) is completed_task:
+            _reminder_tasks.pop(entry['id'], None)
+
+    task.add_done_callback(_forget_task)
 
 
 async def fire_reminder(client, entry):
@@ -7978,16 +7985,19 @@ async def main():
         },
     )
 
-    attempt = 0
-    while attempt < 10:
-        try:
-            await client.start(DISCORD_TOKEN)
-            break
-        except Exception as err:
-            attempt += 1
-            delay = min(30 * 2 ** attempt, 900)
-            print(f'[Login] Error (intento {attempt}): {err}. Reintentando en {delay}s...')
-            await asyncio.sleep(delay)
+    try:
+        attempt = 0
+        while attempt < 10:
+            try:
+                await client.start(DISCORD_TOKEN)
+                break
+            except Exception as err:
+                attempt += 1
+                delay = min(30 * 2 ** attempt, 900)
+                print(f'[Login] Error (intento {attempt}): {err}. Reintentando en {delay}s...')
+                await asyncio.sleep(delay)
+    finally:
+        await client.close()
             
 class MiBot(discord.Client):
     async def setup_hook(self):
