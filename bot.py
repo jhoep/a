@@ -4410,7 +4410,7 @@ def build_help_embed():
         inline=False,
     )
     embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que ha escrito esa persona en el servidor (un parrafo de burla con sus propios mensajes), sin insultos graves, y le pongo un apodo temporal de 30 segundos que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
-    embed.add_field(name='Whitelist / Blacklist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (solo owner)\n`/blacklist add|remove|list` o `jarvis blacklist <ID, mención o tag>` (Manage Server + Ban Members para añadir)', inline=False)
+    embed.add_field(name='Whitelist / Blacklist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (solo owner)\n`/blacklist <ID o tag>` / `/blacklist_remove <ID o tag>` / `/blacklist_list` para la blacklist global del bot', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
     embed.add_field(name='Backups', value='`/save` — Guardar la configuracion actual del servidor\n`/restore` — Restaurar el servidor a un backup guardado (sube el archivo .json)', inline=False)
@@ -4792,7 +4792,6 @@ async def act_rules_show(ctx, intent):
 def can_manage_blacklist(user):
     perms = user.guild_permissions
     return str(user.id) == OWNER_ID or perms.administrator or perms.manage_guild
-    embed.add_field(name='Whitelist / Blacklist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (solo owner)\n`/blacklist <ID o tag>` / `/blacklist_remove <ID o tag>` / `/blacklist_list` o las órdenes equivalentes con Jarvis (Manage Server; añadir requiere Ban Members)', inline=False)
 
 
 async def act_blacklist_add(ctx, intent):
@@ -4802,13 +4801,11 @@ async def act_blacklist_add(ctx, intent):
         raise JarvisError('Necesitas Manage Server y Ban Members para administrar la blacklist.')
     if ctx.me is None or not ctx.me.guild_permissions.ban_members:
         raise JarvisError('Me falta el permiso Ban Members para aplicar la blacklist.')
-    user_id, name, banned, error = await blacklist_add_user(ctx.guild, intent.target_query, ctx.author.id)
-    if banned:
-        text = f'**{name}** (`{user_id}`) añadido y baneado del servidor.'
-    else:
-        text = f'**{name}** (`{user_id}`) añadido. Se baneará si intenta entrar.'
-        if error:
-            text += f' No pude banearlo ahora: {error}'
+    user_id, name, banned_count, failures = await blacklist_add_user(ctx.guild, intent.target_query, ctx.author.id)
+    text = f'**{name}** (`{user_id}`) añadido a la blacklist global y baneado en **{banned_count}** servidor(es).'
+    if failures:
+        text += '\nNo pude banearlo en: ' + '; '.join(failures[:5])
+    text += '\nSi intenta entrar más tarde, la blacklist también lo bloqueará.'
     return simple_embed('Blacklist actualizada', text, 0xe74c3c)
 
 
@@ -4822,7 +4819,7 @@ async def act_blacklist_remove(ctx, intent):
 async def act_blacklist_show(ctx, intent):
     if not can_manage_blacklist(ctx.author):
         raise JarvisError('Necesitas el permiso Manage Server para ver la blacklist.')
-    entries = blacklist_data.get(str(ctx.guild.id), {})
+    entries = blacklist_data
     lines = [
         f'<@{user_id}> (`{user_id}`) - {(entry.get("name") or "Usuario") if isinstance(entry, dict) else "Usuario"}'
         for user_id, entry in sorted(entries.items())
@@ -5124,9 +5121,18 @@ ACTION_LABELS['bardear'] = 'Bardear (defenderse con humor)'
 ANTIRAID_FILE = DATA_DIR / 'antiraid.json'
 antiraid_data = load_json(ANTIRAID_FILE, {})     # { guildId: {config} }
 BLACKLIST_FILE = DATA_DIR / 'blacklist.json'
-blacklist_data = load_json(BLACKLIST_FILE, {})   # { guildId: { userId: {name, addedBy, addedAt} } }
-if not isinstance(blacklist_data, dict):
+_blacklist_saved = load_json(BLACKLIST_FILE, {})
+if isinstance(_blacklist_saved, dict) and isinstance(_blacklist_saved.get('users'), dict):
+    blacklist_data = _blacklist_saved['users']
+else:
     blacklist_data = {}
+    if isinstance(_blacklist_saved, dict):
+        for guild_entries in _blacklist_saved.values():
+            if not isinstance(guild_entries, dict):
+                continue
+            for user_id, entry in guild_entries.items():
+                if str(user_id).isdigit():
+                    blacklist_data.setdefault(str(user_id), entry if isinstance(entry, dict) else {'name': str(entry)})
 
 ANTIRAID_DEFAULTS = {
     'enabled': False,
@@ -5191,7 +5197,7 @@ def antiraid_save():
 
 
 def blacklist_save():
-    save_json(BLACKLIST_FILE, blacklist_data)
+    save_json(BLACKLIST_FILE, {'users': blacklist_data})
 
 
 def blacklist_resolve_id(guild, query):
@@ -5204,7 +5210,7 @@ def blacklist_resolve_id(guild, query):
 
     raw = raw.lstrip('@').strip()
     normalized = normalize_for_compare(raw)
-    matches = []
+    matches = set()
     for member in guild.members:
         names = {str(member).casefold(), member.name.casefold(), member.display_name.casefold()}
         global_name = getattr(member, 'global_name', None)
@@ -5212,52 +5218,74 @@ def blacklist_resolve_id(guild, query):
             names.add(global_name.casefold())
         normalized_names = {normalize_for_compare(name) for name in names}
         if raw.casefold() in names or (normalized and normalized in normalized_names):
-            matches.append(member)
-    unique = {member.id: member for member in matches}
-    if len(unique) == 1:
-        return str(next(iter(unique)))
-    if len(unique) > 1:
+            matches.add(str(member.id))
+    for user_id, entry in blacklist_data.items():
+        if not isinstance(entry, dict):
+            continue
+        names = [entry.get(key, '') for key in ('name', 'username', 'globalName', 'tag')]
+        if any(
+                raw.casefold() == str(name).casefold()
+                or (normalized and normalized == normalize_for_compare(str(name)))
+                for name in names if name):
+            matches.add(str(user_id))
+    if len(matches) == 1:
+        return next(iter(matches))
+    if len(matches) > 1:
         raise JarvisError(f'Hay varios usuarios que coinciden con `{query}`. Usa su ID o mención.')
     raise JarvisError(f'No encontré `{query}`. Usa su ID, mención o tag/nombre exacto de alguien del servidor.')
 
 
 async def blacklist_add_user(guild, query, added_by):
     user_id = blacklist_resolve_id(guild, query)
-    if int(user_id) == guild.owner_id or (client.user and int(user_id) == client.user.id):
-        raise JarvisError('No puedo añadir al dueño del servidor ni al propio bot a la blacklist.')
-    entries = blacklist_data.setdefault(str(guild.id), {})
-    if user_id in entries:
-        raise JarvisError(f'`{query}` ya está en la blacklist de este servidor.')
+    if user_id == str(OWNER_ID) or (client.user and int(user_id) == client.user.id):
+        raise JarvisError('No puedo añadir al owner del bot ni al propio bot a la blacklist.')
+    if user_id in blacklist_data:
+        raise JarvisError(f'`{query}` ya está en la blacklist global del bot.')
 
     member = guild.get_member(int(user_id))
     name = member.display_name if member else str(query)
-    entries[user_id] = {'name': name, 'addedBy': str(added_by), 'addedAt': time.time()}
+    blacklist_data[user_id] = {
+        'name': name,
+        'username': member.name if member else str(query),
+        'globalName': getattr(member, 'global_name', None) if member else None,
+        'tag': str(member) if member else str(query),
+        'addedBy': str(added_by),
+        'addedAt': time.time(),
+    }
     blacklist_save()
 
-    if member is None:
-        return user_id, name, False, None
-    try:
-        await member.ban(reason=f'[Jarvis Blacklist] Añadido por {added_by}'[:500], delete_message_seconds=0)
-        return user_id, name, True, None
-    except Exception as e:
-        return user_id, name, False, short_error(e)
+    banned_count, failures = 0, []
+    for target_guild in client.guilds:
+        if target_guild.owner_id == int(user_id):
+            continue
+        try:
+            user_object = discord.Object(id=int(user_id))
+            try:
+                await target_guild.fetch_ban(user_object)
+                banned_count += 1
+                continue
+            except discord.NotFound:
+                pass
+            await target_guild.ban(user_object, reason=f'[Jarvis Blacklist] Añadido globalmente por {added_by}'[:500],
+                                   delete_message_seconds=0)
+            banned_count += 1
+        except Exception as e:
+            failures.append(f'{target_guild.name}: {short_error(e)}')
+    return user_id, name, banned_count, failures
 
 
 def blacklist_remove_user(guild, query):
     user_id = blacklist_resolve_id(guild, query)
-    entries = blacklist_data.get(str(guild.id), {})
-    if user_id not in entries:
-        raise JarvisError(f'`{query}` no está en la blacklist de este servidor.')
-    entry = entries.pop(user_id)
-    if not entries:
-        blacklist_data.pop(str(guild.id), None)
+    entry = blacklist_data.pop(user_id, None)
+    if entry is None:
+        raise JarvisError(f'`{query}` no está en la blacklist global del bot.')
     blacklist_save()
-    return user_id, entry.get('name') or user_id
+    return user_id, (entry.get('name') or user_id) if isinstance(entry, dict) else user_id
 
 
 async def blacklist_on_member_join(member):
-    entry = blacklist_data.get(str(member.guild.id), {}).get(str(member.id))
-    if not entry or member.id == member.guild.owner_id or (client.user and member.id == client.user.id):
+    entry = blacklist_data.get(str(member.id))
+    if not entry or str(member.id) == str(OWNER_ID) or member.id == member.guild.owner_id or (client.user and member.id == client.user.id):
         return False
     added_by = entry.get('addedBy', 'desconocido') if isinstance(entry, dict) else 'desconocido'
     try:
@@ -5267,6 +5295,14 @@ async def blacklist_on_member_join(member):
     except Exception as e:
         print(f'[Blacklist] No pude banear a {member} ({member.id}): {e}')
         return False
+
+
+async def blacklist_enforce_guild(guild):
+    banned_count = 0
+    for member in list(guild.members):
+        if str(member.id) in blacklist_data and await blacklist_on_member_join(member):
+            banned_count += 1
+    return banned_count
 
 
 def antiraid_cfg(guild_id):
@@ -6082,7 +6118,7 @@ async def ar_slash_alt_disallow(interaction: discord.Interaction, usuario: disco
 client.tree.add_command(antialt_group)
 
 
-@client.tree.command(name='blacklist', description='Añadir un ID, mención o tag a la blacklist del servidor')
+@client.tree.command(name='blacklist', description='Añadir un ID, mención o tag a la blacklist global del bot')
 @app_commands.guild_only()
 @app_commands.describe(usuario='ID, mención o tag/nombre exacto de alguien del servidor')
 async def blacklist_slash_add(interaction: discord.Interaction, usuario: str):
@@ -6094,15 +6130,13 @@ async def blacklist_slash_add(interaction: discord.Interaction, usuario: str):
     if interaction.guild.me is None or not interaction.guild.me.guild_permissions.ban_members:
         return await interaction.response.send_message('Me falta el permiso Ban Members.', ephemeral=True)
     try:
-        user_id, name, banned, error = await blacklist_add_user(interaction.guild, usuario, interaction.user.id)
+        user_id, name, banned_count, failures = await blacklist_add_user(interaction.guild, usuario, interaction.user.id)
     except JarvisError as e:
         return await interaction.response.send_message(str(e), ephemeral=True)
-    if banned:
-        text = f'**{name}** (`{user_id}`) añadido y baneado del servidor.'
-    else:
-        text = f'**{name}** (`{user_id}`) añadido. Se baneará si intenta entrar.'
-        if error:
-            text += f' No pude banearlo ahora: {error}'
+    text = f'**{name}** (`{user_id}`) añadido a la blacklist global y baneado en **{banned_count}** servidor(es).'
+    if failures:
+        text += '\nNo pude banearlo en: ' + '; '.join(failures[:5])
+    text += '\nSi intenta entrar más tarde, la blacklist también lo bloqueará.'
     await interaction.response.send_message(embed=simple_embed('Blacklist actualizada', text, 0xe74c3c), ephemeral=True)
 
 
@@ -6122,18 +6156,18 @@ async def blacklist_slash_remove(interaction: discord.Interaction, usuario: str)
     )
 
 
-@client.tree.command(name='blacklist_list', description='Ver la blacklist del servidor')
+@client.tree.command(name='blacklist_list', description='Ver la blacklist global del bot')
 @app_commands.guild_only()
 async def blacklist_slash_list(interaction: discord.Interaction):
     if not can_manage_blacklist(interaction.user):
         return await interaction.response.send_message('Necesitas el permiso Manage Server.', ephemeral=True)
-    entries = blacklist_data.get(str(interaction.guild.id), {})
+    entries = blacklist_data
     lines = [
         f'<@{user_id}> (`{user_id}`) - {(entry.get("name") or "Usuario") if isinstance(entry, dict) else "Usuario"}'
         for user_id, entry in sorted(entries.items())
     ]
     await interaction.response.send_message(
-        embed=simple_embed('Blacklist del servidor', '\n'.join(lines)[:4000] or 'La blacklist está vacía.', 0xe74c3c),
+        embed=simple_embed('Blacklist global del bot', '\n'.join(lines)[:4000] or 'La blacklist está vacía.', 0xe74c3c),
         ephemeral=True,
     )
 
@@ -7324,6 +7358,7 @@ async def on_ready():
     print(f'Bot listo: {client.user}')
     print(f'Conectado a {len(client.guilds)} servidores')
     await whitelist_boot_sync()
+    await blacklist_enforce_all_guilds()
     print(f'Jarvis whitelist: {", ".join(JARVIS_WHITELIST)}')
     print(f'Jarvis cerebro: IA={"ON" if GROQ_API_KEY else "OFF (solo patrones)"} | modelo={JARVIS_INTENT_MODEL} | '
           f'contexto={JARVIS_CONTEXT_MESSAGES} msgs | confirmar_deducidos={"SI" if JARVIS_CONFIRM_INFERRED else "NO"}')
@@ -7341,6 +7376,15 @@ async def on_ready():
     await resume_voice_jails()
     if not giveaway_checker_loop.is_running():
         giveaway_checker_loop.start()
+
+
+@client.event
+async def on_guild_join(guild: discord.Guild):
+    try:
+        await guild.chunk()
+    except Exception as e:
+        print(f'[Blacklist] No pude cargar miembros de {guild.name}: {e}')
+    await blacklist_enforce_guild(guild)
 
 
 @tasks.loop(seconds=30)
