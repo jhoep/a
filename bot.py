@@ -7928,6 +7928,8 @@ jarvis_roblox.install(sys.modules[__name__])
 import jarvis_suplantar
 jarvis_suplantar.install(sys.modules[__name__])
 
+import jarvis_gestion
+jarvis_gestion.install(sys.modules[__name__])
 # ============================================================================
 # KEEPALIVE
 # ============================================================================
