@@ -6,6 +6,7 @@ import time
 import random
 import webserver
 import asyncio
+import io
 import shutil
 import functools
 import unicodedata
@@ -54,7 +55,7 @@ JARVIS_MAX_CHAIN        = 8       # maximo de pasos encadenados en una sola orde
 # PERSISTENCE
 # ============================================================================
 BASE_DIR       = Path(__file__).resolve().parent
-DATA_DIR       = BASE_DIR / 'data'
+DATA_DIR       = Path(os.environ.get('JARVIS_DATA_DIR') or (BASE_DIR / 'data'))
 XP_FILE        = DATA_DIR / 'xp.json'
 GW_FILE        = DATA_DIR / 'giveaways.json'
 REMIND_FILE    = DATA_DIR / 'reminders.json'
@@ -105,6 +106,10 @@ del_watch_data = load_json(DELWATCH_FILE, {})     # { guildId: [userId, ...] }
 _wl_saved = load_json(WHITELIST_FILE, {})
 if not isinstance(_wl_saved, dict):
     _wl_saved = {}
+try:
+    _wl_updated = float(_wl_saved.get('updated') or 0)
+except (TypeError, ValueError):
+    _wl_updated = 0.0
 JARVIS_WHITELIST = (
     (_WL_ENV | {str(x) for x in _wl_saved.get('added', [])})
     - {str(x) for x in _wl_saved.get('removed', [])}
@@ -112,11 +117,18 @@ JARVIS_WHITELIST = (
 JARVIS_WHITELIST.add(str(OWNER_ID))   # el owner siempre esta dentro
 
 
-def _save_whitelist():
-    save_json(WHITELIST_FILE, {
+def _wl_payload():
+    return {
         'added': sorted(JARVIS_WHITELIST - _WL_ENV),
         'removed': sorted(_WL_ENV - JARVIS_WHITELIST),
-    })
+        'updated': _wl_updated,
+    }
+
+
+def _save_whitelist():
+    global _wl_updated
+    _wl_updated = time.time()
+    save_json(WHITELIST_FILE, _wl_payload())
     # respaldo en Discord (el disco de muchos hosts se borra al reiniciar)
     try:
         asyncio.get_running_loop()
@@ -139,12 +151,21 @@ def whitelist_remove(user_id):
     return True
 
 
-# ---- respaldo de la whitelist en Discord (sobrevive aunque el host borre la carpeta data/) ----
-# Se guarda en un mensaje del bot en tu DM (o en el canal de la variable JARVIS_STORAGE_CHANNEL).
+# ---- almacenamiento en Discord (sobrevive aunque el host borre la carpeta data/) ----
+# Se guarda como ARCHIVO ADJUNTO en un mensaje del bot en tu DM (o en el canal de la variable
+# JARVIS_STORAGE_CHANNEL). Sin limite de tamano. Lo usan la whitelist y la blacklist.
 WL_STORE_MARKER = '[JARVIS_WHITELIST_BACKUP]'
 WL_STORE_CHANNEL = (os.environ.get('JARVIS_STORAGE_CHANNEL') or '').strip()
-_wl_lock = None
+_store_lock_obj = None
+_store_warned = set()
 _wl_boot_done = False
+
+
+def _store_lock():
+    global _store_lock_obj
+    if _store_lock_obj is None:
+        _store_lock_obj = asyncio.Lock()
+    return _store_lock_obj
 
 
 async def _wl_store_channel():
@@ -156,70 +177,117 @@ async def _wl_store_channel():
         owner = await client.fetch_user(int(OWNER_ID))
         return owner.dm_channel or await owner.create_dm()
     except Exception as e:
-        print(f'[Whitelist] No pude abrir el canal de respaldo: {e}')
+        if 'chan' not in _store_warned:
+            _store_warned.add('chan')
+            print(f'[Store] No pude abrir el canal de respaldo: {e}\n'
+                  f'[Store] Abre tus DMs al bot o define JARVIS_STORAGE_CHANNEL con el ID de un canal privado.')
         return None
 
 
-def _wl_message_content():
-    payload = {'added': sorted(JARVIS_WHITELIST - _WL_ENV), 'removed': sorted(_WL_ENV - JARVIS_WHITELIST)}
-    return f'{WL_STORE_MARKER}\n```json\n{json.dumps(payload)}\n```'
-
-
-async def _wl_find_message(ch):
-    async for m in ch.history(limit=100):
-        if m.author.id == client.user.id and (m.content or '').startswith(WL_STORE_MARKER):
+async def _store_find(ch, marker):
+    async for m in ch.history(limit=200):
+        if m.author.id == client.user.id and (m.content or '').startswith(marker):
             return m
     return None
 
 
-async def whitelist_push_to_discord():
-    global _wl_lock
-    if _wl_lock is None:
-        _wl_lock = asyncio.Lock()
-    async with _wl_lock:
-        ch = await _wl_store_channel()
-        if ch is None:
-            return
-        content = _wl_message_content()
-        if len(content) > 1990:
-            print('[Whitelist] Demasiados usuarios para respaldar en un solo mensaje.')
-            return
+async def store_read(marker):
+    """Devuelve (dict | None, canal_ok)."""
+    ch = await _wl_store_channel()
+    if ch is None:
+        return None, False
+    try:
+        msg = await _store_find(ch, marker)
+    except Exception as e:
+        print(f'[Store] No pude leer el historial del canal de respaldo: {e}')
+        return None, False
+    if msg is None:
+        return None, True
+    data = None
+    if msg.attachments:
         try:
-            old = await _wl_find_message(ch)
-            if old is None:
-                await ch.send(content)
-            elif old.content != content:
-                await old.edit(content=content)
+            data = json.loads((await msg.attachments[0].read()).decode('utf-8'))
         except Exception as e:
-            print(f'[Whitelist] No pude guardar el respaldo en Discord: {e}')
+            print(f'[Store] No pude leer el adjunto del respaldo: {e}')
+    if data is None:   # formato antiguo: JSON dentro del texto del mensaje
+        content = msg.content or ''
+        a, b = content.find('{'), content.rfind('}')
+        if a != -1 and b > a:
+            try:
+                data = json.loads(content[a:b + 1])
+            except Exception:
+                data = None
+    return (data if isinstance(data, dict) else None), True
+
+
+async def store_write(marker, filename, payload_fn, tries=3):
+    """Guarda el estado actual (payload_fn() se evalua justo al escribir) con reintentos."""
+    text = f'{marker}\nRespaldo automatico de Jarvis (no borres este mensaje).'
+    for attempt in range(tries):
+        async with _store_lock():
+            ch = await _wl_store_channel()
+            if ch is not None:
+                try:
+                    raw = json.dumps(payload_fn(), ensure_ascii=False, indent=1).encode('utf-8')
+                    old = await _store_find(ch, marker)
+                    if old is None:
+                        await ch.send(content=text, file=discord.File(io.BytesIO(raw), filename=filename))
+                    else:
+                        try:
+                            await old.edit(content=text, attachments=[discord.File(io.BytesIO(raw), filename=filename)])
+                        except Exception:
+                            await old.delete()
+                            await ch.send(content=text, file=discord.File(io.BytesIO(raw), filename=filename))
+                    return True
+                except Exception as e:
+                    print(f'[Store] Intento {attempt + 1}/{tries} fallo al guardar {filename}: {e}')
+        if attempt < tries - 1:
+            await asyncio.sleep(3 * (attempt + 1))
+    return False
+
+
+async def whitelist_push_to_discord():
+    ok = await store_write(WL_STORE_MARKER, 'whitelist.json', _wl_payload)
+    if not ok:
+        print('[Whitelist] ATENCION: no pude guardar el respaldo en Discord. Si el host borra el disco, se perderan los cambios.')
+    return ok
 
 
 async def whitelist_boot_sync():
-    """Al arrancar: si no hay data/whitelist.json (host que borra el disco) la recupera de Discord."""
-    global _wl_boot_done
+    """Al arrancar: gana SIEMPRE la version mas nueva (archivo local o respaldo de Discord)."""
+    global _wl_boot_done, _wl_updated
     if _wl_boot_done:
         return
     _wl_boot_done = True
-    if WHITELIST_FILE.exists():
-        await whitelist_push_to_discord()          # deja el respaldo igual que el archivo local
+    data, channel_ok = await store_read(WL_STORE_MARKER)
+    if not channel_ok:
+        print('[Whitelist] Sin canal de respaldo: solo se usa el archivo local.')
         return
-    ch = await _wl_store_channel()
-    if ch is None:
+    if data is None:
+        await whitelist_push_to_discord()
         return
     try:
-        msg = await _wl_find_message(ch)
-        if msg is None:
-            return
-        a, b = msg.content.find('{'), msg.content.rfind('}')
-        data = json.loads(msg.content[a:b + 1])
-        JARVIS_WHITELIST.update(str(x) for x in data.get('added', []))
-        JARVIS_WHITELIST.difference_update(str(x) for x in data.get('removed', []))
-        JARVIS_WHITELIST.add(str(OWNER_ID))
-        save_json(WHITELIST_FILE, {'added': sorted(JARVIS_WHITELIST - _WL_ENV), 'removed': sorted(_WL_ENV - JARVIS_WHITELIST)})
-        print(f'[Whitelist] Recuperada desde Discord: {len(JARVIS_WHITELIST)} usuario(s).')
-    except Exception as e:
-        print(f'[Whitelist] No pude recuperar el respaldo: {e}')
+        remote_ts = float(data.get('updated') or 0)
+    except (TypeError, ValueError):
+        remote_ts = 0.0
+    r_added = {str(x) for x in (data.get('added') or [])}
+    r_removed = {str(x) for x in (data.get('removed') or [])}
 
+    if remote_ts > _wl_updated or not WHITELIST_FILE.exists():
+        # el respaldo de Discord es mas nuevo (o el host borro el disco) -> se aplica
+        JARVIS_WHITELIST.clear()
+        JARVIS_WHITELIST.update((_WL_ENV | r_added) - r_removed)
+        JARVIS_WHITELIST.add(str(OWNER_ID))
+        _wl_updated = remote_ts
+        save_json(WHITELIST_FILE, _wl_payload())
+        print(f'[Whitelist] Recuperada desde Discord: {len(JARVIS_WHITELIST)} usuario(s).')
+        return
+    if remote_ts == _wl_updated == 0:
+        # ambos con formato antiguo (sin fecha): se mezclan para no perder a nadie
+        JARVIS_WHITELIST.update(r_added - r_removed)
+        _save_whitelist()
+        return
+    await whitelist_push_to_discord()   # lo local es mas nuevo
 
 
 # ============================================================================
@@ -4844,10 +4912,11 @@ async def act_blacklist_add(ctx, intent):
     if ctx.me is None or not ctx.me.guild_permissions.ban_members:
         raise JarvisError('Me falta el permiso Ban Members para aplicar la blacklist.')
     user_id, name, banned_count, failures = await blacklist_add_user(ctx.guild, intent.target_query, ctx.author.id)
-    text = f'**{name}** (`{user_id}`) añadido a la blacklist global y baneado en **{banned_count}** servidor(es).'
+    text = (f'**{name}** (`{user_id}`) añadido a la blacklist global.\n'
+            f'Baneado ahora en **{banned_count}** servidor(es) donde estaba.')
     if failures:
         text += '\nNo pude banearlo en: ' + '; '.join(failures[:5])
-    text += '\nSi intenta entrar más tarde, la blacklist también lo bloqueará.'
+    text += '\nEn los demás servidores lo baneo automáticamente en cuanto entre.'
     return simple_embed('Blacklist actualizada', text, 0xe74c3c)
 
 
@@ -5241,8 +5310,23 @@ def antiraid_save():
     save_json(ANTIRAID_FILE, antiraid_data)
 
 
+try:
+    _blacklist_updated = float(_blacklist_saved.get('updated') or 0) if isinstance(_blacklist_saved, dict) else 0.0
+except (TypeError, ValueError):
+    _blacklist_updated = 0.0
+
+BLACKLIST_STORE_MARKER = '[JARVIS_BLACKLIST_BACKUP]'
+_blacklist_boot_done = False
+
+
+def _blacklist_payload():
+    return {'users': blacklist_data, 'updated': _blacklist_updated}
+
+
 def blacklist_save():
-    save_json(BLACKLIST_FILE, {'users': blacklist_data})
+    global _blacklist_updated
+    _blacklist_updated = time.time()
+    save_json(BLACKLIST_FILE, _blacklist_payload())
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -5250,76 +5334,47 @@ def blacklist_save():
     spawn(blacklist_push_to_discord())
 
 
-BLACKLIST_STORE_MARKER = '[JARVIS_BLACKLIST_BACKUP]'
-_blacklist_lock = None
-_blacklist_boot_done = False
-
-
-def _blacklist_message_content():
-    payload = {'users': blacklist_data}
-    return f'{BLACKLIST_STORE_MARKER}\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```'
-
-
-async def _blacklist_find_message(channel):
-    async for message in channel.history(limit=100):
-        if message.author.id == client.user.id and (message.content or '').startswith(BLACKLIST_STORE_MARKER):
-            return message
-    return None
-
-
 async def blacklist_push_to_discord():
-    global _blacklist_lock
-    if _blacklist_lock is None:
-        _blacklist_lock = asyncio.Lock()
-    async with _blacklist_lock:
-        channel = await _wl_store_channel()
-        if channel is None:
-            return
-        content = _blacklist_message_content()
-        if len(content) > 1990:
-            print('[Blacklist] Demasiados usuarios para respaldar en un solo mensaje de Discord.')
-            return
-        try:
-            old_message = await _blacklist_find_message(channel)
-            if old_message is None:
-                await channel.send(content)
-            elif old_message.content != content:
-                await old_message.edit(content=content)
-        except Exception as e:
-            print(f'[Blacklist] No pude guardar el respaldo en Discord: {e}')
+    ok = await store_write(BLACKLIST_STORE_MARKER, 'blacklist.json', _blacklist_payload)
+    if not ok:
+        print('[Blacklist] ATENCION: no pude guardar el respaldo en Discord.')
+    return ok
 
 
 async def blacklist_boot_sync():
-    global _blacklist_boot_done
+    """Al arrancar: gana SIEMPRE la version mas nueva (archivo local o respaldo de Discord)."""
+    global _blacklist_boot_done, _blacklist_updated
     if _blacklist_boot_done:
         return
     _blacklist_boot_done = True
-    channel = await _wl_store_channel()
-    if channel is None:
+    data, channel_ok = await store_read(BLACKLIST_STORE_MARKER)
+    if not channel_ok:
+        print('[Blacklist] Sin canal de respaldo: solo se usa el archivo local.')
         return
+    saved = data.get('users') if data else None
+    if not isinstance(saved, dict):
+        await blacklist_push_to_discord()
+        return
+    remote = {str(k): (v if isinstance(v, dict) else {'name': str(v)})
+              for k, v in saved.items() if str(k).isdigit()}
     try:
-        message = await _blacklist_find_message(channel)
-        if message is None:
-            await blacklist_push_to_discord()
-            return
-        start = message.content.find('{')
-        end = message.content.rfind('}')
-        if start == -1 or end <= start:
-            raise ValueError('El respaldo no contiene un objeto JSON válido.')
-        payload = json.loads(message.content[start:end + 1])
-        saved_users = payload.get('users') if isinstance(payload, dict) else None
-        if not isinstance(saved_users, dict):
-            raise ValueError('El respaldo no contiene una lista de usuarios válida.')
-        recovered = {}
-        for user_id, entry in saved_users.items():
-            if str(user_id).isdigit():
-                recovered[str(user_id)] = entry if isinstance(entry, dict) else {'name': str(entry)}
+        remote_ts = float(data.get('updated') or 0)
+    except (TypeError, ValueError):
+        remote_ts = 0.0
+
+    if remote_ts > _blacklist_updated or not BLACKLIST_FILE.exists():
         blacklist_data.clear()
-        blacklist_data.update(recovered)
-        save_json(BLACKLIST_FILE, {'users': blacklist_data})
+        blacklist_data.update(remote)
+        _blacklist_updated = remote_ts
+        save_json(BLACKLIST_FILE, _blacklist_payload())
         print(f'[Blacklist] Recuperada desde Discord: {len(blacklist_data)} usuario(s).')
-    except Exception as e:
-        print(f'[Blacklist] No pude recuperar el respaldo: {e}')
+        return
+    if remote_ts == _blacklist_updated == 0:
+        for k, v in remote.items():     # formato antiguo en ambos lados: se mezclan
+            blacklist_data.setdefault(k, v)
+        blacklist_save()
+        return
+    await blacklist_push_to_discord()   # lo local es mas nuevo
 
 
 def blacklist_resolve_id(guild, query):
@@ -5359,12 +5414,13 @@ def blacklist_resolve_id(guild, query):
 
 async def blacklist_add_user(guild, query, added_by):
     user_id = blacklist_resolve_id(guild, query)
-    if user_id == str(OWNER_ID) or (client.user and int(user_id) == client.user.id):
+    uid = int(user_id)
+    if user_id == str(OWNER_ID) or (client.user and uid == client.user.id):
         raise JarvisError('No puedo añadir al owner del bot ni al propio bot a la blacklist.')
     if user_id in blacklist_data:
         raise JarvisError(f'`{query}` ya está en la blacklist global del bot.')
 
-    member = guild.get_member(int(user_id))
+    member = guild.get_member(uid)
     name = member.display_name if member else str(query)
     blacklist_data[user_id] = {
         'name': name,
@@ -5376,20 +5432,23 @@ async def blacklist_add_user(guild, query, added_by):
     }
     blacklist_save()
 
+    # Solo se banea en los servidores donde la persona ESTA ahora mismo.
+    # En los demas no se hace nada: si entra despues, blacklist_on_member_join la banea al instante.
     banned_count, failures = 0, []
     for target_guild in client.guilds:
-        if target_guild.owner_id == int(user_id):
+        if target_guild.owner_id == uid:
+            continue
+        present = target_guild.get_member(uid)
+        if present is None:
+            try:
+                present = await target_guild.fetch_member(uid)
+            except Exception:       # NotFound = no esta en ese servidor
+                present = None
+        if present is None:
             continue
         try:
-            user_object = discord.Object(id=int(user_id))
-            try:
-                await target_guild.fetch_ban(user_object)
-                banned_count += 1
-                continue
-            except discord.NotFound:
-                pass
-            await target_guild.ban(user_object, reason=f'[Jarvis Blacklist] Añadido globalmente por {added_by}'[:500],
-                                   delete_message_seconds=0)
+            await present.ban(reason=f'[Jarvis Blacklist] Añadido globalmente por {added_by}'[:500],
+                              delete_message_seconds=0)
             banned_count += 1
         except Exception as e:
             failures.append(f'{target_guild.name}: {short_error(e)}')
@@ -6262,10 +6321,11 @@ async def blacklist_slash_add(interaction: discord.Interaction, usuario: str):
         user_id, name, banned_count, failures = await blacklist_add_user(interaction.guild, usuario, interaction.user.id)
     except JarvisError as e:
         return await interaction.response.send_message(str(e), ephemeral=True)
-    text = f'**{name}** (`{user_id}`) añadido a la blacklist global y baneado en **{banned_count}** servidor(es).'
+    text = (f'**{name}** (`{user_id}`) añadido a la blacklist global.\n'
+            f'Baneado ahora en **{banned_count}** servidor(es) donde estaba.')
     if failures:
         text += '\nNo pude banearlo en: ' + '; '.join(failures[:5])
-    text += '\nSi intenta entrar más tarde, la blacklist también lo bloqueará.'
+    text += '\nEn los demás servidores lo baneo automáticamente en cuanto entre.'
     await interaction.response.send_message(embed=simple_embed('Blacklist actualizada', text, 0xe74c3c), ephemeral=True)
 
 
@@ -7052,6 +7112,13 @@ async def handle_command(message: discord.Message):
         if sub in ('list', 'lista', 'ver', 'show'):
             users = [f'<@{u}> (`{u}`)' for u in sorted(JARVIS_WHITELIST)]
             return await message.reply(embed=simple_embed('Whitelist de Jarvis', '\n'.join(users) or 'Vacia.'))
+        if sub in ('backup', 'sync', 'respaldo', 'estado'):
+            ok = await whitelist_push_to_discord()
+            await blacklist_push_to_discord()
+            return await message.reply(
+                'Respaldo de whitelist y blacklist guardado en Discord.' if ok else
+                'No pude guardar el respaldo. Abre tus DMs al bot o define `JARVIS_STORAGE_CHANNEL` con el ID de un canal privado.'
+            )
         adding = sub in ('add', 'agregar', 'anadir', 'a\u00f1adir', '+')
         removing = sub in ('remove', 'rm', 'del', 'delete', 'quitar', 'quita', 'borrar', 'eliminar', '-')
         if not (adding or removing):
