@@ -361,9 +361,26 @@ async def save_server_config(guild: discord.Guild):
             'mentionable': r.mentionable,
             'position': r.position,
             'permissions': str(r.permissions.value),
+            'managed': r.managed,
         }
         for r in sorted(guild.roles, key=lambda r: -r.position)
         if r.name != '@everyone'
+    ]
+
+    bots = [
+        {
+            'id': str(member.id),
+            'name': str(member),
+            'displayName': member.display_name,
+            'permissions': str(member.guild_permissions.value),
+            'roleIds': [str(role.id) for role in member.roles if role.name != '@everyone'],
+            'inviteURL': (
+                f'https://discord.com/oauth2/authorize?client_id={member.id}'
+                '&scope=bot%20applications.commands'
+            ),
+        }
+        for member in guild.members
+        if member.bot
     ]
 
     channels = []
@@ -400,8 +417,11 @@ async def save_server_config(guild: discord.Guild):
         'verificationLevel': str(guild.verification_level),
         'afkChannelId': str(guild.afk_channel.id) if guild.afk_channel else None,
         'afkTimeout': guild.afk_timeout,
+        'everyonePermissions': str(guild.default_role.permissions.value),
         'roles': roles,
         'channels': channels,
+        'bots': bots,
+        'botInventoryComplete': guild.chunked,
     }
 
     file_path = BACKUP_DIR / f'{guild.id}.json'
@@ -418,10 +438,21 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
     report = {
         'rolesCreated': 0, 'rolesUpdated': 0, 'rolesDeleted': 0, 'rolesSkipped': 0,
         'channelsCreated': 0, 'channelsUpdated': 0, 'channelsDeleted': 0,
+        'everyoneUpdated': False,
         'errors': [],
     }
 
     my_top_pos = me.top_role.position
+
+    if backup.get('everyonePermissions') is not None:
+        try:
+            await guild.default_role.edit(
+                permissions=discord.Permissions(int(backup['everyonePermissions'])),
+                reason='[Restore] Permisos de @everyone sincronizados con el backup',
+            )
+            report['everyoneUpdated'] = True
+        except Exception as e:
+            report['errors'].append(f'Permisos de @everyone: {e}')
 
     # ---------------------------------------------------------------- ROLES --
     role_id_map = {}  # backupRoleId(str) -> discord.Role
@@ -431,7 +462,7 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
     # 1) match por ID exacto
     for br in backup['roles']:
         existing = guild.get_role(int(br['id']))
-        if existing and not existing.managed and existing.name != '@everyone':
+        if existing and existing.name != '@everyone':
             role_id_map[br['id']] = existing
             used_current_role_ids.add(existing.id)
 
@@ -449,6 +480,12 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
     for br in backup['roles']:
         role = role_id_map.get(br['id'])
         try:
+            if role and role.managed:
+                report['rolesSkipped'] += 1
+                continue
+            if not role and br.get('managed'):
+                report['rolesSkipped'] += 1
+                continue
             colour = discord.Colour(int(br['color'].lstrip('#'), 16)) if isinstance(br['color'], str) and br['color'].startswith('#') else discord.Colour.default()
             perms = discord.Permissions(int(br['permissions']))
             if role:
@@ -489,7 +526,9 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
     # 5) reordenar posiciones segun el backup
     try:
         ordered_roles = [role_id_map[br['id']] for br in backup['roles']
-                         if br['id'] in role_id_map and role_id_map[br['id']].position < my_top_pos]
+                         if br['id'] in role_id_map
+                         and not role_id_map[br['id']].managed
+                         and role_id_map[br['id']].position < my_top_pos]
         if len(ordered_roles) > 1:
             positions = {r: max(1, my_top_pos - 1 - idx) for idx, r in enumerate(ordered_roles)}
             await guild.edit_role_positions(positions=positions)
@@ -526,10 +565,10 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
                 mapped = role_id_map.get(o['id'])
                 if mapped:
                     target = mapped
-                else:
+                elif int(o['id']) == guild.id:
                     target = guild.get_role(int(o['id']))
             else:  # member
-                target = guild.get_member(int(o['id']))
+                target = guild.get_member(int(o['id'])) or discord.Object(id=int(o['id']))
             if not target:
                 continue
             ow = discord.PermissionOverwrite.from_pair(
@@ -8057,6 +8096,9 @@ async def slash_save(interaction: discord.Interaction):
             f'Se guardo una copia de la configuracion de **{interaction.guild.name}**.\n\n'
             f'**Roles guardados:** {len(backup["roles"])}\n'
             f'**Canales guardados:** {len(backup["channels"])}\n'
+            f'**Bots encontrados:** {len(backup["bots"])}'
+            + ('' if backup['botInventoryComplete'] else ' (lista posiblemente incompleta)')
+            + '\nLos bots no se pueden invitar automaticamente; el backup incluye enlaces para agregarlos manualmente.\n'
             f'**Fecha:** <t:{int(time.time())}:f>',
             0x2ecc71,
         )
@@ -8121,6 +8163,22 @@ async def slash_restore(interaction: discord.Interaction, archivo: discord.Attac
             value=f'Creados: **{report["channelsCreated"]}**\nActualizados: **{report["channelsUpdated"]}**\nBorrados: **{report["channelsDeleted"]}**',
             inline=True,
         )
+        if backup.get('everyonePermissions') is not None:
+            embed.add_field(
+                name='Permisos de @everyone',
+                value='Restaurados' if report['everyoneUpdated'] else 'No se pudieron restaurar',
+                inline=True,
+            )
+        saved_bots = backup.get('bots', [])
+        if saved_bots:
+            embed.add_field(
+                name='Bots del backup',
+                value=(
+                    f'{len(saved_bots)} bot(s) guardados en la lista del backup. '
+                    'Discord requiere autorizacion manual para volver a agregarlos.'
+                )[:1024],
+                inline=False,
+            )
         if report['errors']:
             embed.add_field(name=f'Errores ({len(report["errors"])})', value='\n'.join(report['errors'][:10])[:1024])
         await interaction.edit_original_response(content='', embed=embed)
