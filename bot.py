@@ -1383,8 +1383,11 @@ def format_duration(secs):
     return f'{s}s'
 
 
-def simple_embed(title, description, color=0x3498db):
-    embed = discord.Embed(title=title, description=description or '\u200b', color=color)
+def simple_embed(title, description=None, color=0x3498db):
+    text = description
+    if text is None or str(text).strip() == '':
+        text = 'Sin contenido.'
+    embed = discord.Embed(title=str(title) if title is not None else '', description=str(text), color=color)
     embed.timestamp = datetime.now(timezone.utc)
     return embed
 
@@ -5240,6 +5243,83 @@ def antiraid_save():
 
 def blacklist_save():
     save_json(BLACKLIST_FILE, {'users': blacklist_data})
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    spawn(blacklist_push_to_discord())
+
+
+BLACKLIST_STORE_MARKER = '[JARVIS_BLACKLIST_BACKUP]'
+_blacklist_lock = None
+_blacklist_boot_done = False
+
+
+def _blacklist_message_content():
+    payload = {'users': blacklist_data}
+    return f'{BLACKLIST_STORE_MARKER}\n```json\n{json.dumps(payload, ensure_ascii=False)}\n```'
+
+
+async def _blacklist_find_message(channel):
+    async for message in channel.history(limit=100):
+        if message.author.id == client.user.id and (message.content or '').startswith(BLACKLIST_STORE_MARKER):
+            return message
+    return None
+
+
+async def blacklist_push_to_discord():
+    global _blacklist_lock
+    if _blacklist_lock is None:
+        _blacklist_lock = asyncio.Lock()
+    async with _blacklist_lock:
+        channel = await _wl_store_channel()
+        if channel is None:
+            return
+        content = _blacklist_message_content()
+        if len(content) > 1990:
+            print('[Blacklist] Demasiados usuarios para respaldar en un solo mensaje de Discord.')
+            return
+        try:
+            old_message = await _blacklist_find_message(channel)
+            if old_message is None:
+                await channel.send(content)
+            elif old_message.content != content:
+                await old_message.edit(content=content)
+        except Exception as e:
+            print(f'[Blacklist] No pude guardar el respaldo en Discord: {e}')
+
+
+async def blacklist_boot_sync():
+    global _blacklist_boot_done
+    if _blacklist_boot_done:
+        return
+    _blacklist_boot_done = True
+    channel = await _wl_store_channel()
+    if channel is None:
+        return
+    try:
+        message = await _blacklist_find_message(channel)
+        if message is None:
+            await blacklist_push_to_discord()
+            return
+        start = message.content.find('{')
+        end = message.content.rfind('}')
+        if start == -1 or end <= start:
+            raise ValueError('El respaldo no contiene un objeto JSON válido.')
+        payload = json.loads(message.content[start:end + 1])
+        saved_users = payload.get('users') if isinstance(payload, dict) else None
+        if not isinstance(saved_users, dict):
+            raise ValueError('El respaldo no contiene una lista de usuarios válida.')
+        recovered = {}
+        for user_id, entry in saved_users.items():
+            if str(user_id).isdigit():
+                recovered[str(user_id)] = entry if isinstance(entry, dict) else {'name': str(entry)}
+        blacklist_data.clear()
+        blacklist_data.update(recovered)
+        save_json(BLACKLIST_FILE, {'users': blacklist_data})
+        print(f'[Blacklist] Recuperada desde Discord: {len(blacklist_data)} usuario(s).')
+    except Exception as e:
+        print(f'[Blacklist] No pude recuperar el respaldo: {e}')
 
 
 def blacklist_resolve_id(guild, query):
@@ -7407,6 +7487,7 @@ async def on_ready():
     print(f'Bot listo: {client.user}')
     print(f'Conectado a {len(client.guilds)} servidores')
     await whitelist_boot_sync()
+    await blacklist_boot_sync()
     await blacklist_enforce_all_guilds()
     print(f'Jarvis whitelist: {", ".join(JARVIS_WHITELIST)}')
     print(f'Jarvis cerebro: IA={"ON" if GROQ_API_KEY else "OFF (solo patrones)"} | modelo={JARVIS_INTENT_MODEL} | '
