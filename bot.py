@@ -5161,11 +5161,14 @@ ANTIRAID_FILE = DATA_DIR / 'antiraid.json'
 antiraid_data = load_json(ANTIRAID_FILE, {})     # { guildId: {config} }
 BLACKLIST_FILE = DATA_DIR / 'blacklist.json'
 _blacklist_saved = load_json(BLACKLIST_FILE, {})
-if isinstance(_blacklist_saved, dict) and isinstance(_blacklist_saved.get('users'), dict):
-    blacklist_data = _blacklist_saved['users']
-else:
-    blacklist_data = {}
-    if isinstance(_blacklist_saved, dict):
+blacklist_data = {}
+if isinstance(_blacklist_saved, dict):
+    raw_users = _blacklist_saved.get('users') if isinstance(_blacklist_saved.get('users'), dict) else _blacklist_saved
+    if isinstance(raw_users, dict):
+        for user_id, entry in raw_users.items():
+            if str(user_id).isdigit():
+                blacklist_data[str(user_id)] = entry if isinstance(entry, dict) else {'name': str(entry)}
+    else:
         for guild_entries in _blacklist_saved.values():
             if not isinstance(guild_entries, dict):
                 continue
@@ -5342,6 +5345,13 @@ async def blacklist_enforce_guild(guild):
         if str(member.id) in blacklist_data and await blacklist_on_member_join(member):
             banned_count += 1
     return banned_count
+
+
+async def blacklist_enforce_all_guilds():
+    total = 0
+    for guild in list(client.guilds):
+        total += await blacklist_enforce_guild(guild)
+    return total
 
 
 def antiraid_cfg(guild_id):
