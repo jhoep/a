@@ -453,7 +453,7 @@ async def _adminstrip_wait(guild_id, user_id):
             return
         delay = entry['until'] - time.time()
         if delay > 0:
-            await asyncio.sleep(delay + 1)
+            await asyncio.sleep(min(delay + 1, 86400))
             continue
         # segun mi registro ya termino; compruebo que de verdad no siga con timeout
         guild = client.get_guild(int(guild_id))
@@ -483,10 +483,121 @@ def adminstrip_resume():
         adminstrip_schedule(e['guildId'], e['userId'])
 
 
+# ============================================================================
+# SILENCIOS LARGOS (mas de 28 dias: el bot renueva el timeout de Discord solo)
+# ============================================================================
+LONGMUTE_FILE = DATA_DIR / 'long_mutes.json'
+longmute_data = load_json(LONGMUTE_FILE, [])   # [{guildId, userId, until}]
+if not isinstance(longmute_data, list):
+    longmute_data = []
+DISCORD_MAX_TIMEOUT = 28 * 86400 - 3600        # Discord admite 28 dias como maximo; dejo 1h de margen
+LONGMUTE_RENEW_BELOW = 14 * 86400              # renovar cuando a Discord le queden menos de 14 dias
+MAX_MUTE_SECS = 9999 * 365 * 86400             # tope: 9999 anos
+FOREVER_SECS = 100 * 365 * 86400               # desde aqui se muestra como "permanente"
+_longmute_started = False
+
+
+def parse_long_duration(text):
+    """Como parse_natural_duration pero acepta meses, anos y 'permanente' (devuelve segundos o None)."""
+    t = normalize_for_compare(text or '')
+    if not t:
+        return None
+    if re.search(r'\b(?:permanente\w*|perma|para\s+siempre|siempre|indefinid\w*|infinit\w*|forever|eternamente)\b', t):
+        return MAX_MUTE_SECS
+    total = 0
+
+    def grab(pattern, mult):
+        nonlocal t, total
+        for m in re.finditer(pattern, t):
+            total += int(m.group(1)) * mult
+        t = re.sub(pattern, ' ', t)
+
+    grab(r'(\d+)\s*(?:anos?|years?|yrs?|y)\b', 365 * 86400)
+    grab(r'(\d+)\s*(?:meses|mes|months?)\b', 30 * 86400)
+    rest = t.strip()
+    if rest:
+        extra = parse_natural_duration(rest)
+        if extra:
+            total += extra
+        elif not total:
+            return None
+    return min(total, MAX_MUTE_SECS) if total else None
+
+
+def _save_longmutes():
+    save_json(LONGMUTE_FILE, longmute_data)
+
+
+def longmute_find(guild_id, user_id):
+    gid, uid = str(guild_id), str(user_id)
+    return next((e for e in longmute_data if e['guildId'] == gid and e['userId'] == uid), None)
+
+
+def longmute_add(guild_id, user_id, until):
+    e = longmute_find(guild_id, user_id)
+    if e is None:
+        e = {'guildId': str(guild_id), 'userId': str(user_id), 'until': until}
+        longmute_data.append(e)
+    e['until'] = until
+    _save_longmutes()
+
+
+def longmute_remove(guild_id, user_id):
+    e = longmute_find(guild_id, user_id)
+    if e is None:
+        return False
+    longmute_data.remove(e)
+    _save_longmutes()
+    return True
+
+
+async def longmute_check():
+    """Renueva los timeouts largos a los que Discord les queda poco, y borra los que ya terminaron."""
+    now = time.time()
+    for e in list(longmute_data):
+        if e['until'] <= now:
+            if e in longmute_data:
+                longmute_data.remove(e)
+                _save_longmutes()
+            continue
+        guild = client.get_guild(int(e['guildId']))
+        member = guild.get_member(int(e['userId'])) if guild else None
+        if member is None:
+            continue                      # no esta en el servidor: se renueva cuando vuelva
+        tu = member.timed_out_until
+        left = (tu.timestamp() - now) if tu else 0
+        if left >= LONGMUTE_RENEW_BELOW:
+            continue
+        try:
+            await timeout_member(member, e['until'] - now, '[Jarvis] Renovando silencio largo')
+        except Exception as ex:
+            print(f'[LongMute] No pude renovar a {member}: {ex}')
+
+
+async def _longmute_loop():
+    await asyncio.sleep(20)               # dejar que el bot termine de cargar
+    while True:
+        try:
+            await longmute_check()
+        except Exception as e:
+            print(f'[LongMute] {e}')
+        await asyncio.sleep(1800)
+
+
+def longmute_resume():
+    global _longmute_started
+    if _longmute_started:
+        return
+    _longmute_started = True
+    spawn(_longmute_loop())
+
+
 async def timeout_member(member, secs, reason):
-    """Silencia a un miembro. Si es admin, le quita temporalmente los roles con Administrator
-    y se los devuelve al terminar el timeout (o al quitarselo). Devuelve la lista de roles quitados."""
+    """Silencia a un miembro por el tiempo que sea (mas de 28 dias = el bot lo renueva solo).
+    Si es admin, le quita temporalmente los roles con Administrator y se los devuelve al terminar el
+    silencio (o al quitarselo). Devuelve la lista de roles quitados."""
     guild, me = member.guild, member.guild.me
+    secs = max(1, min(int(secs), MAX_MUTE_SECS))
     stripped = []
     if member.guild_permissions.administrator:
         if member.id == guild.owner_id:
@@ -514,14 +625,20 @@ async def timeout_member(member, secs, reason):
         entry['until'] = until
         _save_adminstrip()          # se guarda ANTES de quitar los roles: si el bot cae, no se pierden
 
+    first = min(secs, DISCORD_MAX_TIMEOUT)      # Discord: maximo ~28 dias por timeout
     try:
         if stripped:
             await member.remove_roles(*stripped, reason='[Jarvis] Timeout: rol de admin quitado temporalmente')
-        await member.timeout(timedelta(seconds=secs), reason=reason)
+        await member.timeout(timedelta(seconds=first), reason=reason)
     except Exception:
         if stripped:
             await adminstrip_restore(guild.id, member.id, 'Fallo el timeout')
         raise
+
+    if secs > DISCORD_MAX_TIMEOUT:
+        longmute_add(guild.id, member.id, until)   # el bot lo renueva solo hasta 'until'
+    else:
+        longmute_remove(guild.id, member.id)       # un silencio corto reemplaza a uno largo anterior
 
     entry = adminstrip_find(guild.id, member.id)
     if entry:                       # (tambien cubre ampliar un timeout a alguien que ya estaba sin roles)
@@ -3549,6 +3666,7 @@ REGLAS
 21. bardear NUNCA es insultar: es defenderse con humor sano. Si el JEFE no nombra a nadie, elige a quien estuvo molestando a Jarvis o al JEFE en el HISTORIAL (o el autor del REPLY).
 22. whitelist_add / whitelist_remove: si el JEFE escribe un ID numerico (17 a 20 digitos) o una @mencion, usalo tal cual en target_ids, aunque esa persona no este en el servidor ni en el chat. "quitale la whitelist a 123456789012345678", "saca a 123456789012345678 de la whitelist" o "ya no tiene whitelist 123456789012345678" = whitelist_remove. "dale whitelist a 123456789012345678" = whitelist_add. Si dan un nombre en vez de ID, ponlo en target_query.
 23. blacklist_add / blacklist_remove / blacklist_show: el JEFE puede decir "anade a 123456789012345678 a la lista negra", "blacklist <ID o tag>", "quita <ID> de la blacklist" o "muestra la lista negra". Usa target_query para el ID, mencion o tag/nombre escrito; no confundas blacklist con whitelist.
+24. timeout: acepta cualquier duracion, incluso meses o años ("30 dias", "6 meses", "9999 años"). Si dicen "permanente", "para siempre" o "hasta que lo quite", usa duration="9999 años". Jarvis renueva el silencio solo cuando se acaba el maximo de Discord (28 dias).
 """
 
 
@@ -4143,21 +4261,30 @@ async def act_timeout(ctx, t, intent):
     guard_sanction(ctx, t, 'silenciar', need_member=True)
     guild, author = ctx.guild, ctx.author
     dur_txt = intent.duration or '10m'
-    secs = parse_natural_duration(dur_txt)
-    if not secs or secs > 2419200:
-        raise JarvisError(f"No entendi la duracion: `{dur_txt}`. Usa: 10m, 1h, 'un rato' (maximo 28 dias).")
+    secs = parse_long_duration(dur_txt)
+    if not secs:
+        raise JarvisError(f"No entendi la duracion: `{dur_txt}`. Usa: 10m, 1h, 30 dias, 6 meses, 9999 años o 'permanente'.")
     reason = intent.reason or 'Orden de Jarvis'
-    until = datetime.now(timezone.utc) + timedelta(seconds=secs)
+    end_ts = int(time.time() + secs)
+    forever = secs >= FOREVER_SECS
     try:
-        await t.member.send(f'Has sido silenciado en **{guild.name}** por {dur_txt}. Expira: <t:{int(until.timestamp())}:R>')
+        await t.member.send(
+            f'Has sido silenciado en **{guild.name}** por {dur_txt}. '
+            + ('No tiene fecha de fin.' if forever else f'Expira: <t:{end_ts}:R>'))
     except Exception:
         pass
     stripped = await timeout_member(t.member, secs, f'[Jarvis] {reason} (por {author})'[:500])
     record_mod_action(guild.id, 'timeout', t.id, t.name, reason, author.id)
     embed = simple_embed('Silenciado', f'**{t.name}** ha sido silenciado.', 0xe67e22)
     embed.add_field(name='Duracion', value=dur_txt, inline=True)
-    embed.add_field(name='Expira', value=f'<t:{int(until.timestamp())}:R>', inline=True)
+    embed.add_field(name='Expira', value='Nunca (hasta que lo quites)' if forever else f'<t:{end_ts}:R>', inline=True)
     embed.add_field(name='Razon', value=reason[:1000], inline=False)
+    if secs > DISCORD_MAX_TIMEOUT:
+        embed.add_field(
+            name='Silencio largo',
+            value='Discord solo permite 28 dias por timeout, asi que lo renuevo automaticamente '
+                  'hasta que termine o lo quites.',
+            inline=False)
     if stripped:
         embed.add_field(
             name='Era administrador',
@@ -4178,6 +4305,7 @@ async def act_untimeout(ctx, t, intent):
         raise JarvisError(f'{t.member} no tiene un timeout activo.')
     if timed_out:
         await t.member.timeout(None, reason=f'[Jarvis] Removido por {ctx.author}')
+    longmute_remove(ctx.guild.id, t.id)
     restored = await adminstrip_restore(ctx.guild.id, t.id, 'Timeout quitado') if had_roles else None
     record_mod_action(ctx.guild.id, 'untimeout', t.id, t.name, '', ctx.author.id)
     desc = f'Se quito el timeout a **{t.member}**.'
@@ -6638,8 +6766,8 @@ def blacklist_regex_intent(text, nwords):
 
 
 DURATION_RE = re.compile(
-    r'(?:\b(?:por|durante)\s+)?((?:\d+(?:\.\d+)?\s*(?:segundos?|segs?|minutos?|mins?|horas?|hrs?|d[i\u00ed]as?|semanas?|[smhdw])\b\s*)+'
-    r'|un\s*rat(?:o|ico)|media\s*hora|(?:un|dos|cinco|diez)\s*minutos?|una\s*hora|dos\s*horas)',
+    r'(?:\b(?:por|durante)\s+)?((?:\d+(?:\.\d+)?\s*(?:segundos?|segs?|minutos?|mins?|horas?|hrs?|d[i\u00ed]as?|semanas?|meses|mes|a[ñn]os?|years?|[smhdw])\b\s*)+'
+    r'|permanente|para\s*siempre|un\s*rat(?:o|ico)|media\s*hora|(?:un|dos|cinco|diez)\s*minutos?|una\s*hora|dos\s*horas)',
     re.IGNORECASE,
 )
 
@@ -7387,7 +7515,7 @@ async def handle_command(message: discord.Message):
         if not target:
             return await message.reply('Menciona al usuario.')
         dur_str = args[1] if len(args) > 1 else '10m'
-        secs = parse_duration(dur_str)
+        secs = parse_long_duration(dur_str)
         if not secs:
             return await message.reply('Formato invalido (ej: 10m, 2h, 1d).')
         reason = ' '.join(args[2:]) or 'Sin razon'
@@ -7410,6 +7538,7 @@ async def handle_command(message: discord.Message):
         if not target:
             return await message.reply('Menciona al usuario.')
         try:
+            longmute_remove(guild.id, target.id)
             had_roles = adminstrip_find(guild.id, target.id) is not None
             if target.is_timed_out():
                 await target.timeout(None)
@@ -7734,6 +7863,7 @@ async def on_ready():
     antiraid_resume()
     temprole_resume()
     adminstrip_resume()
+    longmute_resume()
     tempnick_resume()
     await resume_voice_jails()
     if not giveaway_checker_loop.is_running():
@@ -7863,6 +7993,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 async def on_member_update(before: discord.Member, after: discord.Member):
     # le quitaron el timeout a mano desde Discord -> devolver el rol de administrador
     if before.timed_out_until is not None and after.timed_out_until is None:
+        longmute_remove(after.guild.id, after.id)
         if adminstrip_find(after.guild.id, after.id):
             spawn(adminstrip_restore(after.guild.id, after.id, 'Timeout quitado'))
 
