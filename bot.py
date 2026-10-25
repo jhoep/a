@@ -389,6 +389,149 @@ def temprole_resume():
 
 
 # ============================================================================
+# TIMEOUT A ADMINISTRADORES (quita los roles con Administrator y los devuelve solo)
+# ============================================================================
+ADMINSTRIP_FILE = DATA_DIR / 'timeout_admin_roles.json'
+adminstrip_data = load_json(ADMINSTRIP_FILE, [])   # [{guildId, userId, roleIds: [str], until}]
+if not isinstance(adminstrip_data, list):
+    adminstrip_data = []
+_adminstrip_tasks = {}
+_adminstrip_resumed = False
+
+
+def _save_adminstrip():
+    save_json(ADMINSTRIP_FILE, adminstrip_data)
+
+
+def adminstrip_find(guild_id, user_id):
+    gid, uid = str(guild_id), str(user_id)
+    return next((e for e in adminstrip_data if e['guildId'] == gid and e['userId'] == uid), None)
+
+
+async def adminstrip_restore(guild_id, user_id, why='Fin del timeout'):
+    """Devuelve los roles de admin guardados. Es seguro llamarla varias veces (la 2da no hace nada)."""
+    entry = adminstrip_find(guild_id, user_id)
+    if entry is None:
+        return None
+    adminstrip_data.remove(entry)          # se saca ANTES de cualquier await: evita doble restauracion
+    _save_adminstrip()
+    key = (str(guild_id), str(user_id))
+    task = _adminstrip_tasks.pop(key, None)
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+
+    guild = client.get_guild(int(guild_id))
+    if guild is None:
+        return []
+    try:
+        member = guild.get_member(int(user_id)) or await guild.fetch_member(int(user_id))
+    except Exception as e:
+        print(f'[AdminStrip] {user_id} ya no esta en el servidor, no se le pueden devolver los roles: {e}')
+        return []
+
+    me = guild.me
+    roles = []
+    for rid in entry['roleIds']:
+        role = guild.get_role(int(rid))
+        if role and role not in member.roles and (me is None or role < me.top_role):
+            roles.append(role)
+    if roles:
+        try:
+            await member.add_roles(*roles, reason=f'[Jarvis] {why}: devolviendo rol de administrador')
+        except Exception as e:
+            print(f'[AdminStrip] No pude devolver los roles a {member}: {e}')
+            adminstrip_data.append(entry)   # se conserva para reintentar al reiniciar
+            _save_adminstrip()
+            return []
+    return roles
+
+
+async def _adminstrip_wait(guild_id, user_id):
+    while True:
+        entry = adminstrip_find(guild_id, user_id)
+        if entry is None:
+            return
+        delay = entry['until'] - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay + 1)
+            continue
+        # segun mi registro ya termino; compruebo que de verdad no siga con timeout
+        guild = client.get_guild(int(guild_id))
+        member = guild.get_member(int(user_id)) if guild else None
+        if member is not None and member.timed_out_until is not None and member.is_timed_out():
+            entry['until'] = member.timed_out_until.timestamp()
+            _save_adminstrip()
+            continue
+        break
+    await adminstrip_restore(guild_id, user_id, 'Fin del timeout')
+
+
+def adminstrip_schedule(guild_id, user_id):
+    key = (str(guild_id), str(user_id))
+    old = _adminstrip_tasks.pop(key, None)
+    if old is not None and not old.done():
+        old.cancel()
+    _adminstrip_tasks[key] = spawn(_adminstrip_wait(*key))
+
+
+def adminstrip_resume():
+    global _adminstrip_resumed
+    if _adminstrip_resumed:
+        return
+    _adminstrip_resumed = True
+    for e in list(adminstrip_data):
+        adminstrip_schedule(e['guildId'], e['userId'])
+
+
+async def timeout_member(member, secs, reason):
+    """Silencia a un miembro. Si es admin, le quita temporalmente los roles con Administrator
+    y se los devuelve al terminar el timeout (o al quitarselo). Devuelve la lista de roles quitados."""
+    guild, me = member.guild, member.guild.me
+    stripped = []
+    if member.guild_permissions.administrator:
+        if member.id == guild.owner_id:
+            raise JarvisError('Discord no permite silenciar al dueno del servidor.')
+        if guild.default_role.permissions.administrator:
+            raise JarvisError('El rol @everyone tiene Administrator, no puedo quitarselo a una sola persona.')
+        stripped = [r for r in member.roles if not r.is_default() and r.permissions.administrator]
+        if not me.guild_permissions.manage_roles:
+            raise JarvisError('Me falta el permiso **Manage Roles** para quitarle el rol de administrador.')
+        for r in stripped:
+            if r.managed:
+                raise JarvisError(f'El rol **{r.name}** es de un bot/integracion y no se puede quitar manualmente.')
+            if r >= me.top_role:
+                raise JarvisError(f'El rol **{r.name}** (Administrator) esta por encima del mio, no puedo quitarselo.')
+
+    until = time.time() + secs
+    if stripped:
+        entry = adminstrip_find(guild.id, member.id)
+        if entry is None:
+            entry = {'guildId': str(guild.id), 'userId': str(member.id), 'roleIds': [], 'until': until}
+            adminstrip_data.append(entry)
+        for r in stripped:
+            if str(r.id) not in entry['roleIds']:
+                entry['roleIds'].append(str(r.id))
+        entry['until'] = until
+        _save_adminstrip()          # se guarda ANTES de quitar los roles: si el bot cae, no se pierden
+
+    try:
+        if stripped:
+            await member.remove_roles(*stripped, reason='[Jarvis] Timeout: rol de admin quitado temporalmente')
+        await member.timeout(timedelta(seconds=secs), reason=reason)
+    except Exception:
+        if stripped:
+            await adminstrip_restore(guild.id, member.id, 'Fallo el timeout')
+        raise
+
+    entry = adminstrip_find(guild.id, member.id)
+    if entry:                       # (tambien cubre ampliar un timeout a alguien que ya estaba sin roles)
+        entry['until'] = until
+        _save_adminstrip()
+        adminstrip_schedule(guild.id, member.id)
+    return stripped
+
+
+# ============================================================================
 # AUTO-DELETE WATCH (borrar mensajes de una persona automaticamente)
 # ============================================================================
 def get_delwatch_arr(guild_id):
@@ -4009,12 +4152,18 @@ async def act_timeout(ctx, t, intent):
         await t.member.send(f'Has sido silenciado en **{guild.name}** por {dur_txt}. Expira: <t:{int(until.timestamp())}:R>')
     except Exception:
         pass
-    await t.member.timeout(timedelta(seconds=secs), reason=f'[Jarvis] {reason} (por {author})'[:500])
+    stripped = await timeout_member(t.member, secs, f'[Jarvis] {reason} (por {author})'[:500])
     record_mod_action(guild.id, 'timeout', t.id, t.name, reason, author.id)
     embed = simple_embed('Silenciado', f'**{t.name}** ha sido silenciado.', 0xe67e22)
     embed.add_field(name='Duracion', value=dur_txt, inline=True)
     embed.add_field(name='Expira', value=f'<t:{int(until.timestamp())}:R>', inline=True)
     embed.add_field(name='Razon', value=reason[:1000], inline=False)
+    if stripped:
+        embed.add_field(
+            name='Era administrador',
+            value=f'Le quite temporalmente: {", ".join(r.name for r in stripped)}.\n'
+                  f'Se lo devuelvo cuando termine el timeout o si se lo quitas antes.',
+            inline=False)
     embed.set_footer(text=f'Ordenado por {author}')
     await send_mod_log(client, guild.id, mod_log_embed('TIMEOUT', t.member, author, reason, 0xf39c12, {'Duracion': dur_txt}))
     return embed
@@ -4023,11 +4172,18 @@ async def act_timeout(ctx, t, intent):
 async def act_untimeout(ctx, t, intent):
     if t.member is None:
         raise JarvisError(f'{t.name} ya no esta en el servidor.')
-    if not t.member.is_timed_out():
+    had_roles = adminstrip_find(ctx.guild.id, t.id) is not None
+    timed_out = t.member.is_timed_out()
+    if not timed_out and not had_roles:
         raise JarvisError(f'{t.member} no tiene un timeout activo.')
-    await t.member.timeout(None, reason=f'[Jarvis] Removido por {ctx.author}')
+    if timed_out:
+        await t.member.timeout(None, reason=f'[Jarvis] Removido por {ctx.author}')
+    restored = await adminstrip_restore(ctx.guild.id, t.id, 'Timeout quitado') if had_roles else None
     record_mod_action(ctx.guild.id, 'untimeout', t.id, t.name, '', ctx.author.id)
-    return simple_embed('Timeout Removido', f'Se quito el timeout a **{t.member}**.', 0x2ecc71)
+    desc = f'Se quito el timeout a **{t.member}**.'
+    if had_roles:
+        desc += '\nLe devolvi el rol de administrador' + (f' ({", ".join(r.name for r in restored)}).' if restored else '.')
+    return simple_embed('Timeout Removido', desc, 0x2ecc71)
 
 
 async def act_unban(ctx, t, intent):
@@ -7236,8 +7392,12 @@ async def handle_command(message: discord.Message):
             return await message.reply('Formato invalido (ej: 10m, 2h, 1d).')
         reason = ' '.join(args[2:]) or 'Sin razon'
         try:
-            await target.timeout(timedelta(seconds=secs), reason=reason)
-            await message.reply(f'**{target}** silenciado por {dur_str}. Razon: {reason}')
+            stripped = await timeout_member(target, secs, reason)
+            extra = (f'\nEra admin: le quite **{", ".join(r.name for r in stripped)}** y se lo devuelvo al terminar.'
+                     if stripped else '')
+            await message.reply(f'**{target}** silenciado por {dur_str}. Razon: {reason}{extra}')
+        except JarvisError as e:
+            await message.reply(str(e))
         except Exception as e:
             await message.reply(f'No pude silenciar: {e}')
         return
@@ -7250,8 +7410,12 @@ async def handle_command(message: discord.Message):
         if not target:
             return await message.reply('Menciona al usuario.')
         try:
-            await target.timeout(None)
-            await message.reply(f'Silencio removido de **{target}**.')
+            had_roles = adminstrip_find(guild.id, target.id) is not None
+            if target.is_timed_out():
+                await target.timeout(None)
+            if had_roles:
+                await adminstrip_restore(guild.id, target.id, 'Timeout quitado')
+            await message.reply(f'Silencio removido de **{target}**.' + (' Rol de administrador devuelto.' if had_roles else ''))
         except Exception as e:
             await message.reply(f'Error: {e}')
         return
@@ -7569,6 +7733,7 @@ async def on_ready():
     load_reminders(client)
     antiraid_resume()
     temprole_resume()
+    adminstrip_resume()
     tempnick_resume()
     await resume_voice_jails()
     if not giveaway_checker_loop.is_running():
@@ -7696,6 +7861,11 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
+    # le quitaron el timeout a mano desde Discord -> devolver el rol de administrador
+    if before.timed_out_until is not None and after.timed_out_until is None:
+        if adminstrip_find(after.guild.id, after.id):
+            spawn(adminstrip_restore(after.guild.id, after.id, 'Timeout quitado'))
+
     if before.premium_since == after.premium_since:
         return
     canal = after.guild.get_channel(int(CANAL_AVISOS_ID))
