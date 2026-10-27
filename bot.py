@@ -9267,6 +9267,9 @@ jarvis_suplantar.install(sys.modules[__name__])
 
 import jarvis_gestion
 jarvis_gestion.install(sys.modules[__name__])
+
+import jarvis_tts
+jarvis_tts.install(sys.modules{__name__})
 # ============================================================================
 # KEEPALIVE
 # ============================================================================
