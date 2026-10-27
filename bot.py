@@ -8796,7 +8796,15 @@ afk_data = load_json(AFKVOICE_FILE, {})   # { guildId: {'channel': id, 'anti': b
 if not isinstance(afk_data, dict):
     afk_data = {}
 AFK_CHANNEL_TYPES = (discord.VoiceChannel, discord.StageChannel)
+
+AFK_RETRY_DELAYS = (0, 0.4, 0.8, 1.5, 2, 3, 5)   # reintentos rapidos al principio
+AFK_RETRY_FOREVER = 5                             # despues, cada 5s mientras el anti-disconnect siga activo
+AFK_NOPERM_DELAY = 30                             # si me falta permiso de Connect
+AFK_WATCHDOG_SECS = 5                             # vigilante de respaldo
+AFK_CONNECT_TIMEOUT = 10.0
+
 _afk_busy = set()
+_afk_again = set()        # se volvio a necesitar una reconexion mientras ya estaba reconectando
 _afk_ready_done = False
 
 
@@ -8820,7 +8828,7 @@ def afk_status_embed(guild, title='Anti-Disconnect'):
     anti = bool(e.get('anti'))
     emb = simple_embed(
         title,
-        'Si alguien me saca o me mueve del canal de voz, vuelvo solo.' if anti
+        'Si alguien me saca o me mueve del canal de voz, vuelvo solo al instante.' if anti
         else 'Apagado: si me sacan del canal, no vuelvo. Activalo con `/anti_disconnect` o `jarvis activa el anti disconnect`.',
         0x2ecc71 if anti else 0x95a5a6)
     emb.add_field(name='Canal AFK', value=ch.mention if ch else 'Canal eliminado', inline=True)
@@ -8829,6 +8837,43 @@ def afk_status_embed(guild, title='Anti-Disconnect'):
         emb.add_field(name='Puesto por', value=f'<@{e["by"]}>', inline=True)
     emb.set_footer(text='Para quitarme del canal: jarvis desconectate (o /leave). Eso tambien cancela el modo AFK.')
     return emb
+
+
+# ------------------------------------------------------------ conexion rapida a voz --
+async def _afk_join(guild, channel):
+    """Entra (o se mueve) a `channel` lo mas rapido posible. Limpia clientes de voz viejos/muertos."""
+    for attempt in (1, 2):
+        vc = guild.voice_client
+        if vc is not None:
+            if vc.is_connected():
+                if vc.channel and vc.channel.id == channel.id:
+                    return vc
+                await vc.move_to(channel)          # mover es casi instantaneo (sin reconectar)
+                return vc
+            try:                                   # cliente muerto: se limpia antes de reconectar
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+        try:
+            vc = await channel.connect(timeout=AFK_CONNECT_TIMEOUT, reconnect=True, self_deaf=True)
+        except discord.ClientException:
+            # "Already connected": quedo un cliente a medio limpiar; se fuerza y se reintenta una vez
+            stale = guild.voice_client
+            if stale is not None:
+                try:
+                    await stale.disconnect(force=True)
+                except Exception:
+                    pass
+            if attempt == 2:
+                raise
+            continue
+        if isinstance(channel, discord.StageChannel):
+            try:
+                await guild.me.edit(suppress=False)
+            except Exception:
+                pass
+        return vc
+    return None
 
 
 async def afk_set(guild, channel, by):
@@ -8843,7 +8888,7 @@ async def afk_set(guild, channel, by):
     if vc and vc.is_connected() and vc.channel.id != channel.id and player and (player.current or player.queue):
         raise JarvisError(f'Estoy reproduciendo musica en {vc.channel.mention}. Espera a que termine o usa `/stop`.')
     try:
-        await music_connect(guild, channel)
+        await _afk_join(guild, channel)
     except Exception as e:
         raise JarvisError(f'No pude conectarme a {channel.mention}: {short_error(e)}')
     prev = afk_data.get(str(guild.id)) or {}
@@ -8851,7 +8896,7 @@ async def afk_set(guild, channel, by):
     _afk_save()
     emb = afk_status_embed(guild, 'Conectado (AFK)')
     emb.description = (f'Me quede en {channel.mention}. ' +
-                       ('El anti-disconnect esta activado: si me sacan, vuelvo.' if afk_data[str(guild.id)]['anti']
+                       ('El anti-disconnect esta activado: si me sacan, vuelvo al instante.' if afk_data[str(guild.id)]['anti']
                         else 'Activa el anti-disconnect para que vuelva solo si me sacan.'))
     return emb
 
@@ -8892,6 +8937,7 @@ def afk_anti(guild, mode, by=0):
 def afk_schedule(guild_id):
     gid = str(guild_id)
     if gid in _afk_busy:
+        _afk_again.add(gid)          # ya estoy reconectando: que revise otra vez al terminar
         return
     _afk_busy.add(gid)
     spawn(_afk_reconnect(gid))
@@ -8899,13 +8945,11 @@ def afk_schedule(guild_id):
 
 async def _afk_reconnect(gid):
     try:
-        await asyncio.sleep(2)
-        for delay in (0, 3, 8, 15, 30):
-            if delay:
-                await asyncio.sleep(delay)
+        attempt = 0
+        while True:
             e = afk_data.get(gid)
             if not e or not e.get('anti'):
-                return                                   # lo quitaron mientras esperaba
+                return                                   # lo quitaron mientras reconectaba
             guild = client.get_guild(int(gid))
             if guild is None:
                 return
@@ -8914,21 +8958,37 @@ async def _afk_reconnect(gid):
                 afk_clear(gid)
                 print(f'[AFK] El canal AFK de {guild.name} ya no existe; modo AFK cancelado.')
                 return
+
             vc = guild.voice_client
             connected = bool(vc and vc.is_connected())
-            if connected and vc.channel.id == ch.id:
-                return
+            if connected and vc.channel and vc.channel.id == ch.id:
+                return                                   # ya estoy donde toca
             if connected and music_players.get(guild.id):
-                return                                   # estoy reproduciendo musica en otro canal
+                return                                   # reproduciendo musica en otro canal: no pelear
+
+            perms = ch.permissions_for(guild.me)
+            if not (perms.view_channel and perms.connect):
+                print(f'[AFK] Sin permiso de Connect en #{ch.name} ({guild.name}); reintento en {AFK_NOPERM_DELAY}s.')
+                await asyncio.sleep(AFK_NOPERM_DELAY)
+                continue
+
             try:
-                await music_connect(guild, ch)
-                print(f'[AFK] Reconectado a #{ch.name} en {guild.name}.')
+                await _afk_join(guild, ch)
+                print(f'[AFK] Reconectado a #{ch.name} en {guild.name} (intento {attempt + 1}).')
                 return
             except Exception as ex:
-                print(f'[AFK] No pude reconectar a #{ch.name} en {guild.name}: {short_error(ex)}')
-        print(f'[AFK] Me rindo por ahora en {gid}; el vigilante lo reintentara en un minuto.')
+                print(f'[AFK] Intento {attempt + 1} fallo en #{ch.name} ({guild.name}): {short_error(ex)}')
+
+            delay = AFK_RETRY_DELAYS[attempt] if attempt < len(AFK_RETRY_DELAYS) else AFK_RETRY_FOREVER
+            attempt += 1
+            await asyncio.sleep(delay)
     finally:
         _afk_busy.discard(gid)
+        if gid in _afk_again:
+            _afk_again.discard(gid)
+            e = afk_data.get(gid)
+            if e and e.get('anti'):
+                afk_schedule(gid)                        # me sacaron otra vez mientras reconectaba
 
 
 async def afk_on_voice_state_update(member, before, after):
@@ -8939,15 +8999,15 @@ async def afk_on_voice_state_update(member, before, after):
     if not e or not e.get('anti'):
         return
     if after.channel is not None and after.channel.id == int(e['channel']):
-        return
+        return                                           # estoy (o volvi) a mi canal
     if after.channel is not None and music_players.get(guild.id):
         return                                           # me movieron para reproducir musica: no pelear
-    afk_schedule(guild.id)                               # me sacaron o me movieron a otro canal
+    afk_schedule(guild.id)                               # me sacaron o me movieron: reaccion inmediata
 
 
 async def _afk_watchdog():
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(AFK_WATCHDOG_SECS)
         try:
             for gid, e in list(afk_data.items()):
                 if not e.get('anti'):
@@ -8957,6 +9017,8 @@ async def _afk_watchdog():
                     continue
                 vc = guild.voice_client
                 if vc and vc.is_connected() and vc.channel and vc.channel.id == int(e['channel']):
+                    continue
+                if music_players.get(guild.id) and vc and vc.is_connected():
                     continue
                 afk_schedule(gid)
         except Exception as ex:
@@ -8969,17 +9031,19 @@ async def afk_on_ready():
     if _afk_ready_done:
         return
     _afk_ready_done = True
-    await asyncio.sleep(5)
+    await asyncio.sleep(1)
     for gid, e in list(afk_data.items()):
         guild = client.get_guild(int(gid))
         ch = guild.get_channel(int(e['channel'])) if guild else None
         if ch is None:
             continue
         try:
-            await music_connect(guild, ch)
+            await _afk_join(guild, ch)
             print(f'[AFK] Conectado a #{ch.name} en {guild.name}.')
         except Exception as ex:
             print(f'[AFK] No pude conectar a #{ch.name} en {guild.name}: {short_error(ex)}')
+            if e.get('anti'):
+                afk_schedule(gid)
     spawn(_afk_watchdog())
 
 
@@ -9058,7 +9122,6 @@ def afk_regex_intent(ctx):
     nn = normalize_for_compare(text)
     if len(nn.split()) > 16:
         return None
-    F = re.IGNORECASE
 
     # --- anti-disconnect
     if re.search(r'\banti[\s_]*(?:disconnect|desconect\w*|desconexion|dc)\b', nn):
@@ -9128,7 +9191,7 @@ _afk_orig_build_help_embed = build_help_embed
 def build_help_embed():
     emb = _afk_orig_build_help_embed()
     value = ('`/connect [canal]` o `jarvis conectate al vc afk` - me quedo AFK en un canal de voz\n'
-             '`/anti_disconnect` o `jarvis activa el anti disconnect` - si me sacan o me mueven, vuelvo solo\n'
+             '`/anti_disconnect` o `jarvis activa el anti disconnect` - si me sacan o me mueven, vuelvo al instante\n'
              '`jarvis desactiva el anti disconnect` / `jarvis desconectate` (cancela el modo AFK)')
     if len(emb.fields) < 25 and len(emb) + len(value) + 30 < 5900:    # limite de Discord: 6000 caracteres
         emb.add_field(name='AFK en voz / Anti-Disconnect', value=value, inline=False)
