@@ -8786,6 +8786,407 @@ async def slash_leave(interaction: discord.Interaction):
     await music_slash(interaction, music_leave(interaction.guild, interaction.user))
 
 
+# ============================================================================
+# AFK EN VOZ + ANTI-DISCONNECT
+# ============================================================================
+from typing import Union
+
+AFKVOICE_FILE = DATA_DIR / 'afk_voice.json'
+afk_data = load_json(AFKVOICE_FILE, {})   # { guildId: {'channel': id, 'anti': bool, 'by': userId} }
+if not isinstance(afk_data, dict):
+    afk_data = {}
+AFK_CHANNEL_TYPES = (discord.VoiceChannel, discord.StageChannel)
+_afk_busy = set()
+_afk_ready_done = False
+
+
+def _afk_save():
+    save_json(AFKVOICE_FILE, afk_data)
+
+
+def afk_clear(guild_id):
+    if afk_data.pop(str(guild_id), None) is None:
+        return False
+    _afk_save()
+    return True
+
+
+def afk_status_embed(guild, title='Anti-Disconnect'):
+    e = afk_data.get(str(guild.id))
+    if not e:
+        return simple_embed(
+            title, 'No estoy en modo AFK. Usa `/connect` o `jarvis conectate` para dejarme en un canal de voz.', 0x95a5a6)
+    ch = guild.get_channel(int(e['channel']))
+    anti = bool(e.get('anti'))
+    emb = simple_embed(
+        title,
+        'Si alguien me saca o me mueve del canal de voz, vuelvo solo.' if anti
+        else 'Apagado: si me sacan del canal, no vuelvo. Activalo con `/anti_disconnect` o `jarvis activa el anti disconnect`.',
+        0x2ecc71 if anti else 0x95a5a6)
+    emb.add_field(name='Canal AFK', value=ch.mention if ch else 'Canal eliminado', inline=True)
+    emb.add_field(name='Anti-Disconnect', value='Activado' if anti else 'Desactivado', inline=True)
+    if e.get('by'):
+        emb.add_field(name='Puesto por', value=f'<@{e["by"]}>', inline=True)
+    emb.set_footer(text='Para quitarme del canal: jarvis desconectate (o /leave). Eso tambien cancela el modo AFK.')
+    return emb
+
+
+async def afk_set(guild, channel, by):
+    """Conecta al bot a `channel` y lo deja como canal AFK."""
+    if not NACL_OK:
+        raise JarvisError('Me falta `PyNaCl` en el servidor del bot para conectarme a voz.')
+    perms = channel.permissions_for(guild.me)
+    if not (perms.view_channel and perms.connect):
+        raise JarvisError(f'No tengo permiso para conectarme a {channel.mention}.')
+    vc = guild.voice_client
+    player = music_players.get(guild.id)
+    if vc and vc.is_connected() and vc.channel.id != channel.id and player and (player.current or player.queue):
+        raise JarvisError(f'Estoy reproduciendo musica en {vc.channel.mention}. Espera a que termine o usa `/stop`.')
+    try:
+        await music_connect(guild, channel)
+    except Exception as e:
+        raise JarvisError(f'No pude conectarme a {channel.mention}: {short_error(e)}')
+    prev = afk_data.get(str(guild.id)) or {}
+    afk_data[str(guild.id)] = {'channel': channel.id, 'anti': bool(prev.get('anti')), 'by': str(by)}
+    _afk_save()
+    emb = afk_status_embed(guild, 'Conectado (AFK)')
+    emb.description = (f'Me quede en {channel.mention}. ' +
+                       ('El anti-disconnect esta activado: si me sacan, vuelvo.' if afk_data[str(guild.id)]['anti']
+                        else 'Activa el anti-disconnect para que vuelva solo si me sacan.'))
+    return emb
+
+
+def afk_anti(guild, mode, by=0):
+    """mode: 'on' | 'off' | 'status' | None (alternar)."""
+    gid = str(guild.id)
+    e = afk_data.get(gid)
+    if e is None:
+        if mode == 'status':
+            return afk_status_embed(guild)
+        if mode == 'off':
+            raise JarvisError('El anti-disconnect no estaba activado.')
+        vc = guild.voice_client
+        if vc and vc.is_connected() and vc.channel:      # ya estoy en un canal: lo adopto como canal AFK
+            e = {'channel': vc.channel.id, 'anti': False, 'by': str(by)}
+            afk_data[gid] = e
+        else:
+            raise JarvisError('Primero conectame a un canal de voz con `/connect` o `jarvis conectate`.')
+    if mode == 'status':
+        return afk_status_embed(guild)
+    if mode is None:
+        mode = 'off' if e.get('anti') else 'on'
+    if mode == 'on' and e.get('anti'):
+        raise JarvisError('El anti-disconnect ya esta activado.')
+    if mode == 'off' and not e.get('anti'):
+        raise JarvisError('El anti-disconnect ya esta desactivado.')
+    e['anti'] = (mode == 'on')
+    _afk_save()
+    if e['anti']:
+        vc = guild.voice_client
+        if not (vc and vc.is_connected() and vc.channel and vc.channel.id == int(e['channel'])):
+            afk_schedule(guild.id)                       # estoy fuera del canal: vuelvo ya
+    return afk_status_embed(guild, 'Anti-Disconnect Activado' if e['anti'] else 'Anti-Disconnect Desactivado')
+
+
+# ------------------------------------------------------------- reconexion automatica --
+def afk_schedule(guild_id):
+    gid = str(guild_id)
+    if gid in _afk_busy:
+        return
+    _afk_busy.add(gid)
+    spawn(_afk_reconnect(gid))
+
+
+async def _afk_reconnect(gid):
+    try:
+        await asyncio.sleep(2)
+        for delay in (0, 3, 8, 15, 30):
+            if delay:
+                await asyncio.sleep(delay)
+            e = afk_data.get(gid)
+            if not e or not e.get('anti'):
+                return                                   # lo quitaron mientras esperaba
+            guild = client.get_guild(int(gid))
+            if guild is None:
+                return
+            ch = guild.get_channel(int(e['channel']))
+            if ch is None:
+                afk_clear(gid)
+                print(f'[AFK] El canal AFK de {guild.name} ya no existe; modo AFK cancelado.')
+                return
+            vc = guild.voice_client
+            connected = bool(vc and vc.is_connected())
+            if connected and vc.channel.id == ch.id:
+                return
+            if connected and music_players.get(guild.id):
+                return                                   # estoy reproduciendo musica en otro canal
+            try:
+                await music_connect(guild, ch)
+                print(f'[AFK] Reconectado a #{ch.name} en {guild.name}.')
+                return
+            except Exception as ex:
+                print(f'[AFK] No pude reconectar a #{ch.name} en {guild.name}: {short_error(ex)}')
+        print(f'[AFK] Me rindo por ahora en {gid}; el vigilante lo reintentara en un minuto.')
+    finally:
+        _afk_busy.discard(gid)
+
+
+async def afk_on_voice_state_update(member, before, after):
+    if not client.user or member.id != client.user.id:
+        return
+    guild = member.guild
+    e = afk_data.get(str(guild.id))
+    if not e or not e.get('anti'):
+        return
+    if after.channel is not None and after.channel.id == int(e['channel']):
+        return
+    if after.channel is not None and music_players.get(guild.id):
+        return                                           # me movieron para reproducir musica: no pelear
+    afk_schedule(guild.id)                               # me sacaron o me movieron a otro canal
+
+
+async def _afk_watchdog():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            for gid, e in list(afk_data.items()):
+                if not e.get('anti'):
+                    continue
+                guild = client.get_guild(int(gid))
+                if guild is None:
+                    continue
+                vc = guild.voice_client
+                if vc and vc.is_connected() and vc.channel and vc.channel.id == int(e['channel']):
+                    continue
+                afk_schedule(gid)
+        except Exception as ex:
+            print(f'[AFK] vigilante: {ex}')
+
+
+async def afk_on_ready():
+    """Al arrancar el bot, vuelve a los canales AFK guardados."""
+    global _afk_ready_done
+    if _afk_ready_done:
+        return
+    _afk_ready_done = True
+    await asyncio.sleep(5)
+    for gid, e in list(afk_data.items()):
+        guild = client.get_guild(int(gid))
+        ch = guild.get_channel(int(e['channel'])) if guild else None
+        if ch is None:
+            continue
+        try:
+            await music_connect(guild, ch)
+            print(f'[AFK] Conectado a #{ch.name} en {guild.name}.')
+        except Exception as ex:
+            print(f'[AFK] No pude conectar a #{ch.name} en {guild.name}: {short_error(ex)}')
+    spawn(_afk_watchdog())
+
+
+client.add_listener(afk_on_voice_state_update, 'on_voice_state_update')
+client.add_listener(afk_on_ready, 'on_ready')
+
+
+# --------------------------------------- "jarvis desconectate" / /leave cancelan el modo AFK --
+_afk_orig_music_leave = music_leave
+
+
+async def music_leave(guild, member):
+    try:
+        result = await _afk_orig_music_leave(guild, member)
+    except MusicError:
+        vc = guild.voice_client
+        if not (vc and vc.is_connected()) and afk_clear(guild.id):
+            return simple_embed('Modo AFK cancelado', 'No estaba en voz, pero ya no volvere a conectarme solo.', 0x95a5a6)
+        raise
+    afk_clear(guild.id)
+    return result
+
+
+# ------------------------------------------------------------------ handlers de Jarvis --
+async def act_afk_connect(ctx, intent):
+    guild = ctx.guild
+    if intent.channel:
+        ch = resolve_channel(guild, intent.channel, AFK_CHANNEL_TYPES)
+        if ch is None:
+            raise JarvisError(f'No encontre el canal de voz `{intent.channel}`.')
+    else:
+        ch = voice_channel_of(ctx.author)
+        if ch is None:
+            raise JarvisError('Dime a que canal de voz me conecto (ej: `jarvis conectate al vc afk`) o entra a uno y repite.')
+    return await afk_set(guild, ch, ctx.author.id)
+
+
+async def act_antidisconnect_on(ctx, intent):
+    return afk_anti(ctx.guild, 'on', ctx.author.id)
+
+
+async def act_antidisconnect_off(ctx, intent):
+    return afk_anti(ctx.guild, 'off', ctx.author.id)
+
+
+async def act_antidisconnect_status(ctx, intent):
+    return afk_anti(ctx.guild, 'status', ctx.author.id)
+
+
+AFK_ACTIONS = {'afk_connect', 'antidisconnect_on', 'antidisconnect_off', 'antidisconnect_status'}
+PLAIN_ACTIONS.update(AFK_ACTIONS)
+KNOWN_ACTIONS.update(AFK_ACTIONS)
+PLAIN_HANDLERS.update({
+    'afk_connect': act_afk_connect, 'antidisconnect_on': act_antidisconnect_on,
+    'antidisconnect_off': act_antidisconnect_off, 'antidisconnect_status': act_antidisconnect_status,
+})
+ACTION_LABELS.update({
+    'afk_connect': 'Conectar a voz (AFK)', 'antidisconnect_on': 'Activar anti-disconnect',
+    'antidisconnect_off': 'Desactivar anti-disconnect', 'antidisconnect_status': 'Ver anti-disconnect',
+})
+
+INTENT_SYSTEM_PROMPT += """
+ACCIONES EXTRA (voz AFK):
+- afk_connect: conectar a Jarvis a un canal de voz para dejarlo AFK. channel (nombre o #mencion; vacio = el canal de voz donde esta el JEFE)
+- antidisconnect_on | antidisconnect_off | antidisconnect_status: activar / desactivar / ver el ANTI-DISCONNECT (si alguien saca o mueve a Jarvis del canal de voz, vuelve solo)
+REGLA EXTRA: "conectate a un vc", "metete al canal de voz", "quedate afk en X" = afk_connect. "anti disconnect", "antidisconnect", "anti desconectar" SIEMPRE son antidisconnect_*, nunca voice_disconnect ni music_leave. "desconectate" / "sal del vc" = music_leave (eso tambien cancela el modo AFK).
+"""
+
+
+# ------------------------------------------------------------------ patrones (sin IA) --
+_AFK_PREPS = r'(?:a|al|en|el|la|un|una|canal|chat|de|del|voz|vc|call|llamada|llamadas|este|esta|ese|mi)'
+
+
+def afk_regex_intent(ctx):
+    text = ctx.text
+    nn = normalize_for_compare(text)
+    if len(nn.split()) > 16:
+        return None
+    F = re.IGNORECASE
+
+    # --- anti-disconnect
+    if re.search(r'\banti[\s_]*(?:disconnect|desconect\w*|desconexion|dc)\b', nn):
+        stop = re.search(r'\b(?:desactiva\w*|apaga\w*|quita\w*|deshabilita\w*|off|deja\s+de|ya\s+no)\b', nn)
+        start = re.search(r'\b(?:activa\w*|enciende\w*|prende\w*|habilita\w*|pon\w*|inicia\w*|on)\b', nn)
+        if stop:
+            action = 'antidisconnect_off'
+        elif start:
+            action = 'antidisconnect_on'
+        else:
+            action = 'antidisconnect_status'
+        return Intent(action=action, source='regex', explicit=True)
+
+    # --- conectarse a un canal de voz
+    m = re.match(r'^(?P<v>conectate|conectarte|conecta|unete|unirte|metete|mete|entra|entrate|join|ponte|quedate)\b\s*(?P<rest>.*)$', nn)
+    if not m:
+        return None
+    verb, rest = m.group('v'), m.group('rest')
+    has_vc = bool(re.search(r'\b(?:vc|voz|call|llamada|llamadas|canal)\b', rest))
+    if verb == 'quedate':
+        if not (has_vc or re.search(r'\bafk\b', rest)):
+            return None
+        rest = re.sub(r'^afk\b', '', rest).strip()
+    elif verb not in ('conectate', 'conectarte') and not has_vc:
+        return None
+
+    mention = re.search(r'<#(\d+)>', text)
+    if mention:
+        chan = mention.group(0)
+    else:
+        r = rest
+        for _ in range(8):
+            new = re.sub(r'^' + _AFK_PREPS + r'\b\s*', '', r)
+            if new == r:
+                break
+            r = new
+        r = re.sub(r'\b(?:por\s+favor|porfa|plis)\b.*$', '', r)
+        r = re.sub(r'\bpara\s+(?:dejar\s+|estar\s+|quedarme\s+|quedarte\s+)?afk\b.*$', '', r)
+        r = re.sub(r'\by\s+(?:quedate|dejate)\b.*$', '', r).strip()
+        chan = r or None
+
+    if verb in ('conectate', 'conectarte') and chan and not mention and not has_vc and ctx.guild is not None:
+        try:                                   # "conectate a roblox" no es un canal de voz
+            if resolve_channel(ctx.guild, chan, AFK_CHANNEL_TYPES, strict=False) is None:
+                return None
+        except JarvisError:
+            pass                               # varios canales encajan: lo decide el handler
+    return Intent(action='afk_connect', source='regex', channel=chan, explicit=True)
+
+
+_afk_orig_regex_parse_intent = regex_parse_intent
+
+
+def regex_parse_intent(ctx):
+    try:
+        it = afk_regex_intent(ctx)
+    except Exception as e:
+        print(f'[AFK] patron: {e}')
+        it = None
+    return it if it is not None else _afk_orig_regex_parse_intent(ctx)
+
+
+# ---------------------------------------------------------------------- ayuda (/help) --
+_afk_orig_build_help_embed = build_help_embed
+
+
+def build_help_embed():
+    emb = _afk_orig_build_help_embed()
+    value = ('`/connect [canal]` o `jarvis conectate al vc afk` - me quedo AFK en un canal de voz\n'
+             '`/anti_disconnect` o `jarvis activa el anti disconnect` - si me sacan o me mueven, vuelvo solo\n'
+             '`jarvis desactiva el anti disconnect` / `jarvis desconectate` (cancela el modo AFK)')
+    if len(emb.fields) < 25 and len(emb) + len(value) + 30 < 5900:    # limite de Discord: 6000 caracteres
+        emb.add_field(name='AFK en voz / Anti-Disconnect', value=value, inline=False)
+    return emb
+
+
+# ------------------------------------------------------------------ slash commands --
+async def _afk_slash(interaction, fn):
+    if not ar_can_manage(interaction.user):
+        return await interaction.response.send_message(
+            'Necesitas el permiso **Manage Server** (o estar en la whitelist de Jarvis) para usar esto.', ephemeral=True)
+    try:
+        embed = fn()
+    except (JarvisError, MusicError) as e:
+        return await interaction.response.send_message(str(e), ephemeral=True)
+    except Exception as e:
+        print(f'[AFK] slash: {e}')
+        return await interaction.response.send_message(f'Error inesperado: {short_error(e)}', ephemeral=True)
+    await interaction.response.send_message(embed=embed)
+
+
+try:
+    @client.tree.command(name='connect', description='Conecta al bot a un canal de voz y lo deja AFK')
+    @app_commands.guild_only()
+    @app_commands.describe(canal='Canal de voz (omitir = el canal en el que estas)')
+    async def slash_connect(interaction: discord.Interaction, canal: Union[discord.VoiceChannel, discord.StageChannel] = None):
+        if not ar_can_manage(interaction.user):
+            return await interaction.response.send_message(
+                'Necesitas el permiso **Manage Server** (o estar en la whitelist de Jarvis) para usar esto.', ephemeral=True)
+        ch = canal or voice_channel_of(interaction.user)
+        if ch is None:
+            return await interaction.response.send_message(
+                'Elige un canal de voz o entra a uno y repite el comando.', ephemeral=True)
+        await interaction.response.defer()
+        try:
+            embed = await afk_set(interaction.guild, ch, interaction.user.id)
+        except (JarvisError, MusicError) as e:
+            return await interaction.followup.send(str(e))
+        except Exception as e:
+            print(f'[AFK] /connect: {e}')
+            return await interaction.followup.send(f'Error inesperado: {short_error(e)}')
+        await interaction.followup.send(embed=embed)
+
+    @client.tree.command(name='anti_disconnect', description='Anti-disconnect: si me sacan del canal de voz, vuelvo solo')
+    @app_commands.guild_only()
+    @app_commands.describe(estado='Activar, desactivar o ver el estado (omitir = alternar)')
+    @app_commands.choices(estado=[
+        app_commands.Choice(name='Activar', value='on'),
+        app_commands.Choice(name='Desactivar', value='off'),
+        app_commands.Choice(name='Estado', value='status'),
+    ])
+    async def slash_anti_disconnect(interaction: discord.Interaction, estado: app_commands.Choice[str] = None):
+        mode = estado.value if estado else None
+        await _afk_slash(interaction, lambda: afk_anti(interaction.guild, mode, interaction.user.id))
+except Exception as _afk_err:
+    print(f'[AFK] No pude registrar los comandos /connect y /anti_disconnect: {_afk_err}')
+
+
 import jarvis_imagenes
 jarvis_imagenes.install(sys.modules[__name__])
 
