@@ -155,7 +155,15 @@ def _names(names, limit=12):
 # ============================================================================
 # SAVE
 # ============================================================================
-def _channel_entry(c, idx):
+def _is_private(guild, c):
+    """True si @everyone NO puede ver el canal (canal privado). None si no se pudo calcular."""
+    try:
+        return not c.permissions_for(guild.default_role).view_channel
+    except Exception:
+        return None
+
+
+def _channel_entry(guild, c, idx, cat_names):
     overwrites = []
     for target, ow in c.overwrites.items():
         allow, deny = ow.pair()
@@ -167,7 +175,6 @@ def _channel_entry(c, idx):
             'allow': str(allow.value),
             'deny': str(deny.value),
         })
-    cat = c.category
     return {
         'id': str(c.id),
         'name': c.name,
@@ -175,7 +182,10 @@ def _channel_entry(c, idx):
         'position': c.position,
         'order': idx,                                   # orden en el que se ve en Discord
         'parentId': str(c.category_id) if c.category_id else None,
-        'parentName': cat.name if cat else None,
+        'parentName': cat_names.get(c.category_id) if c.category_id else None,
+        'private': _is_private(guild, c),               # True = @everyone no puede ver el canal
+        'viewAllowed': [str(getattr(t, 'name', None) or t.id) for t, ow in c.overwrites.items()
+                        if ow.view_channel is True],    # roles/personas que SI lo ven (informativo)
         'topic': getattr(c, 'topic', None),
         'nsfw': bool(getattr(c, 'nsfw', False)),
         'rateLimitPerUser': getattr(c, 'slowmode_delay', None),
@@ -216,12 +226,30 @@ async def save_server_config(guild: discord.Guild, include_bot=False):
         })
 
     # ---- canales: en el mismo orden en el que se ven en Discord, con sus permisos ----
+    # Se piden a la API (no a la cache): un bot sin Administrador NO recibe en su cache los canales
+    # privados que no puede ver, y asi se perderian del backup.
+    try:
+        all_channels = list(await guild.fetch_channels())
+    except Exception as e:
+        print(f'[Backup] fetch_channels fallo, uso la cache: {e}')
+        all_channels = list(guild.channels)
+    hidden = len({c.id for c in all_channels} - {c.id for c in guild.channels})
+
+    def _sort_key(c):
+        return (1 if _bucket(int(c.type.value)) == 'voice' else 0, c.position, c.id)   # Discord: texto antes que voz
+
+    cats = sorted((c for c in all_channels if isinstance(c, discord.CategoryChannel)), key=lambda c: (c.position, c.id))
+    cat_names = {c.id: c.name for c in cats}
+    loose = sorted((c for c in all_channels
+                    if not isinstance(c, discord.CategoryChannel) and not c.category_id), key=_sort_key)
     channels = []
-    for category, children in guild.by_category():
-        if category is not None:
-            channels.append(_channel_entry(category, len(channels)))
-        for c in children:
-            channels.append(_channel_entry(c, len(channels)))
+    for c in loose:
+        channels.append(_channel_entry(guild, c, len(channels), cat_names))
+    for cat in cats:
+        channels.append(_channel_entry(guild, cat, len(channels), cat_names))
+        for c in sorted((x for x in all_channels
+                         if not isinstance(x, discord.CategoryChannel) and x.category_id == cat.id), key=_sort_key):
+            channels.append(_channel_entry(guild, c, len(channels), cat_names))
 
     # ---- roles de cada persona ----
     members = []
@@ -271,6 +299,9 @@ async def save_server_config(guild: discord.Guild, include_bot=False):
         'membersComplete': complete,
         'botInventoryComplete': complete,
         'overwritesTotal': sum(len(c['permissionOverwrites']) for c in channels),
+        'privateChannels': sum(1 for c in channels if c.get('private')),
+        'hiddenChannels': hidden,                       # canales que el bot no veia en su cache
+        'botWasAdmin': bool(guild.me.guild_permissions.administrator) if guild.me else None,
         'roles': roles,
         'channels': channels,
         'members': members,
@@ -481,7 +512,7 @@ async def restore_server_config(guild: discord.Guild, backup: dict, *,
         'rolesReordered': None, 'skippedRoles': [], 'managedMissing': [],
         'channelsCreated': 0, 'channelsUpdated': 0, 'channelsUnchanged': 0, 'channelsDeleted': 0,
         'channelsSkipped': 0, 'channelsReordered': None, 'keptChannels': [], 'overwritesSkipped': 0,
-        'overwritesFallback': 0, 'permsMismatch': [], 'permsChecked': 0, 'noAdmin': not me.guild_permissions.administrator,
+        'overwritesFallback': 0, 'permsMismatch': [], 'permsChecked': 0, 'privateChecked': 0, 'privateMismatch': [], 'hiddenChannels': 0, 'noAdmin': not me.guild_permissions.administrator,
         'everyoneUpdated': False,
         'membersTotal': 0, 'membersUpdated': 0, 'membersOk': 0, 'membersMissing': 0, 'membersBlocked': 0,
         'membersFailed': 0, 'nicksUpdated': 0, 'roleAssignments': 0, 'assignmentsBlocked': 0, 'membersNote': None,
@@ -601,12 +632,19 @@ async def restore_server_config(guild: discord.Guild, backup: dict, *,
     # -------------------------------------------------------------- CANALES --
     await say('Fase 3/4: canales (crear, actualizar, permisos, orden)...')
     backup_channels = [bc for bc in (backup.get('channels') or []) if isinstance(bc, dict) and bc.get('id') is not None]
-    current_channels = list(guild.channels)
+    try:                                    # desde la API: la cache no trae los canales privados que el bot no ve
+        current_channels = list(await guild.fetch_channels())
+    except Exception as e:
+        err(f'No pude leer la lista completa de canales: {_short(e)}')
+        current_channels = list(guild.channels)
+    report['hiddenChannels'] = len({c.id for c in current_channels} - {c.id for c in guild.channels})
+    by_id = {c.id: c for c in current_channels}
+    cat_names_now = {c.id: c.name for c in current_channels if isinstance(c, discord.CategoryChannel)}
     channel_map = {}                        # ID del canal en el backup -> canal actual
     used_ch = set()
 
     for bc in backup_channels:              # 1) mismo ID y mismo tipo
-        c = guild.get_channel(_int(bc['id']))
+        c = by_id.get(_int(bc['id']))
         if c is not None and int(c.type.value) == _int(bc.get('type')) and c.id not in used_ch:
             channel_map[str(bc['id'])] = c
             used_ch.add(c.id)
@@ -617,7 +655,7 @@ async def restore_server_config(guild: discord.Guild, backup: dict, *,
                  if c.id not in used_ch and int(c.type.value) == _int(bc.get('type')) and c.name == bc.get('name')]
         if not cands:
             continue
-        pick = next((c for c in cands if (c.category.name if c.category else None) == bc.get('parentName')), cands[0])
+        pick = next((c for c in cands if cat_names_now.get(c.category_id) == bc.get('parentName')), cands[0])
         channel_map[str(bc['id'])] = pick
         used_ch.add(pick.id)
 
@@ -748,6 +786,10 @@ async def restore_server_config(guild: discord.Guild, backup: dict, *,
             report['permsChecked'] += 1
             if _ow_sig(fresh[ch.id].overwrites) != _ow_sig(await build_overwrites_quiet(bc)):
                 report['permsMismatch'].append(ch.name)
+            if bc.get('private') is not None:
+                report['privateChecked'] += 1
+                if _is_private(guild, fresh[ch.id]) != bool(bc['private']):
+                    report['privateMismatch'].append(ch.name)
     except Exception as e:
         err(f'Verificacion de permisos: {_short(e)}')
 
@@ -876,8 +918,15 @@ def _restore_embed(report, backup, saved_at_ms, assigned, bot_result=None):
         txt = f'Canales con permisos verificados: **{good}/{r["permsChecked"]}**'
         if r['overwritesFallback']:
             txt += f'\nCanales donde tuve que aplicarlos uno por uno: **{r["overwritesFallback"]}**'
+        if r['privateChecked']:
+            okp = r['privateChecked'] - len(r['privateMismatch'])
+            txt += f'\nPrivado/publico correcto: **{okp}/{r["privateChecked"]}**'
+            if r['privateMismatch']:
+                txt += '\nCon privacidad distinta al backup: ' + _names(r['privateMismatch'])
         if r['permsMismatch']:
-            txt += '\nNo quedaron iguales: ' + _names(r['permsMismatch'])
+            txt += '\nPermisos distintos al backup: ' + _names(r['permsMismatch'])
+        if r['hiddenChannels']:
+            txt += f'\nCanales privados que el bot no veia en su cache: **{r["hiddenChannels"]}** (los inclui igual)'
         e.add_field(name='Permisos de canales', value=txt[:1024], inline=False)
     if backup.get('everyonePermissions') is not None:
         e.add_field(name='Permisos de @everyone',
@@ -973,8 +1022,15 @@ def install(m):
                 f'**Canales:** {len(backup["channels"])} (en orden y con sus permisos)\n'
                 f'**Permisos de canal guardados:** {backup["overwritesTotal"]} '
                 f'(en {sum(1 for c in backup["channels"] if c["permissionOverwrites"])} canales)\n'
+                f'**Canales privados** (@everyone no los ve): {backup["privateChannels"]} de {len(backup["channels"])}\n'
                 f'**Personas con roles:** {len(backup["members"])} de {backup["membersTotal"]} miembros\n'
                 f'**Bots encontrados:** {len(backup["bots"])}\n')
+        if backup['hiddenChannels']:
+            desc += (f'\nGuarde **{backup["hiddenChannels"]}** canal(es) privado(s) que el bot no veia en su cache '
+                     '(los lei desde la API de Discord).\n')
+        if backup['botWasAdmin'] is False:
+            desc += ('\nOjo: el bot no tiene **Administrador**. Los permisos se guardan igual, pero para '
+                     'restaurarlos todos Discord exige que el bot los tenga tambien.\n')
         if not backup['membersComplete']:
             desc += '\nOjo: no pude cargar a todos los miembros, la lista de roles de personas puede estar incompleta.\n'
         if with_bot:
