@@ -9268,9 +9268,6 @@ jarvis_suplantar.install(sys.modules[__name__])
 import jarvis_gestion
 jarvis_gestion.install(sys.modules[__name__])
 
-import jarvis_tts
-jarvis_tts.install(sys.modules[__name__])
-
 import jarvis_devolver_rol
 jarvis_devolver_rol.install(sys.modules[__name__])
 
