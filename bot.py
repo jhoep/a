@@ -9273,6 +9273,9 @@ jarvis_tts.install(sys.modules{__name__})
 
 import jarvis_devolver_rol
 jarvis_devolver_rol.install(sys.modules[__name__])
+
+import jarvis_backup
+jarvis_backup.install(sys.modules[__name__])
 # ============================================================================
 # KEEPALIVE
 # ============================================================================
