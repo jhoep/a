@@ -7881,7 +7881,7 @@ async def handle_command(message: discord.Message):
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline=False)
         embed.add_field(name='Musica', value='`play` (`p`) `playnext` `skip` (`s`) `stop` `pause` `resume` `queue` (`q`)\n`np` `volume` (`vol`) `loop` `shuffle` `remove` `clear` `leave` (`dc`)', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/regla_apodo` `/quitar_regla_apodo`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla_apodo`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
@@ -7890,8 +7890,12 @@ async def handle_command(message: discord.Message):
 # ============================================================================
 # EVENTS
 # ============================================================================
+_slash_sync_done = False
+
+
 @client.event
 async def on_ready():
+    global _slash_sync_done
     print(f'Bot listo: {client.user}')
     print(f'Conectado a {len(client.guilds)} servidores')
     await whitelist_boot_sync()
@@ -7902,11 +7906,21 @@ async def on_ready():
           f'contexto={JARVIS_CONTEXT_MESSAGES} msgs | confirmar_deducidos={"SI" if JARVIS_CONFIRM_INFERRED else "NO"}')
     print(music_status_line())
     await client.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f'{PREFIX}help | /help'))
-    try:
-        synced = await client.tree.sync()
-        print(f'[Slash] Comandos registrados globalmente ({len(synced)}).')
-    except Exception as e:
-        print(f'[Slash] Error: {e}')
+    if not _slash_sync_done:
+        try:
+            sync_guild_id = os.environ.get('SLASH_SYNC_GUILD_ID', '').strip()
+            if sync_guild_id:
+                sync_guild = discord.Object(id=int(sync_guild_id))
+                client.tree.copy_global_to(guild=sync_guild)
+                synced = await client.tree.sync(guild=sync_guild)
+                scope = f' servidor {sync_guild_id}'
+            else:
+                synced = await client.tree.sync()
+                scope = ' globalmente'
+            _slash_sync_done = True
+            print(f'[Slash] Comandos registrados{scope} ({len(synced)}).')
+        except Exception as e:
+            print(f'[Slash] Error al sincronizar: {e}')
     load_reminders(client)
     antiraid_resume()
     temprole_resume()
@@ -8368,23 +8382,47 @@ async def slash_setmodlog(interaction: discord.Interaction, canal: discord.TextC
     await interaction.response.send_message(embed=simple_embed('Mod Log Configurado', f'Los logs de moderacion se enviaran a {canal.mention}.', 0x2ecc71))
 
 
+@client.tree.command(name='auditoria', description='Consultar los ultimos 100 registros de auditoria')
+@app_commands.guild_only()
+async def slash_auditoria(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not interaction.user.guild_permissions.view_audit_log:
+        return await interaction.response.send_message('Necesitas el permiso **View Audit Log**.', ephemeral=True)
+    if guild.me is None or not guild.me.guild_permissions.view_audit_log:
+        return await interaction.response.send_message('Al bot le falta el permiso **View Audit Log**.', ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        entries = [entry async for entry in guild.audit_logs(limit=100)]
+    except Exception as e:
+        return await interaction.followup.send(f'No pude leer el registro de auditoria: {short_error(e)}', ephemeral=True)
+
+    lines = [f'Registro de auditoria de {guild.name} - {len(entries)} entrada(s) mas recientes', '']
+    for index, entry in enumerate(entries, 1):
+        actor = entry.user
+        target = entry.target
+        action = getattr(entry.action, 'name', str(entry.action))
+        actor_text = f'{actor} ({actor.id})' if actor else 'Desconocido'
+        target_id = getattr(target, 'id', None)
+        target_text = f'{target} ({target_id})' if target is not None and target_id else str(target or 'Sin objetivo')
+        lines.extend([
+            f'{index}. {action} | {entry.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")} | ID: {entry.id}',
+            f'   Actor: {actor_text}',
+            f'   Objetivo: {target_text}',
+            f'   Motivo: {entry.reason or "Sin motivo"}',
+        ])
+
+    if not entries:
+        lines.append('No hay registros disponibles.')
+    report = '\n'.join(lines).encode('utf-8')
+    await interaction.followup.send(
+        content='Adjunto el registro de auditoria con las 100 entradas mas recientes (o todas las disponibles).',
+        file=discord.File(io.BytesIO(report), filename=f'auditoria_{guild.id}.txt'),
+        ephemeral=True,
+    )
+
+
 # ── REGLA DE APODO ──
-async def resolve_guild_member(guild, identifier):
-    match = re.fullmatch(r'<@!?(\d{15,21})>|(\d{15,21})', identifier.strip())
-    if not match:
-        raise JarvisError('Indica una mencion o un ID de usuario valido.')
-    user_id = int(match.group(1) or match.group(2))
-    member = guild.get_member(user_id)
-    if member is None:
-        try:
-            member = await guild.fetch_member(user_id)
-        except discord.NotFound:
-            raise JarvisError('Ese usuario no pertenece a este servidor.')
-        except Exception as e:
-            raise JarvisError(f'No pude buscar ese usuario: {short_error(e)}')
-    return member
-
-
 def can_manage_member_nickname(guild, actor, member):
     if not actor.guild_permissions.manage_nicknames:
         return 'Necesitas el permiso **Manage Nicknames** para usar este comando.'
@@ -8399,15 +8437,11 @@ def can_manage_member_nickname(guild, actor, member):
 
 
 @client.tree.command(name='regla_apodo', description='Forzar un apodo durante un periodo')
-@app_commands.describe(usuario='Mencion o ID de un miembro', apodo='Apodo que Jarvis mantendra', duracion='Duracion (ej: 30m, 2h, 3d)')
-async def slash_regla_apodo(interaction: discord.Interaction, usuario: str, apodo: str, duracion: str):
-    if interaction.guild is None:
-        return await interaction.response.send_message('Este comando solo funciona dentro de un servidor.', ephemeral=True)
+@app_commands.guild_only()
+@app_commands.describe(usuario='Miembro del servidor', apodo='Apodo que Jarvis mantendra', duracion='Duracion (ej: 30m, 2h, 3d)')
+async def slash_regla_apodo(interaction: discord.Interaction, usuario: discord.Member, apodo: str, duracion: str):
     await interaction.response.defer(ephemeral=True)
-    try:
-        member = await resolve_guild_member(interaction.guild, usuario)
-    except JarvisError as e:
-        return await interaction.followup.send(str(e))
+    member = usuario
     error = can_manage_member_nickname(interaction.guild, interaction.user, member)
     if error:
         return await interaction.followup.send(error)
@@ -8446,15 +8480,11 @@ async def slash_regla_apodo(interaction: discord.Interaction, usuario: str, apod
 
 
 @client.tree.command(name='quitar_regla_apodo', description='Quitar la regla de apodo de un miembro')
-@app_commands.describe(usuario='Mencion o ID del miembro')
-async def slash_quitar_regla_apodo(interaction: discord.Interaction, usuario: str):
-    if interaction.guild is None:
-        return await interaction.response.send_message('Este comando solo funciona dentro de un servidor.', ephemeral=True)
+@app_commands.guild_only()
+@app_commands.describe(usuario='Miembro del servidor')
+async def slash_quitar_regla_apodo(interaction: discord.Interaction, usuario: discord.Member):
     await interaction.response.defer(ephemeral=True)
-    try:
-        member = await resolve_guild_member(interaction.guild, usuario)
-    except JarvisError as e:
-        return await interaction.followup.send(str(e))
+    member = usuario
     error = can_manage_member_nickname(interaction.guild, interaction.user, member)
     if error:
         return await interaction.followup.send(error)
