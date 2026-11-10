@@ -3633,7 +3633,7 @@ ACCIONES (action) y sus campos:
 - antiraid_on | antiraid_off | antiraid_status: activar / desactivar / ver el sistema ANTI-RAID (proteccion contra raids = mucha gente entrando de golpe, y contra spam masivo)
 - antiraid_logs: channel opcional (vacio = canal actual); mode="off" para quitar el canal de logs del anti-raid
 - antiraid_lockdown_on | antiraid_lockdown_off: lockdown de emergencia (sanciona a todo el que entre); duration opcional ("10m")
-- antiraid_config: setting (joins|ventana|edad_cuenta|accion|spam|mensajes|menciones|lockdown_tiempo) + value (numero; los tiempos van en SEGUNDOS, o usa duration) y/o text (kick|ban|timeout para accion; on|off para spam)
+- antiraid_config: setting (joins|ventana|edad_cuenta|accion|spam|bots|mensajes|menciones|lockdown_tiempo) + value (numero; los tiempos van en SEGUNDOS, o usa duration) y/o text (kick|ban|timeout para accion; on|off para spam o bots)
 - antialt_on: activar el ANTI-ALT (expulsa/banea cuentas de Discord mas nuevas que X dias). value = edad minima en DIAS, text = accion opcional (kick|ban|timeout) | antialt_off | antialt_status
 - antialt_allow | antialt_disallow: target_ids (o target_query con el ID): dejar entrar a esa persona aunque su cuenta sea nueva / quitar la excepcion
 - blacklist_add | blacklist_remove: target_query (ID, mencion o tag/nombre exacto del servidor); blacklist_show: ver la lista negra. Anadir banea ahora si el usuario ya esta dentro y tambien al volver a entrar.
@@ -5583,6 +5583,7 @@ if isinstance(_blacklist_saved, dict):
 ANTIRAID_DEFAULTS = {
     'enabled': False,
     'log_channel': None,          # id (str) del canal de logs
+    'unverified_bots_enabled': False,
     'join_threshold': 6,          # entradas...
     'join_window': 10,            # ...en estos segundos = raid
     'alt_enabled': False,         # ANTI-ALT: bloquear cuentas de Discord demasiado nuevas al entrar
@@ -5601,6 +5602,7 @@ ANTIRAID_DEFAULTS = {
 AR_ACTION_LABELS = {'kick': 'Expulsar', 'ban': 'Banear', 'timeout': 'Timeout 24h'}
 AR_LABELS = {
     'join_threshold': 'Entradas para detectar raid', 'join_window': 'Ventana de entradas (s)',
+    'unverified_bots_enabled': 'Expulsion de bots sin verificacion',
     'alt_days': 'Edad minima de cuenta anti-alt (dias)', 'alt_action': 'Accion anti-alt', 'alt_enabled': 'Anti-alt',
     'action': 'Accion contra raiders',
     'spam_enabled': 'Anti-spam', 'spam_msgs': 'Mensajes para flood', 'spam_window': 'Ventana de flood (s)',
@@ -5613,6 +5615,8 @@ AR_LIMITS = {
 AR_SETTING_ALIASES = {
     'joins': 'join_threshold', 'join': 'join_threshold', 'entradas': 'join_threshold', 'umbral': 'join_threshold',
     'jointhreshold': 'join_threshold',
+    'bots': 'unverified_bots_enabled', 'botsnoverificados': 'unverified_bots_enabled',
+    'botssinverificar': 'unverified_bots_enabled', 'unverifiedbots': 'unverified_bots_enabled',
     'ventana': 'join_window', 'tiempo': 'join_window', 'joinwindow': 'join_window',
     'edadcuenta': 'alt_days', 'edad': 'alt_days', 'altdays': 'alt_days', 'antialt': 'alt_enabled',
     'accionalt': 'alt_action', 'altaccion': 'alt_action',
@@ -5986,12 +5990,26 @@ async def antiraid_on_member_join(member):
     """Devuelve True si el miembro fue sancionado (para saltarse el log de bienvenida)."""
     guild = member.guild
     d = antiraid_data.get(str(guild.id))
-    if not d or member.bot:
+    if not d:
         return False
+    cfg = antiraid_cfg(guild.id)
+    if member.bot:
+        if not cfg['enabled'] or not cfg['unverified_bots_enabled']:
+            return False
+        flags = getattr(member, 'public_flags', None)
+        verified_bot = getattr(flags, 'verified_bot', None)
+        if verified_bot is not False:
+            return False
+        ok, err = await antiraid_punish(member, cfg, 'bot sin insignia verificada', action='kick')
+        e = discord.Embed(title='Anti-Raid: bot sin verificar', color=0xe67e22 if ok else 0xe74c3c)
+        e.add_field(name='Bot', value=f'{member} (`{member.id}`)', inline=True)
+        e.add_field(name='Accion', value='Expulsado' if ok else f'No pude expulsarlo: {err}', inline=False)
+        e.timestamp = datetime.now(timezone.utc)
+        await antiraid_log(guild, e)
+        return ok
     raid_on, alt_on = bool(d.get('enabled')), bool(d.get('alt_enabled'))
     if not (raid_on or alt_on) or antiraid_exempt(member):
         return False
-    cfg = antiraid_cfg(guild.id)
     now = time.time()
     age_days = (datetime.now(timezone.utc) - member.created_at).total_seconds() / 86400
 
@@ -6117,6 +6135,9 @@ def antiraid_status_embed(guild, title='Estado del Anti-Raid'):
             f'Lockdown de {format_duration(cfg["lockdown_secs"])}')
     e.add_field(name='Deteccion de raid', value=raid, inline=False)
     e.add_field(name='Anti-alt', value=antialt_summary(cfg), inline=False)
+    bot_guard = 'Activado' if cfg['unverified_bots_enabled'] and on else (
+        'Configurado; requiere anti-raid activo' if cfg['unverified_bots_enabled'] else 'Desactivado')
+    e.add_field(name='Bots sin verificar', value=bot_guard, inline=False)
     if cfg['spam_enabled']:
         spam = (f'{cfg["spam_msgs"]} mensajes en {cfg["spam_window"]}s = flood\n'
                 f'Menciones max por mensaje: {cfg["mention_limit"] or "sin limite"}\n'
@@ -6196,7 +6217,7 @@ def ar_apply_settings(guild, changes):
         if key in ('action', 'alt_action'):
             if val not in AR_ACTION_LABELS:
                 raise JarvisError('La accion puede ser `kick`, `ban` o `timeout`.')
-        elif key in ('spam_enabled', 'alt_enabled'):
+        elif key in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled'):
             val = bool(val)
         else:
             lo, hi = AR_LIMITS[key]
@@ -6213,7 +6234,7 @@ def ar_apply_settings(guild, changes):
         cfg[key] = val
         if key in ('action', 'alt_action'):
             shown = AR_ACTION_LABELS[val]
-        elif key in ('spam_enabled', 'alt_enabled'):
+        elif key in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled'):
             shown = 'Activado' if val else 'Desactivado'
         else:
             shown = str(val)
@@ -6263,14 +6284,14 @@ async def act_antiraid_config(ctx, intent):
     field = AR_SETTING_ALIASES.get(key)
     if not field:
         raise JarvisError('No se que ajuste quieres cambiar. Puedo: joins, ventana, edad_cuenta, accion, spam, '
-                          'mensajes, menciones, lockdown_tiempo.')
+                          'mensajes, menciones, lockdown_tiempo, bots (expulsar bots sin verificar).')
     txt = normalize_for_compare(intent.text or '')
     num = next((v for v in (intent.value, intent.seconds, intent.amount) if v is not None), None)
     if field in ('action', 'alt_action'):
         val = AR_ACTION_WORDS.get(txt)
         if not val:
             raise JarvisError('La accion puede ser `kick`, `ban` o `timeout`.')
-    elif field in ('spam_enabled', 'alt_enabled'):
+    elif field in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled'):
         if txt in AR_ON_WORDS or num == 1:
             val = True
         elif txt in AR_OFF_WORDS or num == 0:
@@ -6415,6 +6436,7 @@ async def ar_slash_lockdown(interaction: discord.Interaction, estado: app_comman
 @app_commands.describe(
     joins='Entradas necesarias para detectar un raid', ventana='Ventana de tiempo de las entradas (segundos)',
     accion='Que hacer con los raiders',
+    bots='Expulsar bots que no tengan la insignia de verificacion de Discord',
     spam='Activar/desactivar el anti-spam', mensajes='Mensajes para considerar flood',
     menciones='Menciones maximas por mensaje (0 = sin limite)', lockdown_minutos='Duracion del lockdown (minutos)',
 )
@@ -6428,6 +6450,7 @@ async def ar_slash_config(
     joins: app_commands.Range[int, 2, 100] = None,
     ventana: app_commands.Range[int, 2, 300] = None,
     accion: app_commands.Choice[str] = None,
+    bots: bool = None,
     spam: bool = None,
     mensajes: app_commands.Range[int, 3, 50] = None,
     menciones: app_commands.Range[int, 0, 50] = None,
@@ -6437,6 +6460,7 @@ async def ar_slash_config(
     if joins is not None: changes.append(('join_threshold', joins))
     if ventana is not None: changes.append(('join_window', ventana))
     if accion is not None: changes.append(('action', accion.value))
+    if bots is not None: changes.append(('unverified_bots_enabled', bots))
     if spam is not None: changes.append(('spam_enabled', spam))
     if mensajes is not None: changes.append(('spam_msgs', mensajes))
     if menciones is not None: changes.append(('mention_limit', menciones))
@@ -7908,11 +7932,36 @@ async def handle_command(message: discord.Message):
 _slash_sync_done = False
 
 
+async def sync_slash():
+    global _slash_sync_done
+    if _slash_sync_done:
+        return
+    _slash_sync_done = True
+    try:
+        gid = os.environ.get('SLASH_SYNC_GUILD_ID', '').strip()
+        if gid:
+            guild = discord.Object(id=int(gid))
+            client.tree.copy_global_to(guild=guild)
+            synced = await client.tree.sync(guild=guild)
+            scope = f'servidor {gid}'
+        else:
+            synced = await client.tree.sync()
+            scope = 'global'
+        names = sorted(command.name for command in synced)
+        print(f'[Slash] {len(synced)} comandos ({scope}): {", ".join(names)}')
+        faltan = {'auditoria', 'regla_apodo'} - set(names)
+        if faltan:
+            print(f'[Slash] NO llegaron a Discord: {faltan}')
+    except Exception as e:
+        _slash_sync_done = False
+        print(f'[Slash] Error al sincronizar: {type(e).__name__}: {e}')
+
+
 @client.event
 async def on_ready():
-    global _slash_sync_done
     print(f'Bot listo: {client.user}')
     print(f'Conectado a {len(client.guilds)} servidores')
+    spawn(sync_slash())
     await whitelist_boot_sync()
     await blacklist_boot_sync()
     await blacklist_enforce_all_guilds()
@@ -7921,21 +7970,6 @@ async def on_ready():
           f'contexto={JARVIS_CONTEXT_MESSAGES} msgs | confirmar_deducidos={"SI" if JARVIS_CONFIRM_INFERRED else "NO"}')
     print(music_status_line())
     await client.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f'{PREFIX}help | /help'))
-    if not _slash_sync_done:
-        try:
-            sync_guild_id = os.environ.get('SLASH_SYNC_GUILD_ID', '').strip()
-            if sync_guild_id:
-                sync_guild = discord.Object(id=int(sync_guild_id))
-                client.tree.copy_global_to(guild=sync_guild)
-                synced = await client.tree.sync(guild=sync_guild)
-                scope = f' servidor {sync_guild_id}'
-            else:
-                synced = await client.tree.sync()
-                scope = ' globalmente'
-            _slash_sync_done = True
-            print(f'[Slash] Comandos registrados{scope} ({len(synced)}).')
-        except Exception as e:
-            print(f'[Slash] Error al sincronizar: {e}')
     load_reminders(client)
     antiraid_resume()
     temprole_resume()
@@ -9557,6 +9591,8 @@ class MiBot(discord.Client):
 
 
 if __name__ == '__main__':
+    import logging
+    discord.utils.setup_logging(level=logging.INFO)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
