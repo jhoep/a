@@ -5398,6 +5398,49 @@ def tempnick_resume():
         schedule_tempnick(e)
 
 
+NICKRULES_FILE = DATA_DIR / 'nick_rules.json'
+nick_rules = load_json(NICKRULES_FILE, [])   # [{guildId, userId, oldNick, newNick, until}]
+_nickrules_resumed = False
+
+
+def _save_nickrules():
+    save_json(NICKRULES_FILE, nick_rules)
+
+
+async def _fire_nickrule(entry):
+    if entry not in nick_rules:
+        return
+    try:
+        guild = client.get_guild(int(entry['guildId']))
+        if guild:
+            uid = int(entry['userId'])
+            member = guild.get_member(uid) or await guild.fetch_member(uid)
+            if member and member.nick == entry['newNick']:
+                await member.edit(nick=entry['oldNick'], reason='[Jarvis] Fin de la regla de apodo')
+    except Exception as e:
+        print(f'[NickRule] No pude restaurar el apodo: {e}')
+    finally:
+        if entry in nick_rules:
+            nick_rules.remove(entry)
+            _save_nickrules()
+
+
+def schedule_nickrule(entry):
+    async def _wait():
+        await asyncio.sleep(max(0.0, entry['until'] - time.time()))
+        await _fire_nickrule(entry)
+    spawn(_wait())
+
+
+def nickrules_resume():
+    global _nickrules_resumed
+    if _nickrules_resumed:
+        return
+    _nickrules_resumed = True
+    for entry in list(nick_rules):
+        schedule_nickrule(entry)
+
+
 async def collect_member_messages(guild, member, current_channel, max_msgs=40):
     """Mensajes recientes de esa persona: canal actual + otros canales activos que ELLA tambien puede ver."""
     async def scan(ch, limit):
@@ -7833,7 +7876,7 @@ async def handle_command(message: discord.Message):
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline=False)
         embed.add_field(name='Musica', value='`play` (`p`) `playnext` `skip` (`s`) `stop` `pause` `resume` `queue` (`q`)\n`np` `volume` (`vol`) `loop` `shuffle` `remove` `clear` `leave` (`dc`)', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog`\n`/regla_apodo` `/quitar_regla_apodo`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
@@ -7865,6 +7908,7 @@ async def on_ready():
     adminstrip_resume()
     longmute_resume()
     tempnick_resume()
+    nickrules_resume()
     await resume_voice_jails()
     if not giveaway_checker_loop.is_running():
         giveaway_checker_loop.start()
@@ -7991,6 +8035,18 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
+    if before.nick != after.nick:
+        entry = next((e for e in nick_rules
+                      if e['guildId'] == str(after.guild.id) and e['userId'] == str(after.id)), None)
+        if entry:
+            if entry['until'] <= time.time():
+                spawn(_fire_nickrule(entry))
+            elif after.nick != entry['newNick']:
+                try:
+                    await after.edit(nick=entry['newNick'], reason='[Jarvis] Regla de apodo activa')
+                except Exception as e:
+                    print(f'[NickRule] No pude volver a aplicar el apodo a {after.id}: {e}')
+
     # le quitaron el timeout a mano desde Discord -> devolver el rol de administrador
     if before.timed_out_until is not None and after.timed_out_until is None:
         longmute_remove(after.guild.id, after.id)
@@ -8305,6 +8361,111 @@ async def slash_setmodlog(interaction: discord.Interaction, canal: discord.TextC
     modlog_map[str(interaction.guild.id)] = str(canal.id)
     save_json(MODLOG_FILE, modlog_map)
     await interaction.response.send_message(embed=simple_embed('Mod Log Configurado', f'Los logs de moderacion se enviaran a {canal.mention}.', 0x2ecc71))
+
+
+# ── REGLA DE APODO ──
+async def resolve_guild_member(guild, identifier):
+    match = re.fullmatch(r'<@!?(\d{15,21})>|(\d{15,21})', identifier.strip())
+    if not match:
+        raise JarvisError('Indica una mencion o un ID de usuario valido.')
+    user_id = int(match.group(1) or match.group(2))
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.NotFound:
+            raise JarvisError('Ese usuario no pertenece a este servidor.')
+        except Exception as e:
+            raise JarvisError(f'No pude buscar ese usuario: {short_error(e)}')
+    return member
+
+
+def can_manage_member_nickname(guild, actor, member):
+    if not actor.guild_permissions.manage_nicknames:
+        return 'Necesitas el permiso **Manage Nicknames** para usar este comando.'
+    if member.id in (guild.owner_id, client.user.id):
+        return 'No puedo aplicar una regla de apodo a esa persona.'
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_nicknames:
+        return 'Me falta el permiso **Manage Nicknames** para cambiar apodos.'
+    if bot_member.top_role <= member.top_role:
+        return 'Mi rol mas alto debe estar por encima del rol de esa persona.'
+    return None
+
+
+@client.tree.command(name='regla_apodo', description='Forzar un apodo durante un periodo')
+@app_commands.describe(usuario='Mencion o ID de un miembro', apodo='Apodo que Jarvis mantendra', duracion='Duracion (ej: 30m, 2h, 3d)')
+async def slash_regla_apodo(interaction: discord.Interaction, usuario: str, apodo: str, duracion: str):
+    if interaction.guild is None:
+        return await interaction.response.send_message('Este comando solo funciona dentro de un servidor.', ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        member = await resolve_guild_member(interaction.guild, usuario)
+    except JarvisError as e:
+        return await interaction.followup.send(str(e))
+    error = can_manage_member_nickname(interaction.guild, interaction.user, member)
+    if error:
+        return await interaction.followup.send(error)
+
+    nickname = apodo.strip()
+    if not nickname or len(nickname) > 32:
+        return await interaction.followup.send('El apodo debe tener entre 1 y 32 caracteres.')
+    seconds = parse_duration(duracion)
+    if not seconds or seconds < 1 or seconds > 365 * 24 * 3600:
+        return await interaction.followup.send('Duracion invalida. Usa de 1 segundo a 365 dias (ej: 30m, 2h, 3d).')
+
+    existing = next((e for e in nick_rules
+                     if e['guildId'] == str(interaction.guild.id) and e['userId'] == str(member.id)), None)
+    old_nick = existing['oldNick'] if existing else member.nick
+    try:
+        await member.edit(nick=nickname, reason=f'[Jarvis] Regla de apodo por {interaction.user}')
+    except Exception as e:
+        return await interaction.followup.send(f'No pude cambiar el apodo: {short_error(e)}')
+
+    if existing:
+        nick_rules.remove(existing)
+    entry = {
+        'guildId': str(interaction.guild.id),
+        'userId': str(member.id),
+        'oldNick': old_nick,
+        'newNick': nickname,
+        'until': time.time() + seconds,
+    }
+    nick_rules.append(entry)
+    _save_nickrules()
+    schedule_nickrule(entry)
+    await interaction.followup.send(
+        f'Aplicare **{nickname}** a {member.mention} durante **{format_duration(seconds)}**. '
+        f'Jarvis lo volvera a poner si se lo cambian y al terminar restaurara su apodo anterior.',
+    )
+
+
+@client.tree.command(name='quitar_regla_apodo', description='Quitar la regla de apodo de un miembro')
+@app_commands.describe(usuario='Mencion o ID del miembro')
+async def slash_quitar_regla_apodo(interaction: discord.Interaction, usuario: str):
+    if interaction.guild is None:
+        return await interaction.response.send_message('Este comando solo funciona dentro de un servidor.', ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        member = await resolve_guild_member(interaction.guild, usuario)
+    except JarvisError as e:
+        return await interaction.followup.send(str(e))
+    error = can_manage_member_nickname(interaction.guild, interaction.user, member)
+    if error:
+        return await interaction.followup.send(error)
+
+    entry = next((e for e in nick_rules
+                  if e['guildId'] == str(interaction.guild.id) and e['userId'] == str(member.id)), None)
+    if entry is None:
+        return await interaction.followup.send(f'{member.mention} no tiene una regla de apodo activa.')
+    if member.nick == entry['newNick']:
+        try:
+            await member.edit(nick=entry['oldNick'], reason=f'[Jarvis] Regla de apodo retirada por {interaction.user}')
+        except Exception as e:
+            return await interaction.followup.send(f'No pude restaurar el apodo: {short_error(e)}')
+    nick_rules.remove(entry)
+    _save_nickrules()
+    await interaction.followup.send(f'Regla de apodo quitada para {member.mention}.')
 
 
 # ── VOICEJAIL ──
