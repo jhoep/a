@@ -5411,18 +5411,23 @@ async def _fire_nickrule(entry):
     if entry not in nick_rules:
         return
     try:
-        guild = client.get_guild(int(entry['guildId']))
-        if guild:
-            uid = int(entry['userId'])
-            member = guild.get_member(uid) or await guild.fetch_member(uid)
-            if member and member.nick == entry['newNick']:
-                await member.edit(nick=entry['oldNick'], reason='[Jarvis] Fin de la regla de apodo')
+        guild = client.get_guild(int(entry['guildId'])) or await client.fetch_guild(int(entry['guildId']))
+        uid = int(entry['userId'])
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        if member.nick == entry['newNick']:
+            await member.edit(nick=entry['oldNick'], reason='[Jarvis] Fin de la regla de apodo')
+    except discord.NotFound:
+        pass
     except Exception as e:
         print(f'[NickRule] No pude restaurar el apodo: {e}')
-    finally:
-        if entry in nick_rules:
-            nick_rules.remove(entry)
-            _save_nickrules()
+        async def _retry():
+            await asyncio.sleep(60)
+            await _fire_nickrule(entry)
+        spawn(_retry())
+        return
+    if entry in nick_rules:
+        nick_rules.remove(entry)
+        _save_nickrules()
 
 
 def schedule_nickrule(entry):
