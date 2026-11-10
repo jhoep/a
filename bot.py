@@ -9495,9 +9495,6 @@ except Exception as _afk_err:
     print(f'[AFK] No pude registrar los comandos /connect y /anti_disconnect: {_afk_err}')
 
 
-import jarvis_backup
-jarvis_backup.install(sys.modules[__name__])
-
 import jarvis_imagenes
 jarvis_imagenes.install(sys.modules[__name__])
 
