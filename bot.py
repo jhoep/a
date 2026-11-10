@@ -7382,6 +7382,21 @@ async def handle_command(message: discord.Message):
     cmd = args.pop(0).lower()
     guild = message.guild
 
+    if cmd == 'syncslash':
+        if str(message.author.id) != OWNER_ID:
+            return await message.reply('Solo el owner puede sincronizar los slash commands.')
+        if guild is None:
+            return await message.reply('Ejecuta `>>syncslash` dentro del servidor donde quieres actualizar los comandos.')
+        try:
+            sync_guild = discord.Object(id=guild.id)
+            client.tree.copy_global_to(guild=sync_guild)
+            synced = await client.tree.sync(guild=sync_guild)
+            names = ', '.join(sorted(command.name for command in synced))
+            return await message.reply(f'Sincronizados **{len(synced)}** slash commands en **{guild.name}**.\n{names[:1600]}')
+        except Exception as e:
+            print(f'[Slash] Sync manual fallo en {guild.id}: {e}')
+            return await message.reply(f'No pude sincronizar los comandos: {short_error(e)}')
+
     # ── MUSICA (>>play, >>skip, >>queue, ...) ──
     if cmd in MUSIC_PREFIX_CMDS:
         return await handle_music_prefix(message, cmd, args)
@@ -7884,7 +7899,7 @@ async def handle_command(message: discord.Message):
         embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla_apodo`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
-            embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner`\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
+            embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner` `syncslash`\n`>>syncslash` — Sincronizar los slash commands en este servidor\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
         return await message.reply(embed=embed)
 
 # ============================================================================
