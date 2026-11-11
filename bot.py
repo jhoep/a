@@ -700,6 +700,13 @@ def next_delwatch_count(guild_id, user_id):
 # SERVER CONFIG BACKUP (/save)
 # ============================================================================
 async def save_server_config(guild: discord.Guild):
+    member_inventory_error = None
+    if not guild.chunked:
+        try:
+            await guild.chunk()
+        except discord.DiscordException as e:
+            member_inventory_error = str(e)
+
     roles = [
         {
             'id': str(r.id),
@@ -751,11 +758,20 @@ async def save_server_config(guild: discord.Guild):
             'parentName': c.category.name if getattr(c, 'category', None) else None,
             'topic': getattr(c, 'topic', None),
             'nsfw': getattr(c, 'nsfw', False),
+            'private': c.overwrites_for(guild.default_role).view_channel is False,
             'rateLimitPerUser': getattr(c, 'slowmode_delay', None),
             'bitrate': getattr(c, 'bitrate', None),
             'userLimit': getattr(c, 'user_limit', None),
             'permissionOverwrites': overwrites,
         })
+
+    members = [
+        {
+            'id': str(member.id),
+            'roleIds': [str(role.id) for role in member.roles if role.name != '@everyone'],
+        }
+        for member in guild.members
+    ]
 
     backup = {
         'guildId': str(guild.id),
@@ -768,6 +784,9 @@ async def save_server_config(guild: discord.Guild):
         'everyonePermissions': str(guild.default_role.permissions.value),
         'roles': roles,
         'channels': channels,
+        'members': members,
+        'memberInventoryComplete': bool(guild.chunked),
+        'memberInventoryError': member_inventory_error,
         'bots': bots,
         'botInventoryComplete': guild.chunked,
     }
@@ -786,6 +805,7 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
     report = {
         'rolesCreated': 0, 'rolesUpdated': 0, 'rolesDeleted': 0, 'rolesSkipped': 0,
         'channelsCreated': 0, 'channelsUpdated': 0, 'channelsDeleted': 0,
+        'membersUpdated': 0, 'membersSkipped': 0, 'memberRolesSkipped': 0,
         'everyoneUpdated': False,
         'errors': [],
     }
@@ -977,6 +997,8 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
                     edit_opts['bitrate'] = bc['bitrate']
                 if bc.get('userLimit') is not None and hasattr(ch, 'user_limit'):
                     edit_opts['user_limit'] = bc['userLimit']
+                if hasattr(ch, 'nsfw'):
+                    edit_opts['nsfw'] = bc.get('nsfw', False)
                 if parent is not None:
                     edit_opts['category'] = parent
                 await ch.edit(reason='[Restore] Sincronizado con el backup', **edit_opts)
@@ -1014,6 +1036,58 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
         except Exception as e:
             report['errors'].append(f'Borrar canal "{ch.name}": {e}')
 
+    # ------------------------------------------------------ ROLES DE MIEMBROS --
+    saved_members = backup.get('members')
+    if isinstance(saved_members, list):
+        if not guild.chunked:
+            try:
+                await guild.chunk()
+            except discord.DiscordException as e:
+                report['errors'].append(f'No pude cargar la lista completa de miembros: {e}')
+
+        for saved_member in saved_members:
+            try:
+                member_id = int(saved_member['id'])
+                saved_role_ids = saved_member.get('roleIds', [])
+                if not isinstance(saved_role_ids, list):
+                    raise ValueError('roleIds debe ser una lista')
+            except (KeyError, TypeError, ValueError) as e:
+                report['membersSkipped'] += 1
+                report['errors'].append(f'Registro de miembro invalido: {e}')
+                continue
+
+            member = guild.get_member(member_id)
+            if member is None:
+                report['membersSkipped'] += 1
+                continue
+
+            desired_roles = {
+                role for role in member.roles
+                if role.managed or role.position >= my_top_pos
+            }
+            for saved_role_id in saved_role_ids:
+                mapped_role = role_id_map.get(str(saved_role_id))
+                if mapped_role and not mapped_role.managed and mapped_role.position < my_top_pos:
+                    desired_roles.add(mapped_role)
+                else:
+                    report['memberRolesSkipped'] += 1
+
+            current_roles = {
+                role for role in member.roles
+                if role != guild.default_role and not role.managed and role.position < my_top_pos
+            }
+            roles_to_add = [role for role in desired_roles if role not in current_roles]
+            roles_to_remove = [role for role in current_roles if role not in desired_roles]
+            try:
+                if roles_to_add:
+                    await member.add_roles(*roles_to_add, reason='[Restore] Roles del backup')
+                if roles_to_remove:
+                    await member.remove_roles(*roles_to_remove, reason='[Restore] Roles del backup')
+                if roles_to_add or roles_to_remove:
+                    report['membersUpdated'] += 1
+            except discord.DiscordException as e:
+                report['errors'].append(f'Roles de {member} ({member.id}): {e}')
+
     # --------------------------------------------------------- CONFIG BASICA --
     try:
         updates = {}
@@ -1023,10 +1097,17 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
             afk = channel_id_map.get(backup['afkChannelId'])
             if afk:
                 updates['afk_channel'] = afk
+        if backup.get('verificationLevel'):
+            level_name = str(backup['verificationLevel']).split('.')[-1]
+            verification_level = getattr(discord.VerificationLevel, level_name, None)
+            if verification_level is None:
+                report['errors'].append(f'Nivel de verificacion invalido: {backup["verificationLevel"]}')
+            else:
+                updates['verification_level'] = verification_level
         if updates:
             await guild.edit(**updates)
-    except Exception:
-        pass
+    except discord.DiscordException as e:
+        report['errors'].append(f'Configuracion del servidor: {e}')
 
     return report
 # ============================================================================
@@ -1652,6 +1733,10 @@ async def monitor_voice_jail(entry):
 # ============================================================================
 intents = discord.Intents.default()
 intents.guilds = True
+if hasattr(intents, 'moderation'):
+    intents.moderation = True
+elif hasattr(intents, 'bans'):
+    intents.bans = True
 intents.messages = True
 intents.message_content = True
 intents.voice_states = True
@@ -3653,7 +3738,7 @@ ACCIONES (action) y sus campos:
 - antiraid_on | antiraid_off | antiraid_status: activar / desactivar / ver el sistema ANTI-RAID (proteccion contra raids = mucha gente entrando de golpe, y contra spam masivo)
 - antiraid_logs: channel opcional (vacio = canal actual); mode="off" para quitar el canal de logs del anti-raid
 - antiraid_lockdown_on | antiraid_lockdown_off: lockdown de emergencia (sanciona a todo el que entre); duration opcional ("10m")
-- antiraid_config: setting (joins|ventana|edad_cuenta|accion|spam|bots|mensajes|menciones|lockdown_tiempo) + value (numero; los tiempos van en SEGUNDOS, o usa duration) y/o text (kick|ban|timeout para accion; on|off para spam o bots)
+- antiraid_config: setting (joins|ventana|edad_cuenta|accion|spam|bots|bansmasivos|umbralbans|ventanabans|mensajes|menciones|lockdown_tiempo) + value (numero; los tiempos van en SEGUNDOS, o usa duration) y/o text (kick|ban|timeout para accion; on|off para spam, bots o bansmasivos)
 - antialt_on: activar el ANTI-ALT (expulsa/banea cuentas de Discord mas nuevas que X dias). value = edad minima en DIAS, text = accion opcional (kick|ban|timeout) | antialt_off | antialt_status
 - antialt_allow | antialt_disallow: target_ids (o target_query con el ID): dejar entrar a esa persona aunque su cuenta sea nueva / quitar la excepcion
 - blacklist_add | blacklist_remove: target_query (ID, mencion o tag/nombre exacto del servidor); blacklist_show: ver la lista negra. Anadir banea ahora si el usuario ya esta dentro y tambien al volver a entrar.
@@ -4812,7 +4897,7 @@ def build_help_embed():
               '`jarvis activa logs de anti raid en este canal` (o en #canal) / `jarvis quita los logs del anti raid`\n'
               '`jarvis activa el lockdown 15m` / `jarvis quita el lockdown`\n'
               '`jarvis configura el anti raid: 5 joins en 10s, accion ban`\n'
-              '`/antiraid activar|desactivar|estado|logs|lockdown|config`',
+              '`/antiraid activar|desactivar|estado|logs|lockdown|config` (incluye alertas de bans masivos)',
         inline=False,
     )
     embed.add_field(
@@ -4827,7 +4912,7 @@ def build_help_embed():
     embed.add_field(name='Whitelist / Blacklist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (solo owner)\n`/blacklist <ID o tag>` / `/blacklist_remove <ID o tag>` / `/blacklist_list` para la blacklist global del bot', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
-    embed.add_field(name='Backups', value='`/save` — Guardar la configuracion actual del servidor\n`/restore` — Restaurar el servidor a un backup guardado (sube el archivo .json)', inline=False)
+    embed.add_field(name='Backups', value='`/save` — Guardar canales, privacidad/permisos, roles y sus miembros\n`/restore` — Restaurar canales, permisos y asignaciones de roles desde el .json', inline=False)
     return embed
 
 
@@ -5605,6 +5690,9 @@ ANTIRAID_DEFAULTS = {
     'enabled': False,
     'log_channel': None,          # id (str) del canal de logs
     'unverified_bots_enabled': False,
+    'mass_ban_enabled': True,
+    'mass_ban_threshold': 4,
+    'mass_ban_window': 10,
     'join_threshold': 6,          # entradas...
     'join_window': 10,            # ...en estos segundos = raid
     'alt_enabled': False,         # ANTI-ALT: bloquear cuentas de Discord demasiado nuevas al entrar
@@ -5623,6 +5711,9 @@ ANTIRAID_DEFAULTS = {
 AR_ACTION_LABELS = {'kick': 'Expulsar', 'ban': 'Banear', 'timeout': 'Timeout 24h'}
 AR_LABELS = {
     'join_threshold': 'Entradas para detectar raid', 'join_window': 'Ventana de entradas (s)',
+    'mass_ban_enabled': 'Deteccion de bans masivos',
+    'mass_ban_threshold': 'Bans para detectar actividad masiva',
+    'mass_ban_window': 'Ventana de bans (s)',
     'unverified_bots_enabled': 'Expulsion de bots sin verificacion',
     'alt_days': 'Edad minima de cuenta anti-alt (dias)', 'alt_action': 'Accion anti-alt', 'alt_enabled': 'Anti-alt',
     'action': 'Accion contra raiders',
@@ -5630,12 +5721,19 @@ AR_LABELS = {
     'mention_limit': 'Limite de menciones', 'lockdown_secs': 'Duracion del lockdown (s)',
 }
 AR_LIMITS = {
-    'join_threshold': (2, 100), 'join_window': (2, 300), 'alt_days': (1, 3650),
+    'join_threshold': (2, 100), 'join_window': (2, 300),
+    'mass_ban_threshold': (2, 100), 'mass_ban_window': (2, 300),
+    'alt_days': (1, 3650),
     'spam_msgs': (3, 50), 'spam_window': (2, 60), 'mention_limit': (0, 50), 'lockdown_secs': (30, 86400),
 }
 AR_SETTING_ALIASES = {
     'joins': 'join_threshold', 'join': 'join_threshold', 'entradas': 'join_threshold', 'umbral': 'join_threshold',
     'jointhreshold': 'join_threshold',
+    'massban': 'mass_ban_enabled', 'massbans': 'mass_ban_enabled',
+    'bansmasivos': 'mass_ban_enabled', 'banesmasivos': 'mass_ban_enabled',
+    'umbralbans': 'mass_ban_threshold', 'limitebans': 'mass_ban_threshold',
+    'massbanthreshold': 'mass_ban_threshold', 'ventanabans': 'mass_ban_window',
+    'massbanwindow': 'mass_ban_window',
     'bots': 'unverified_bots_enabled', 'botsnoverificados': 'unverified_bots_enabled',
     'botssinverificar': 'unverified_bots_enabled', 'unverifiedbots': 'unverified_bots_enabled',
     'ventana': 'join_window', 'tiempo': 'join_window', 'joinwindow': 'join_window',
@@ -5658,6 +5756,7 @@ AR_ON_WORDS = {'on', 'si', 'yes', 'true', '1', 'activar', 'activado', 'activa', 
 AR_OFF_WORDS = {'off', 'no', 'false', '0', 'desactivar', 'desactivado', 'desactiva', 'disable'}
 
 antiraid_joins = {}          # guildId -> deque([(ts, member_id)])
+antiraid_bans = {}           # guildId -> deque([(ts, user_id)])
 antiraid_msgs = {}           # (guildId, userId) -> deque([(ts, message_id, channel_id, hash)])
 antiraid_blocked = {}        # guildId -> [texto, ...]  (para agrupar logs durante un raid)
 antiraid_flush_tasks = {}
@@ -6058,6 +6157,55 @@ async def antiraid_on_member_join(member):
     return False
 
 
+async def antiraid_on_member_ban(guild, user):
+    """Detecta y registra una rafaga de bans; nunca sanciona al moderador automaticamente."""
+    if not antiraid_active(guild.id):
+        return
+    cfg = antiraid_cfg(guild.id)
+    if not cfg['mass_ban_enabled']:
+        return
+
+    now = time.time()
+    bans = antiraid_bans.setdefault(guild.id, deque(maxlen=200))
+    bans.append((now, user.id))
+    recent = [(ts, uid) for ts, uid in bans if now - ts <= cfg['mass_ban_window']]
+    if len(recent) < cfg['mass_ban_threshold']:
+        return
+    bans.clear()
+
+    moderator = None
+    try:
+        async for entry in guild.audit_logs(limit=20, action=discord.AuditLogAction.ban):
+            if (getattr(entry.target, 'id', None) == user.id
+                    and (datetime.now(timezone.utc) - entry.created_at).total_seconds() <= 30):
+                moderator = entry.user
+                break
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f'[AntiRaid] No pude consultar quien realizo los bans en {guild.id}: {e}')
+
+    banned_ids = list(dict.fromkeys(uid for _ts, uid in recent))
+    embed = discord.Embed(
+        title='Anti-Raid: bans masivos detectados',
+        description=f'{len(recent)} bans en {cfg["mass_ban_window"]} segundos '
+                    f'(umbral: {cfg["mass_ban_threshold"]}).',
+        color=0xe74c3c,
+    )
+    embed.add_field(
+        name='Usuarios baneados',
+        value='\n'.join(f'`{uid}`' for uid in banned_ids[:15])
+              + (f'\n... y {len(banned_ids) - 15} mas' if len(banned_ids) > 15 else ''),
+        inline=False,
+    )
+    embed.add_field(
+        name='Moderador',
+        value=f'{moderator} (`{moderator.id}`)' if moderator else 'No identificado (revisa el permiso View Audit Log)',
+        inline=False,
+    )
+    embed.set_footer(text='Se registro y notifico el evento; no se aplicaron sanciones automaticas.')
+    embed.timestamp = datetime.now(timezone.utc)
+    await antiraid_log(guild, embed)
+
+
 def antiraid_msg_exempt_cleanup(now):
     if len(antiraid_msgs) > 4000:
         for k in [k for k, v in antiraid_msgs.items() if not v or now - v[-1][0] > 120]:
@@ -6139,14 +6287,15 @@ async def antiraid_on_message(message):
 def ar_missing_perms(guild):
     p = guild.me.guild_permissions
     need = {'kick_members': 'Kick Members', 'ban_members': 'Ban Members',
-            'moderate_members': 'Timeout Members', 'manage_messages': 'Manage Messages'}
+            'moderate_members': 'Timeout Members', 'manage_messages': 'Manage Messages',
+            'view_audit_log': 'View Audit Log'}
     return [label for attr, label in need.items() if not getattr(p, attr, False)]
 
 
 def antiraid_status_embed(guild, title='Estado del Anti-Raid'):
     cfg = antiraid_cfg(guild.id)
     on = cfg['enabled']
-    e = simple_embed(title, 'Proteccion contra raids (entradas masivas) y spam masivo.', 0x2ecc71 if on else 0x95a5a6)
+    e = simple_embed(title, 'Proteccion contra raids, bans masivos, bots no verificados y spam.', 0x2ecc71 if on else 0x95a5a6)
     e.add_field(name='Estado', value='Activado' if on else 'Desactivado', inline=True)
     locked = time.time() < cfg['lockdown_until']
     e.add_field(name='Lockdown', value=f'ACTIVO hasta <t:{int(cfg["lockdown_until"])}:R>' if locked else 'Apagado', inline=True)
@@ -6155,6 +6304,13 @@ def antiraid_status_embed(guild, title='Estado del Anti-Raid'):
             f'Accion: **{AR_ACTION_LABELS.get(cfg["action"], cfg["action"])}**\n'
             f'Lockdown de {format_duration(cfg["lockdown_secs"])}')
     e.add_field(name='Deteccion de raid', value=raid, inline=False)
+    if not cfg['mass_ban_enabled']:
+        mass_bans = 'Desactivada'
+    elif on:
+        mass_bans = f'{cfg["mass_ban_threshold"]} bans en {cfg["mass_ban_window"]}s'
+    else:
+        mass_bans = 'Configurada; requiere anti-raid activo'
+    e.add_field(name='Deteccion de bans masivos', value=mass_bans, inline=False)
     e.add_field(name='Anti-alt', value=antialt_summary(cfg), inline=False)
     bot_guard = 'Activado' if cfg['unverified_bots_enabled'] and on else (
         'Configurado; requiere anti-raid activo' if cfg['unverified_bots_enabled'] else 'Desactivado')
@@ -6238,7 +6394,7 @@ def ar_apply_settings(guild, changes):
         if key in ('action', 'alt_action'):
             if val not in AR_ACTION_LABELS:
                 raise JarvisError('La accion puede ser `kick`, `ban` o `timeout`.')
-        elif key in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled'):
+        elif key in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled', 'mass_ban_enabled'):
             val = bool(val)
         else:
             lo, hi = AR_LIMITS[key]
@@ -6255,7 +6411,7 @@ def ar_apply_settings(guild, changes):
         cfg[key] = val
         if key in ('action', 'alt_action'):
             shown = AR_ACTION_LABELS[val]
-        elif key in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled'):
+        elif key in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled', 'mass_ban_enabled'):
             shown = 'Activado' if val else 'Desactivado'
         else:
             shown = str(val)
@@ -6305,22 +6461,22 @@ async def act_antiraid_config(ctx, intent):
     field = AR_SETTING_ALIASES.get(key)
     if not field:
         raise JarvisError('No se que ajuste quieres cambiar. Puedo: joins, ventana, edad_cuenta, accion, spam, '
-                          'mensajes, menciones, lockdown_tiempo, bots (expulsar bots sin verificar).')
+                          'mensajes, menciones, lockdown_tiempo, bots, bansmasivos, umbralbans o ventanabans.')
     txt = normalize_for_compare(intent.text or '')
     num = next((v for v in (intent.value, intent.seconds, intent.amount) if v is not None), None)
     if field in ('action', 'alt_action'):
         val = AR_ACTION_WORDS.get(txt)
         if not val:
             raise JarvisError('La accion puede ser `kick`, `ban` o `timeout`.')
-    elif field in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled'):
+    elif field in ('spam_enabled', 'alt_enabled', 'unverified_bots_enabled', 'mass_ban_enabled'):
         if txt in AR_ON_WORDS or num == 1:
             val = True
         elif txt in AR_OFF_WORDS or num == 0:
             val = False
         else:
-            raise JarvisError('Quieres el anti-spam activado o desactivado?')
+            raise JarvisError('Indica on u off para activar o desactivar este ajuste.')
     else:
-        if intent.duration and field in ('join_window', 'spam_window', 'lockdown_secs'):
+        if intent.duration and field in ('join_window', 'spam_window', 'lockdown_secs', 'mass_ban_window'):
             num = parse_natural_duration(intent.duration)
         if num is None:
             raise JarvisError('Que valor le pongo?')
@@ -6458,6 +6614,9 @@ async def ar_slash_lockdown(interaction: discord.Interaction, estado: app_comman
     joins='Entradas necesarias para detectar un raid', ventana='Ventana de tiempo de las entradas (segundos)',
     accion='Que hacer con los raiders',
     bots='Expulsar bots que no tengan la insignia de verificacion de Discord',
+    bans_masivos='Detectar y registrar bans masivos, sin sancionar automaticamente',
+    limite_bans='Cantidad de bans para activar la alerta',
+    ventana_bans='Ventana de tiempo para contar los bans (segundos)',
     spam='Activar/desactivar el anti-spam', mensajes='Mensajes para considerar flood',
     menciones='Menciones maximas por mensaje (0 = sin limite)', lockdown_minutos='Duracion del lockdown (minutos)',
 )
@@ -6472,6 +6631,9 @@ async def ar_slash_config(
     ventana: app_commands.Range[int, 2, 300] = None,
     accion: app_commands.Choice[str] = None,
     bots: bool = None,
+    bans_masivos: bool = None,
+    limite_bans: app_commands.Range[int, 2, 100] = None,
+    ventana_bans: app_commands.Range[int, 2, 300] = None,
     spam: bool = None,
     mensajes: app_commands.Range[int, 3, 50] = None,
     menciones: app_commands.Range[int, 0, 50] = None,
@@ -6482,6 +6644,9 @@ async def ar_slash_config(
     if ventana is not None: changes.append(('join_window', ventana))
     if accion is not None: changes.append(('action', accion.value))
     if bots is not None: changes.append(('unverified_bots_enabled', bots))
+    if bans_masivos is not None: changes.append(('mass_ban_enabled', bans_masivos))
+    if limite_bans is not None: changes.append(('mass_ban_threshold', limite_bans))
+    if ventana_bans is not None: changes.append(('mass_ban_window', ventana_bans))
     if spam is not None: changes.append(('spam_enabled', spam))
     if mensajes is not None: changes.append(('spam_msgs', mensajes))
     if menciones is not None: changes.append(('mention_limit', menciones))
@@ -7427,6 +7592,36 @@ async def handle_command(message: discord.Message):
     cmd = args.pop(0).lower()
     guild = message.guild
 
+    if cmd == 'quitar_icono':
+        if guild is None:
+            return await message.reply('Este comando solo funciona dentro de un servidor.')
+        if not guild.me.guild_permissions.manage_channels:
+            return await message.reply('Necesito el permiso **Manage Channels** para cambiar nombres de canales.')
+        changed, skipped, errors = 0, 0, []
+        for channel in guild.channels:
+            if '🩸' not in channel.name:
+                continue
+            new_name = channel.name.replace('🩸', '').strip()
+            if not new_name:
+                skipped += 1
+                continue
+            try:
+                await channel.edit(name=new_name, reason=f'[quitar_icono] Solicitado por {message.author}')
+                changed += 1
+            except discord.DiscordException as e:
+                errors.append(f'{channel.name}: {short_error(e)}')
+                print(f'[quitar_icono] No pude cambiar el canal {channel.id}: {e}')
+        if not changed and not skipped and not errors:
+            return await message.reply('No encontre 🩸 en los nombres de los canales.')
+        summary = f'Quite 🩸 de **{changed}** canal(es).'
+        if skipped:
+            summary += f'\nOmiti **{skipped}** canal(es) porque el nombre quedaria vacio.'
+        if errors:
+            summary += f'\nNo pude cambiar **{len(errors)}** canal(es):\n' + '\n'.join(errors[:5])
+            if len(errors) > 5:
+                summary += f'\n... y {len(errors) - 5} mas.'
+        return await message.reply(summary)
+
     if cmd == 'syncslash':
         if str(message.author.id) != OWNER_ID:
             return await message.reply('Solo el owner puede sincronizar los slash commands.')
@@ -7939,7 +8134,7 @@ async def handle_command(message: discord.Message):
         embed = discord.Embed(title='Comandos Disponibles', description=f'Prefijo: `{PREFIX}`', color=0x5865F2)
         embed.timestamp = datetime.now(timezone.utc)
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
-        embed.add_field(name='Utilidades', value='`ping` `robar`\n`jarvis <pregunta>` - Asistente IA', inline=False)
+        embed.add_field(name='Utilidades', value='`ping` `robar` `quitar_icono` (quita 🩸 de los canales)\n`jarvis <pregunta>` - Asistente IA', inline=False)
         embed.add_field(name='Musica', value='`play` (`p`) `playnext` `skip` (`s`) `stop` `pause` `resume` `queue` (`q`)\n`np` `volume` (`vol`) `loop` `shuffle` `remove` `clear` `leave` (`dc`)', inline=False)
         embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla_apodo`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
@@ -8191,6 +8386,14 @@ async def on_member_join(member: discord.Member):
     embed.add_field(name='Miembros totales', value=str(member.guild.member_count), inline=True)
     embed.timestamp = datetime.now(timezone.utc)
     await send_mod_log(client, member.guild.id, embed)
+
+
+@client.event
+async def on_member_ban(guild: discord.Guild, user: discord.User):
+    try:
+        await antiraid_on_member_ban(guild, user)
+    except discord.DiscordException as e:
+        print(f'[AntiRaid] on_member_ban: {e}')
 
 
 @client.event
@@ -8826,6 +9029,7 @@ async def slash_borrar_mensajes_persona(interaction: discord.Interaction, usuari
 
 # ── SAVE ──
 @client.tree.command(name='save', description='Guarda la configuracion actual del servidor (canales, roles, etc.)')
+@app_commands.guild_only()
 async def slash_save(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message('Necesitas permisos de **Administrador** para usar este comando.', ephemeral=True)
@@ -8838,6 +9042,11 @@ async def slash_save(interaction: discord.Interaction):
             f'Se guardo una copia de la configuracion de **{interaction.guild.name}**.\n\n'
             f'**Roles guardados:** {len(backup["roles"])}\n'
             f'**Canales guardados:** {len(backup["channels"])}\n'
+            f'**Canales privados:** {sum(1 for channel in backup["channels"] if channel["private"])}\n'
+            f'**Miembros con roles guardados:** {len(backup["members"])}'
+            + ('' if backup['memberInventoryComplete'] else ' (lista posiblemente incompleta)')
+            + (f'\nAviso al cargar miembros: {backup["memberInventoryError"]}' if backup['memberInventoryError'] else '')
+            + '\n'
             f'**Bots encontrados:** {len(backup["bots"])}'
             + ('' if backup['botInventoryComplete'] else ' (lista posiblemente incompleta)')
             + '\nLos bots no se pueden invitar automaticamente; el backup incluye enlaces para agregarlos manualmente.\n'
@@ -8905,6 +9114,20 @@ async def slash_restore(interaction: discord.Interaction, archivo: discord.Attac
             value=f'Creados: **{report["channelsCreated"]}**\nActualizados: **{report["channelsUpdated"]}**\nBorrados: **{report["channelsDeleted"]}**',
             inline=True,
         )
+        if isinstance(backup.get('members'), list):
+            embed.add_field(
+                name='Roles de miembros',
+                value=f'Miembros actualizados: **{report["membersUpdated"]}**\n'
+                      f'Miembros omitidos/no encontrados: **{report["membersSkipped"]}**\n'
+                      f'Roles omitidos: **{report["memberRolesSkipped"]}**',
+                inline=True,
+            )
+            if backup.get('memberInventoryComplete') is False:
+                embed.add_field(
+                    name='Aviso del backup',
+                    value='La lista de miembros del backup estaba incompleta; algunos roles pueden no haberse guardado.',
+                    inline=False,
+                )
         if backup.get('everyonePermissions') is not None:
             embed.add_field(
                 name='Permisos de @everyone',
