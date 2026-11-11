@@ -63,6 +63,7 @@ MODLOG_FILE    = DATA_DIR / 'modlog_channels.json'
 WARNS_FILE     = DATA_DIR / 'warnings.json'
 XPCHANNELS_FILE = DATA_DIR / 'xp_channels.json'
 DELWATCH_FILE  = DATA_DIR / 'delwatch.json'
+DELWATCH_COUNTS_FILE = DATA_DIR / 'delwatch_counts.json'
 WHITELIST_FILE = DATA_DIR / 'whitelist.json'
 VOICEKICK_FILE = DATA_DIR / 'voicekick.json'
 BACKUP_DIR     = DATA_DIR / 'backups'
@@ -98,6 +99,9 @@ modlog_map     = load_json(MODLOG_FILE, {})
 warnings_data  = load_json(WARNS_FILE, {})
 xp_channels    = load_json(XPCHANNELS_FILE, {})   # { guildId: channelId | 'all' }
 del_watch_data = load_json(DELWATCH_FILE, {})     # { guildId: [userId, ...] }
+delwatch_counts = load_json(DELWATCH_COUNTS_FILE, {})  # { guildId: { userId: count } }
+if not isinstance(delwatch_counts, dict):
+    delwatch_counts = {}
 
 
 # ============================================================================
@@ -676,6 +680,22 @@ def remove_delwatch(guild_id, user_id):
         return
     del_watch_data[guild_id] = [u for u in del_watch_data[guild_id] if u != str(user_id)]
     save_json(DELWATCH_FILE, del_watch_data)
+
+
+def next_delwatch_count(guild_id, user_id):
+    guild_id = str(guild_id)
+    user_id = str(user_id)
+    guild_counts = delwatch_counts.get(guild_id)
+    if not isinstance(guild_counts, dict):
+        guild_counts = {}
+        delwatch_counts[guild_id] = guild_counts
+    try:
+        count = int(guild_counts.get(user_id, 0)) + 1
+    except (TypeError, ValueError):
+        count = 1
+    guild_counts[user_id] = count
+    save_json(DELWATCH_COUNTS_FILE, delwatch_counts)
+    return count
 # ============================================================================
 # SERVER CONFIG BACKUP (/save)
 # ============================================================================
@@ -5155,7 +5175,8 @@ async def act_autodelete_on(ctx, t, intent):
     add_delwatch(ctx.guild.id, t.id)
     extra = '\nTus mensajes que empiecen con `jarvis` no se borran, para que puedas quitarlo.' if t.id == ctx.author.id else ''
     return simple_embed('Regla Activada: borrar mensajes',
-                        f'Se borrara cada mensaje nuevo de **{t.name}**.{extra}', 0xe74c3c)
+                        f'Se borrara cada mensaje nuevo de **{t.name}** y Jarvis mostrara su contenido '
+                        f'con un `>>scope` numerado.{extra}', 0xe74c3c)
 
 
 async def act_autodelete_off(ctx, t, intent):
@@ -8006,8 +8027,24 @@ async def on_message(message: discord.Message):
             and not (JARVIS_TRIGGER.match(message.content) and str(message.author.id) in JARVIS_WHITELIST)):
         try:
             await message.delete()
-        except Exception:
-            pass
+        except discord.DiscordException as e:
+            print(f'[AutoDelete] No pude borrar el mensaje {message.id}: {e}')
+            return
+
+        scope = next_delwatch_count(message.guild.id, message.author.id)
+        embed = discord.Embed(
+            title=f'>>scope {scope} · mensaje borrado',
+            description=message.content or '(sin texto)',
+            color=0xe74c3c,
+        )
+        embed.set_author(name=f'{message.author} ({message.author.id})')
+        try:
+            await message.channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.DiscordException as e:
+            print(f'[AutoDelete] No pude mostrar el mensaje {message.id} borrado: {e}')
         return
 
     # ── ANTI-RAID (anti-spam): flood, menciones masivas, mismo mensaje en varios canales ──
@@ -8778,7 +8815,8 @@ async def slash_borrar_mensajes_persona(interaction: discord.Interaction, usuari
     add_delwatch(guild.id, usuario.id)
     embed = simple_embed(
         'Borrado Automatico Activado',
-        f'A partir de ahora se borrara **automaticamente** cada mensaje que envie {usuario.mention} en este servidor.\n'
+        f'A partir de ahora se borrara **automaticamente** cada mensaje que envie {usuario.mention} en este servidor '
+        f'y Jarvis mostrara el contenido borrado con un `>>scope` numerado.\n'
         f'Usa `/borrar_mensajes_persona usuario:{usuario.name} desactivar:true` para detenerlo.',
         0xe74c3c,
     )
