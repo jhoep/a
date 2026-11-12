@@ -927,14 +927,14 @@ async def restore_server_config(guild: discord.Guild, backup: dict):
 
     def map_overwrites(bc):
         result = {}
+        backup_guild_id = str(backup.get('guildId', guild.id))
         for o in bc.get('permissionOverwrites', []):
             target = None
             if o['type'] == 0:  # role
-                mapped = role_id_map.get(o['id'])
-                if mapped:
-                    target = mapped
-                elif int(o['id']) == guild.id:
-                    target = guild.get_role(int(o['id']))
+                if str(o['id']) == backup_guild_id:
+                    target = guild.default_role
+                else:
+                    target = role_id_map.get(str(o['id']))
             else:  # member
                 target = guild.get_member(int(o['id'])) or discord.Object(id=int(o['id']))
             if not target:
