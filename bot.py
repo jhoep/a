@@ -5095,15 +5095,9 @@ def _check_quarantine_permissions(ctx, target):
         raise JarvisError(f'Mi rol debe estar por encima de todos los roles de {target.member}.')
     if target.member.voice and target.member.voice.channel and not bot_permissions.move_members:
         raise JarvisError('A Jarvis le falta **Move Members** para desconectar a esa persona de voz.')
-    if (ctx.author.id != ctx.guild.owner_id
+    if (str(ctx.author.id) != OWNER_ID
             and ctx.author.top_role <= target.member.top_role):
         raise JarvisError(f'Tu rol debe estar por encima de todos los roles de {target.member}.')
-    managed_roles = [role for role in target.member.roles if not role.is_default() and role.managed]
-    if managed_roles:
-        raise JarvisError(
-            f'No puedo quitar roles administrados por integraciones de {target.member}: '
-            + ', '.join(role.name for role in managed_roles[:5])
-        )
 
 
 async def act_quarantine(ctx, t, intent):
@@ -5118,11 +5112,11 @@ async def act_quarantine(ctx, t, intent):
         member_overwrites = []
         for channel in ctx.guild.channels:
             overwrite = channel.overwrites_for(t.member)
-            if not overwrite.is_empty():
-                member_overwrites.append({
-                    'channelId': str(channel.id),
-                    **_serialize_overwrite(overwrite),
-                })
+            member_overwrites.append({
+                'channelId': str(channel.id),
+                'hadOverwrite': not overwrite.is_empty(),
+                **_serialize_overwrite(overwrite),
+            })
         entry = {
             'guildId': str(ctx.guild.id),
             'userId': str(t.id),
@@ -5166,12 +5160,10 @@ async def act_quarantine(ctx, t, intent):
     if until is not None:
         schedule_quarantine(entry)
         return (
-            f'{t.member.mention} quedo en **quarantine** durante **{format_duration(until - time.time())}**. '
-            f'Le quite sus roles previos; se restauraran al vencer la cuarentena.'
+            f'{t.member.mention} quedo con **quarantine** durante **{format_duration(until - time.time())}**.'
         )
     return (
-        f'{t.member.mention} quedo en **quarantine permanente**. Le quite sus roles previos; '
-        'se restauraran al usar `>>unquarantine` o pedirle a Jarvis que lo libere.'
+        f'{t.member.mention} quedo en **quarantine permanente**.'
     )
 
 
@@ -6148,19 +6140,32 @@ async def _ensure_quarantine_role(guild, bot_member):
 async def _apply_quarantine_overwrites(guild, member, role, entry):
     original_by_channel = {item['channelId']: item for item in entry.get('channelOverwrites', [])}
     for channel in guild.channels:
+        channel_id = str(channel.id)
+        original = original_by_channel.get(channel_id)
+        if original is None:
+            overwrite = channel.overwrites_for(member)
+            original = {
+                'channelId': channel_id,
+                'hadOverwrite': not overwrite.is_empty(),
+                **_serialize_overwrite(overwrite),
+            }
+            entry.setdefault('channelOverwrites', []).append(original)
+            original_by_channel[channel_id] = original
+
         role_overwrite = _quarantine_overwrite(channel.overwrites_for(role))
         if channel.overwrites_for(role) != role_overwrite:
             await channel.set_permissions(
                 role, overwrite=role_overwrite, reason='[Jarvis] Bloquear canales al rol quarantine',
             )
 
-        original = original_by_channel.get(str(channel.id))
-        if original:
+        member_overwrite = _quarantine_overwrite(_deserialize_overwrite(original))
+        if channel.overwrites_for(member) != member_overwrite:
             await channel.set_permissions(
                 member,
-                overwrite=_quarantine_overwrite(_deserialize_overwrite(original)),
+                overwrite=member_overwrite,
                 reason='[Jarvis] Impedir permisos individuales durante quarantine',
             )
+    _save_quarantines()
 
 
 async def _enforce_quarantine(guild, member, entry):
@@ -6170,7 +6175,14 @@ async def _enforce_quarantine(guild, member, entry):
     role = await _ensure_quarantine_role(guild, bot_member)
     entry['roleId'] = str(role.id)
     await _apply_quarantine_overwrites(guild, member, role, entry)
-    await member.edit(roles=[role], reason='[Jarvis] Aplicar quarantine')
+    removable_roles = [
+        current_role for current_role in member.roles
+        if not current_role.is_default() and not current_role.managed and current_role != role
+    ]
+    if removable_roles:
+        await member.remove_roles(*removable_roles, reason='[Jarvis] Quitar roles durante quarantine')
+    if role not in member.roles:
+        await member.add_roles(role, reason='[Jarvis] Aplicar quarantine')
     if member.voice and member.voice.channel:
         if not bot_member.guild_permissions.move_members:
             raise JarvisError('A Jarvis le falta **Move Members** para desconectar de voz.')
@@ -6189,10 +6201,11 @@ async def _enforce_quarantine_channel(channel, entry):
     entry['roleId'] = str(role.id)
 
     original = channel.overwrites_for(member)
-    if not original.is_empty() and not any(
-            saved['channelId'] == str(channel.id) for saved in entry.get('channelOverwrites', [])):
+    if not any(saved['channelId'] == str(channel.id)
+               for saved in entry.get('channelOverwrites', [])):
         entry.setdefault('channelOverwrites', []).append({
             'channelId': str(channel.id),
+            'hadOverwrite': not original.is_empty(),
             **_serialize_overwrite(original),
         })
         _save_quarantines()
@@ -6200,12 +6213,11 @@ async def _enforce_quarantine_channel(channel, entry):
     await channel.set_permissions(
         role, overwrite=role_overwrite, reason='[Jarvis] Bloquear canal nuevo al rol quarantine',
     )
-    if not original.is_empty():
-        await channel.set_permissions(
-            member,
-            overwrite=_quarantine_overwrite(original),
-            reason='[Jarvis] Bloquear permiso individual durante quarantine',
-        )
+    await channel.set_permissions(
+        member,
+        overwrite=_quarantine_overwrite(original),
+        reason='[Jarvis] Bloquear permiso individual durante quarantine',
+    )
 
 
 async def _restore_quarantine(entry):
@@ -6214,15 +6226,26 @@ async def _restore_quarantine(entry):
     member = guild.get_member(uid) or await guild.fetch_member(uid)
 
     roles = [guild.get_role(int(role_id)) for role_id in entry.get('roleIds', [])]
-    roles = [role for role in roles if role is not None]
-    await member.edit(roles=roles, reason='[Jarvis] Fin de quarantine: restaurar roles')
+    roles = [role for role in roles
+             if role is not None and not role.is_default() and not role.managed
+             and role not in member.roles]
+    if roles:
+        await member.add_roles(*roles, reason='[Jarvis] Fin de quarantine: restaurar roles')
+    quarantine_role = guild.get_role(int(entry['roleId']))
+    if quarantine_role is not None and quarantine_role in member.roles:
+        await member.remove_roles(
+            quarantine_role, reason='[Jarvis] Fin de quarantine: quitar rol de quarantine',
+        )
 
     for saved in entry.get('channelOverwrites', []):
         channel = guild.get_channel(int(saved['channelId']))
         if channel is not None:
             await channel.set_permissions(
                 member,
-                overwrite=_deserialize_overwrite(saved),
+                overwrite=(
+                    _deserialize_overwrite(saved)
+                    if saved.get('hadOverwrite', True) else None
+                ),
                 reason='[Jarvis] Restaurar permisos previos a quarantine',
             )
 
