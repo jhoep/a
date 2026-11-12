@@ -3861,6 +3861,7 @@ TARGET_ACTIONS = {
     'ban', 'kick', 'warn', 'timeout', 'untimeout', 'unban', 'voice_disconnect', 'voice_move',
     'role_add', 'role_remove', 'nick', 'dm', 'avatar', 'userinfo', 'whitelist_add', 'whitelist_remove',
     'warns_show', 'warns_clear', 'voice_autokick', 'voice_autokick_off', 'autodelete_on', 'autodelete_off',
+    'quarantine', 'unquarantine',
 }
 PLAIN_ACTIONS = {
     'purge', 'slowmode', 'lock', 'unlock', 'list_roles', 'say', 'whitelist_show', 'members_count',
@@ -3878,7 +3879,7 @@ SELF_DEFAULT_ACTIONS = {'role_add', 'role_remove', 'avatar', 'userinfo', 'voice_
 CONFIRM_ACTIONS = {
     'ban', 'kick', 'warn', 'timeout', 'unban', 'role_add', 'role_remove', 'nick', 'dm',
     'voice_disconnect', 'voice_move', 'whitelist_add', 'whitelist_remove', 'warns_clear',
-    'voice_autokick', 'autodelete_on',
+    'voice_autokick', 'autodelete_on', 'quarantine', 'unquarantine',
 }
 OWNER_ONLY_ACTIONS = {'whitelist_add', 'whitelist_remove', 'leave_server'}
 PLAIN_CONFIRM = {'leave_server', 'delete_channel', 'delete_role', 'blacklist_add'}   # siempre piden confirmacion
@@ -3894,6 +3895,7 @@ ACTION_LABELS = {
     'dm': 'Enviar mensaje privado', 'voice_disconnect': 'Sacar de voz', 'voice_move': 'Mover de canal de voz',
     'whitelist_add': 'Anadir a la whitelist', 'whitelist_remove': 'Quitar de la whitelist',
     'leave_server': 'Salir del servidor',
+    'quarantine': 'Poner en quarantine', 'unquarantine': 'Sacar de quarantine',
     'create_channel': 'Crear canal', 'delete_channel': 'Eliminar canal', 'edit_channel': 'Editar canal',
     'create_role': 'Crear rol', 'delete_role': 'Eliminar rol', 'edit_role': 'Editar rol',
     'edit_server': 'Editar servidor', 'create_invite': 'Crear invitacion',
@@ -4080,6 +4082,8 @@ Para ordenes de VARIOS pasos responde {"actions":[{...},{...}]} (maximo 8 pasos,
 ACCIONES (action) y sus campos:
 - ban | kick | warn: target_ids, reason
 - timeout: target_ids, duration ("10m","2h","1d"), reason
+- quarantine: target_ids, duration opcional (sin duracion = permanente; acepta segundos, minutos, horas, dias o semanas, maximo 365 dias). Pone un rol rojo `quarantine`, quita los demas roles, oculta todos los canales y restaura roles/permisos al vencer.
+- unquarantine: target_ids. Quita la cuarentena y devuelve los roles/permisos anteriores.
 - untimeout | unban: target_ids (o target_query con el nombre/ID si ya no esta en el chat)
 - purge: amount (1-500); target_ids opcional = borrar solo los mensajes de esa persona
 - slowmode: seconds (0 = quitar), channel opcional | lock | unlock: channel opcional (vacio = canal actual)
@@ -5067,6 +5071,134 @@ async def act_role_remove(ctx, t, intent):
     return embed
 
 
+def _quarantine_until(duration):
+    if not duration or normalize_for_compare(duration) in {
+            'perma', 'permanente', 'permanent', 'para siempre', 'forever'}:
+        return None
+    seconds = parse_natural_duration(duration)
+    if not seconds or seconds > 365 * 24 * 3600:
+        raise JarvisError(
+            f'No entendi la duracion `{duration}`. Usa segundos, minutos, horas, dias o semanas '
+            '(maximo 365 dias), o indica `permanente`.'
+        )
+    return time.time() + seconds
+
+
+def _check_quarantine_permissions(ctx, target):
+    actor_permissions = ctx.author.guild_permissions
+    if not actor_permissions.manage_roles or not actor_permissions.manage_channels:
+        raise JarvisError('Necesitas **Manage Roles** y **Manage Channels** para usar quarantine.')
+    bot_permissions = ctx.me.guild_permissions if ctx.me else None
+    if bot_permissions is None or not bot_permissions.manage_roles or not bot_permissions.manage_channels:
+        raise JarvisError('A Jarvis le faltan **Manage Roles** o **Manage Channels**.')
+    if ctx.me.top_role <= target.member.top_role:
+        raise JarvisError(f'Mi rol debe estar por encima de todos los roles de {target.member}.')
+    if target.member.voice and target.member.voice.channel and not bot_permissions.move_members:
+        raise JarvisError('A Jarvis le falta **Move Members** para desconectar a esa persona de voz.')
+    if (ctx.author.id != ctx.guild.owner_id
+            and ctx.author.top_role <= target.member.top_role):
+        raise JarvisError(f'Tu rol debe estar por encima de todos los roles de {target.member}.')
+    managed_roles = [role for role in target.member.roles if not role.is_default() and role.managed]
+    if managed_roles:
+        raise JarvisError(
+            f'No puedo quitar roles administrados por integraciones de {target.member}: '
+            + ', '.join(role.name for role in managed_roles[:5])
+        )
+
+
+async def act_quarantine(ctx, t, intent):
+    guard_sanction(ctx, t, 'poner en quarantine', need_member=True)
+    _check_quarantine_permissions(ctx, t)
+    until = _quarantine_until(intent.duration)
+    role = await _ensure_quarantine_role(ctx.guild, ctx.me)
+    entry = next((saved for saved in quarantine_data
+                  if saved['guildId'] == str(ctx.guild.id) and saved['userId'] == str(t.id)), None)
+    is_new = entry is None
+    if is_new:
+        member_overwrites = []
+        for channel in ctx.guild.channels:
+            overwrite = channel.overwrites_for(t.member)
+            if not overwrite.is_empty():
+                member_overwrites.append({
+                    'channelId': str(channel.id),
+                    **_serialize_overwrite(overwrite),
+                })
+        entry = {
+            'guildId': str(ctx.guild.id),
+            'userId': str(t.id),
+            'roleId': str(role.id),
+            'roleIds': [str(r.id) for r in t.member.roles
+                        if not r.is_default() and r.id != role.id],
+            'channelOverwrites': member_overwrites,
+            'until': until,
+        }
+        quarantine_data.append(entry)
+    else:
+        previous_until = entry.get('until')
+        entry['until'] = until
+        entry['roleId'] = str(role.id)
+        try:
+            _save_quarantines()
+        except OSError as e:
+            entry['until'] = previous_until
+            raise JarvisError(f'No pude guardar el cambio de duracion: {short_error(e)}')
+
+    if is_new:
+        try:
+            _save_quarantines()
+        except OSError as e:
+            quarantine_data.remove(entry)
+            raise JarvisError(f'No pude guardar la cuarentena; no se aplico: {short_error(e)}')
+
+    try:
+        await _enforce_quarantine(ctx.guild, t.member, entry)
+    except Exception as e:
+        if is_new:
+            await _fire_quarantine(entry, force=True)
+        else:
+            entry['until'] = previous_until
+            try:
+                _save_quarantines()
+            except OSError as save_error:
+                print(f'[Quarantine] No pude revertir la duracion: {save_error}')
+        raise JarvisError(f'No pude completar quarantine: {short_error(e)}')
+
+    if until is not None:
+        schedule_quarantine(entry)
+        return (
+            f'{t.member.mention} quedo en **quarantine** durante **{format_duration(until - time.time())}**. '
+            f'Le quite sus roles previos; se restauraran al vencer la cuarentena.'
+        )
+    return (
+        f'{t.member.mention} quedo en **quarantine permanente**. Le quite sus roles previos; '
+        'se restauraran al usar `>>unquarantine` o pedirle a Jarvis que lo libere.'
+    )
+
+
+async def act_unquarantine(ctx, t, intent):
+    guard_sanction(ctx, t, 'sacar de quarantine', need_member=True)
+    _check_quarantine_permissions(ctx, t)
+    entry = next((saved for saved in quarantine_data
+                  if saved['guildId'] == str(ctx.guild.id) and saved['userId'] == str(t.id)), None)
+    if entry is None:
+        raise JarvisError(f'{t.member.mention} no tiene una quarantine activa de Jarvis.')
+    try:
+        await _restore_quarantine(entry)
+        remaining = [saved for saved in quarantine_data if saved is not entry]
+        _save_quarantines(remaining)
+        quarantine_data[:] = remaining
+    except Exception as e:
+        print(f'[Quarantine] No pude liberar a {t.id}: {e}')
+
+        async def _retry():
+            await asyncio.sleep(60)
+            await _fire_quarantine(entry, force=True)
+
+        spawn(_retry())
+        raise JarvisError(f'No pude completar la restauracion: {short_error(e)}')
+    return f'{t.member.mention} salio de **quarantine**; sus roles anteriores fueron restaurados.'
+
+
 async def act_list_roles(ctx, intent):
     roles = sorted([r for r in ctx.guild.roles if r.name != '@everyone'], key=lambda r: -r.position)
     lines = [f'{r.mention} \u2014 `{r.id}`' for r in roles[:30]]
@@ -5249,7 +5381,14 @@ def build_help_embed():
               'Para preguntas sobre conversaciones anteriores, un admin puede activar `/jarvis_conocimiento`.',
         inline=False,
     )
-    embed.add_field(name='Moderacion', value='`jarvis banea a @user [razon]`\n`jarvis expulsa a @user`\n`jarvis silencia a @user 10m`\n`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis advierte a @user [razon]`', inline=False)
+    embed.add_field(
+        name='Moderacion',
+        value='`jarvis banea a @user [razon]`\n`jarvis expulsa a @user`\n`jarvis silencia a @user 10m`\n'
+              '`jarvis pon en quarantine a @user 10m` / `jarvis pon en quarantine permanente a @user`\n'
+              '`>>quarantine @user [10m|permanente]` / `>>unquarantine @user`\n'
+              '`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis advierte a @user [razon]`',
+        inline=False,
+    )
     embed.add_field(name='Voz', value='`jarvis desconecta a @user`\n`jarvis mueve a @user a #canal-voz`', inline=False)
     embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
     embed.add_field(name='Encuestas', value='`/poll` — Crear encuesta con botones', inline=False)
@@ -5723,6 +5862,7 @@ TARGET_HANDLERS = {
     'role_add': act_role_add, 'role_remove': act_role_remove, 'nick': act_nick, 'dm': act_dm,
     'avatar': act_avatar, 'userinfo': act_userinfo, 'whitelist_add': act_whitelist_add,
     'whitelist_remove': act_whitelist_remove, 'warns_show': act_warns_show, 'warns_clear': act_warns_clear,
+    'quarantine': act_quarantine, 'unquarantine': act_unquarantine,
 }
 PLAIN_HANDLERS = {
     'purge': act_purge, 'slowmode': act_slowmode, 'lock': act_lock, 'unlock': act_unlock,
@@ -5909,8 +6049,7 @@ async def _fire_nickrule(entry):
         guild = client.get_guild(int(entry['guildId'])) or await client.fetch_guild(int(entry['guildId']))
         uid = int(entry['userId'])
         member = guild.get_member(uid) or await guild.fetch_member(uid)
-        if member.nick == entry['newNick']:
-            await member.edit(nick=entry['oldNick'], reason='[Jarvis] Fin de la regla de apodo')
+        await member.edit(nick=entry['oldNick'], reason='[Jarvis] Fin de la regla de apodo')
     except discord.NotFound:
         pass
     except Exception as e:
@@ -5939,6 +6078,210 @@ def nickrules_resume():
     _nickrules_resumed = True
     for entry in list(nick_rules):
         schedule_nickrule(entry)
+
+
+QUARANTINE_FILE = DATA_DIR / 'quarantines.json'
+quarantine_data = load_json(QUARANTINE_FILE, [])
+if not isinstance(quarantine_data, list):
+    quarantine_data = []
+_quarantines_resumed = False
+QUARANTINE_DENIED_PERMISSIONS = (
+    'view_channel', 'send_messages', 'send_messages_in_threads', 'create_public_threads',
+    'create_private_threads', 'add_reactions', 'connect', 'speak', 'use_application_commands',
+)
+
+
+def _save_quarantines(entries=None):
+    entries = quarantine_data if entries is None else entries
+    temp_file = QUARANTINE_FILE.with_name(QUARANTINE_FILE.name + '.tmp')
+    try:
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(entries, f, indent=2, ensure_ascii=False)
+        os.replace(temp_file, QUARANTINE_FILE)
+    except OSError as e:
+        print(f'[Quarantine] No pude guardar las cuarentenas: {e}')
+        raise
+
+
+def _serialize_overwrite(overwrite):
+    allow, deny = overwrite.pair()
+    return {'allow': allow.value, 'deny': deny.value}
+
+
+def _deserialize_overwrite(data):
+    return discord.PermissionOverwrite.from_pair(
+        discord.Permissions(data['allow']),
+        discord.Permissions(data['deny']),
+    )
+
+
+def _quarantine_overwrite(overwrite=None):
+    overwrite = overwrite or discord.PermissionOverwrite()
+    for permission in QUARANTINE_DENIED_PERMISSIONS:
+        if hasattr(overwrite, permission):
+            setattr(overwrite, permission, False)
+    return overwrite
+
+
+async def _ensure_quarantine_role(guild, bot_member):
+    role = next((r for r in guild.roles if r.name.casefold() == 'quarantine'), None)
+    if role is not None:
+        if role.managed or role.permissions.value:
+            raise JarvisError(
+                'Ya existe un rol `quarantine` con permisos o administrado por una integración. '
+                'Renómbralo o quítale sus permisos para que Jarvis pueda usarlo sin riesgos.'
+            )
+        if role >= bot_member.top_role:
+            raise JarvisError('El rol `quarantine` debe estar por debajo del rol mas alto de Jarvis.')
+        if role.colour != discord.Colour.red():
+            await role.edit(colour=discord.Colour.red(), reason='[Jarvis] Configurar rol de quarantine')
+        return role
+
+    return await guild.create_role(
+        name='quarantine',
+        colour=discord.Colour.red(),
+        permissions=discord.Permissions.none(),
+        reason='[Jarvis] Crear rol de quarantine',
+    )
+
+
+async def _apply_quarantine_overwrites(guild, member, role, entry):
+    original_by_channel = {item['channelId']: item for item in entry.get('channelOverwrites', [])}
+    for channel in guild.channels:
+        role_overwrite = _quarantine_overwrite(channel.overwrites_for(role))
+        if channel.overwrites_for(role) != role_overwrite:
+            await channel.set_permissions(
+                role, overwrite=role_overwrite, reason='[Jarvis] Bloquear canales al rol quarantine',
+            )
+
+        original = original_by_channel.get(str(channel.id))
+        if original:
+            await channel.set_permissions(
+                member,
+                overwrite=_quarantine_overwrite(_deserialize_overwrite(original)),
+                reason='[Jarvis] Impedir permisos individuales durante quarantine',
+            )
+
+
+async def _enforce_quarantine(guild, member, entry):
+    bot_member = guild.me
+    if bot_member is None:
+        raise JarvisError('No pude obtener el miembro de Jarvis en este servidor.')
+    role = await _ensure_quarantine_role(guild, bot_member)
+    entry['roleId'] = str(role.id)
+    await _apply_quarantine_overwrites(guild, member, role, entry)
+    await member.edit(roles=[role], reason='[Jarvis] Aplicar quarantine')
+    if member.voice and member.voice.channel:
+        if not bot_member.guild_permissions.move_members:
+            raise JarvisError('A Jarvis le falta **Move Members** para desconectar de voz.')
+        await member.move_to(None, reason='[Jarvis] Desconectar de voz por quarantine')
+
+
+async def _enforce_quarantine_channel(channel, entry):
+    guild = channel.guild
+    member = guild.get_member(int(entry['userId']))
+    if member is None:
+        return
+    bot_member = guild.me
+    if bot_member is None:
+        raise JarvisError('No pude obtener el miembro de Jarvis en este servidor.')
+    role = await _ensure_quarantine_role(guild, bot_member)
+    entry['roleId'] = str(role.id)
+
+    original = channel.overwrites_for(member)
+    if not original.is_empty() and not any(
+            saved['channelId'] == str(channel.id) for saved in entry.get('channelOverwrites', [])):
+        entry.setdefault('channelOverwrites', []).append({
+            'channelId': str(channel.id),
+            **_serialize_overwrite(original),
+        })
+        _save_quarantines()
+    role_overwrite = _quarantine_overwrite(channel.overwrites_for(role))
+    await channel.set_permissions(
+        role, overwrite=role_overwrite, reason='[Jarvis] Bloquear canal nuevo al rol quarantine',
+    )
+    if not original.is_empty():
+        await channel.set_permissions(
+            member,
+            overwrite=_quarantine_overwrite(original),
+            reason='[Jarvis] Bloquear permiso individual durante quarantine',
+        )
+
+
+async def _restore_quarantine(entry):
+    guild = client.get_guild(int(entry['guildId'])) or await client.fetch_guild(int(entry['guildId']))
+    uid = int(entry['userId'])
+    member = guild.get_member(uid) or await guild.fetch_member(uid)
+
+    roles = [guild.get_role(int(role_id)) for role_id in entry.get('roleIds', [])]
+    roles = [role for role in roles if role is not None]
+    await member.edit(roles=roles, reason='[Jarvis] Fin de quarantine: restaurar roles')
+
+    for saved in entry.get('channelOverwrites', []):
+        channel = guild.get_channel(int(saved['channelId']))
+        if channel is not None:
+            await channel.set_permissions(
+                member,
+                overwrite=_deserialize_overwrite(saved),
+                reason='[Jarvis] Restaurar permisos previos a quarantine',
+            )
+
+
+async def _fire_quarantine(entry, force=False):
+    if entry not in quarantine_data:
+        return
+    if not force and (entry.get('until') is None or entry['until'] > time.time()):
+        return
+    try:
+        await _restore_quarantine(entry)
+        remaining = [saved for saved in quarantine_data if saved is not entry]
+        _save_quarantines(remaining)
+        quarantine_data[:] = remaining
+    except discord.NotFound:
+        remaining = [saved for saved in quarantine_data if saved is not entry]
+        _save_quarantines(remaining)
+        quarantine_data[:] = remaining
+    except Exception as e:
+        print(f'[Quarantine] No pude restaurar {entry.get("userId")}: {e}')
+
+        async def _retry():
+            await asyncio.sleep(60)
+            await _fire_quarantine(entry, force=True)
+
+        spawn(_retry())
+
+
+def schedule_quarantine(entry):
+    async def _wait():
+        await asyncio.sleep(max(0.0, entry['until'] - time.time()))
+        await _fire_quarantine(entry)
+
+    spawn(_wait())
+
+
+def quarantines_resume():
+    global _quarantines_resumed
+    if _quarantines_resumed:
+        return
+    _quarantines_resumed = True
+    for entry in list(quarantine_data):
+        if entry.get('until') is not None:
+            schedule_quarantine(entry)
+        if entry.get('until') is None or entry['until'] > time.time():
+            spawn(_resume_quarantine(entry))
+
+
+async def _resume_quarantine(entry):
+    if entry not in quarantine_data or (
+            entry.get('until') is not None and entry['until'] <= time.time()):
+        return
+    try:
+        guild = client.get_guild(int(entry['guildId'])) or await client.fetch_guild(int(entry['guildId']))
+        member = guild.get_member(int(entry['userId'])) or await guild.fetch_member(int(entry['userId']))
+        await _enforce_quarantine(guild, member, entry)
+        _save_quarantines()
+    except Exception as e:
+        print(f'[Quarantine] No pude reanudar {entry.get("userId")}: {e}')
 
 
 async def collect_member_messages(guild, member, current_channel, max_msgs=40):
@@ -7440,6 +7783,40 @@ def regex_parse_intent(ctx):
     if blacklist_intent is not None:
         return blacklist_intent
 
+    if re.search(r'\b(?:quarantine|cuarentena)\b', norm, F):
+        removal = bool(re.search(
+            r'\b(?:unquarantine|desquarantine|libera\w*|saca\w*|quita\w*|retira\w*)\b', norm, F,
+        ))
+        apply_command = bool(re.search(r'\b(?:pon\w*|mete\w*|manda\w*|aplica\w*)\b', norm, F)) or bool(
+            re.match(r'^\s*(?:quarantine|cuarentena)\b', norm, F)
+        )
+        if not removal and not apply_command:
+            return None
+        duration_match = DURATION_RE.search(norm)
+        duration = duration_match.group(1).strip() if duration_match else None
+        target_text = norm
+        if duration_match:
+            target_text = target_text[:duration_match.start()] + ' ' + target_text[duration_match.end():]
+        target_text = re.sub(
+            r'\b(?:unquarantine|desquarantine|quarantine|cuarentena|libera\w*|saca\w*|quita\w*|retira\w*|'
+            r'pon\w*|mete\w*|manda\w*|aplica\w*|perma|permanente|permanent|forever|para\s+siempre|'
+            r'a|al|de|del|el|la|los|las|en|por|durante|favor|porfa|usuario|persona)\b',
+            ' ', target_text, flags=F,
+        )
+        target_text = re.sub(r'\s+', ' ', target_text).strip()
+        parsed_ids, target_query, _ = parse_target_phrase(target_text)
+        ids = list(dict.fromkeys([a or b for a, b in REF_RE.findall(text)] + parsed_ids))
+        if ids or target_query:
+            it = Intent(
+                action='unquarantine' if removal else 'quarantine',
+                source='regex',
+                targets=ids,
+                target_query=target_query,
+                duration=duration,
+            )
+            it.explicit = bool(ids) and nwords <= 16
+            return it
+
     # -- anti-raid (primero: "activa logs de anti raid" no es otra cosa)
     matched, ar_it = antiraid_regex_intent(text, nwords)
     if matched:
@@ -8043,6 +8420,33 @@ async def handle_command(message: discord.Message):
         return
     cmd = args.pop(0).lower()
     guild = message.guild
+
+    if cmd in ('quarantine', 'unquarantine'):
+        if guild is None:
+            return await message.reply('Este comando solo funciona dentro de un servidor.')
+        target_ids = list(dict.fromkeys(a or b for a, b in REF_RE.findall(message.content)))
+        if not target_ids:
+            return await message.reply(
+                f'Uso: `{PREFIX}{cmd} @usuario'
+                + (' [duracion|permanente]' if cmd == 'quarantine' else '')
+                + '`'
+            )
+        duration_text = REF_RE.sub(' ', ' '.join(args)).strip() if cmd == 'quarantine' else None
+        duration = None
+        if duration_text:
+            if re.search(r'\b(?:perma|permanente|permanent|forever)\b|para\s+siempre', duration_text, re.I):
+                duration = 'permanente'
+            else:
+                duration = duration_text
+        command_text = ' '.join([cmd] + args)
+        ctx = JarvisCtx(
+            message=message, guild=guild, author=message.author, me=guild.me,
+            text=command_text, norm=normalize_text(command_text),
+        )
+        intent = Intent(
+            action=cmd, source='regex', targets=target_ids, duration=duration, explicit=True,
+        )
+        return await execute_intent(ctx, intent)
 
     if cmd == 'quitar_icono':
         if guild is None:
@@ -8648,6 +9052,7 @@ async def on_ready():
     longmute_resume()
     tempnick_resume()
     nickrules_resume()
+    quarantines_resume()
     await resume_voice_jails()
     if not giveaway_checker_loop.is_running():
         giveaway_checker_loop.start()
@@ -8857,7 +9262,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
                       if e['guildId'] == str(after.guild.id) and e['userId'] == str(after.id)), None)
         if entry:
             if entry['until'] <= time.time():
-                spawn(_fire_nickrule(entry))
+                if after.nick != entry['oldNick']:
+                    spawn(_fire_nickrule(entry))
             elif after.nick != entry['newNick']:
                 try:
                     await after.edit(nick=entry['newNick'], reason='[Jarvis] Regla de apodo activa')
@@ -8882,6 +9288,18 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             await canal.send(f'**{after.name}** ha **quitado el boost** del servidor.')
     except Exception:
         pass
+
+
+@client.event
+async def on_guild_channel_create(channel):
+    for entry in list(quarantine_data):
+        if (entry['guildId'] != str(channel.guild.id)
+                or (entry.get('until') is not None and entry['until'] <= time.time())):
+            continue
+        try:
+            await _enforce_quarantine_channel(channel, entry)
+        except Exception as e:
+            print(f'[Quarantine] No pude bloquear el canal nuevo {channel.id}: {e}')
 
 
 @client.event
@@ -9270,7 +9688,7 @@ async def slash_setmodlog(interaction: discord.Interaction, canal: discord.TextC
     await interaction.response.send_message(embed=simple_embed('Mod Log Configurado', f'Los logs de moderacion se enviaran a {canal.mention}.', 0x2ecc71))
 
 
-@client.tree.command(name='auditoria', description='Consultar los ultimos 100 registros de auditoria')
+@client.tree.command(name='auditoria', description='Consultar las ultimas 20 entradas de auditoria')
 @app_commands.guild_only()
 async def slash_auditoria(interaction: discord.Interaction):
     guild = interaction.guild
@@ -9281,33 +9699,63 @@ async def slash_auditoria(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     try:
-        entries = [entry async for entry in guild.audit_logs(limit=100)]
+        entries = await asyncio.wait_for(
+            _read_audit_log_entries(guild, limit=20),
+            timeout=20,
+        )
+    except asyncio.TimeoutError:
+        return await interaction.followup.send(
+            embed=simple_embed(
+                'Auditoria no disponible',
+                'Discord tardo demasiado en devolver el registro. Intentalo de nuevo en unos segundos.',
+                0xe67e22,
+            ),
+            ephemeral=True,
+        )
     except Exception as e:
-        return await interaction.followup.send(f'No pude leer el registro de auditoria: {short_error(e)}', ephemeral=True)
+        print(f'[Auditoria] No pude leer el registro de {guild.id}: {e}')
+        return await interaction.followup.send(
+            embed=simple_embed(
+                'Error al consultar auditoria',
+                f'No pude leer el registro: {short_error(e)}',
+                0xe74c3c,
+            ),
+            ephemeral=True,
+        )
 
-    lines = [f'Registro de auditoria de {guild.name} - {len(entries)} entrada(s) mas recientes', '']
+    embed = discord.Embed(
+        title=f'Auditoria de {guild.name}'[:256],
+        description=f'Ultimas {len(entries)} entradas del servidor.' if entries else 'No hay registros disponibles.',
+        color=0x3498db,
+        timestamp=datetime.now(timezone.utc),
+    )
     for index, entry in enumerate(entries, 1):
         actor = entry.user
         target = entry.target
-        action = getattr(entry.action, 'name', str(entry.action))
-        actor_text = f'{actor} ({actor.id})' if actor else 'Desconocido'
+        action = getattr(entry.action, 'name', str(entry.action)).replace('_', ' ').title()
+        actor_text = f'{str(actor)[:60]} (`{actor.id}`)' if actor else 'Desconocido'
         target_id = getattr(target, 'id', None)
-        target_text = f'{target} ({target_id})' if target is not None and target_id else str(target or 'Sin objetivo')
-        lines.extend([
-            f'{index}. {action} | {entry.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")} | ID: {entry.id}',
-            f'   Actor: {actor_text}',
-            f'   Objetivo: {target_text}',
-            f'   Motivo: {entry.reason or "Sin motivo"}',
-        ])
+        target_text = (
+            f'{str(target)[:60]} (`{target_id}`)'
+            if target is not None and target_id
+            else str(target or 'Sin objetivo')[:80]
+        )
+        reason = ' '.join((entry.reason or 'Sin motivo').split())[:100]
+        value = (
+            f'**<t:{int(entry.created_at.timestamp())}:R>**\n'
+            f'Actor: {actor_text}\nObjetivo: {target_text}\nMotivo: {reason}'
+        )
+        embed.add_field(name=f'{index}. {action}'[:256], value=value[:1024], inline=False)
 
-    if not entries:
-        lines.append('No hay registros disponibles.')
-    report = '\n'.join(lines).encode('utf-8')
     await interaction.followup.send(
-        content='Adjunto el registro de auditoria con las 100 entradas mas recientes (o todas las disponibles).',
-        file=discord.File(io.BytesIO(report), filename=f'auditoria_{guild.id}.txt'),
+        embed=embed,
         ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
     )
+
+
+async def _read_audit_log_entries(guild, limit):
+    return [entry async for entry in guild.audit_logs(limit=limit)]
 
 
 # ── REGLA DE APODO ──
