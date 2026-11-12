@@ -9905,14 +9905,15 @@ async def slash_quitar_regla_apodo(interaction: discord.Interaction, usuario: di
                   if e['guildId'] == str(interaction.guild.id) and e['userId'] == str(member.id)), None)
     if entry is None:
         return await interaction.followup.send(f'{member.mention} no tiene una regla de apodo activa.')
-    if member.nick == entry['newNick']:
-        try:
-            await member.edit(nick=entry['oldNick'], reason=f'[Jarvis] Regla de apodo retirada por {interaction.user}')
-        except Exception as e:
-            return await interaction.followup.send(f'No pude restaurar el apodo: {short_error(e)}')
     nick_rules.remove(entry)
     _save_nickrules()
-    await interaction.followup.send(f'Regla de apodo quitada para {member.mention}.')
+    try:
+        await member.edit(nick=entry['oldNick'], reason=f'[Jarvis] Regla de apodo retirada por {interaction.user}')
+    except Exception as e:
+        nick_rules.append(entry)
+        _save_nickrules()
+        return await interaction.followup.send(f'No pude restaurar el apodo: {short_error(e)}')
+    await interaction.followup.send(f'Regla de apodo quitada y apodo anterior restaurado para {member.mention}.')
 
 
 # ── VOICEJAIL ──
