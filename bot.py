@@ -5414,6 +5414,7 @@ def build_help_embed():
     embed.add_field(
         name='Anti-Raid',
         value='`jarvis activa el anti raid` / `jarvis desactiva el anti raid` / `jarvis estado del anti raid`\n'
+              'Al activarlo, tambien expulso por defecto a bots sin insignia verificada; lo puedes cambiar con `jarvis configura el anti raid: bots off`.\n'
               '`jarvis activa logs de anti raid en este canal` (o en #canal) / `jarvis quita los logs del anti raid`\n'
               '`jarvis activa el lockdown 15m` / `jarvis quita el lockdown`\n'
               '`jarvis configura el anti raid: 5 joins en 10s, accion ban`\n'
@@ -6444,7 +6445,7 @@ if isinstance(_blacklist_saved, dict):
 ANTIRAID_DEFAULTS = {
     'enabled': False,
     'log_channel': None,          # id (str) del canal de logs
-    'unverified_bots_enabled': False,
+    'unverified_bots_enabled': True,
     'mass_ban_enabled': True,
     'mass_ban_threshold': 4,
     'mass_ban_window': 10,
@@ -6731,7 +6732,11 @@ async def antiraid_log(guild, embed):
     cid = cfg.get('log_channel') or modlog_map.get(str(guild.id))
     if not cid:
         return
-    ch = guild.get_channel(int(cid))
+    try:
+        ch = guild.get_channel(int(cid))
+    except (TypeError, ValueError):
+        print(f'[AntiRaid] Canal de logs invalido para el servidor {guild.id}: {cid!r}')
+        return
     if ch is None:
         return
     try:
@@ -6873,11 +6878,13 @@ async def antiraid_on_member_join(member):
             return False
         flags = getattr(member, 'public_flags', None)
         verified_bot = getattr(flags, 'verified_bot', None)
-        if verified_bot is not False:
+        if verified_bot is True:
             return False
-        ok, err = await antiraid_punish(member, cfg, 'bot sin insignia verificada', action='kick')
+        reason = 'bot sin insignia verificada' if verified_bot is False else 'insignia de verificacion no disponible'
+        ok, err = await antiraid_punish(member, cfg, reason, action='kick')
         e = discord.Embed(title='Anti-Raid: bot sin verificar', color=0xe67e22 if ok else 0xe74c3c)
         e.add_field(name='Bot', value=f'{member} (`{member.id}`)', inline=True)
+        e.add_field(name='Motivo', value=reason, inline=True)
         e.add_field(name='Accion', value='Expulsado' if ok else f'No pude expulsarlo: {err}', inline=False)
         e.timestamp = datetime.now(timezone.utc)
         await antiraid_log(guild, e)
@@ -7005,7 +7012,9 @@ async def antiraid_on_message(message):
     recent = [x for x in dq if now - x[0] <= window]
     mentions = len(message.mentions) + len(message.role_mentions)
     reason = None
-    if cfg['mention_limit'] and mentions >= cfg['mention_limit']:
+    if message.mention_everyone:
+        reason = 'mencion masiva (@everyone/@here)'
+    elif cfg['mention_limit'] and mentions >= cfg['mention_limit']:
         reason = f'mencion masiva ({mentions} menciones en un mensaje)'
     elif len(recent) >= cfg['spam_msgs']:
         reason = f'flood ({len(recent)} mensajes en {window}s)'
@@ -7041,10 +7050,40 @@ async def antiraid_on_message(message):
 # ------------------------------------------------------- operaciones (compartidas) --
 def ar_missing_perms(guild):
     p = guild.me.guild_permissions
-    need = {'kick_members': 'Kick Members', 'ban_members': 'Ban Members',
-            'moderate_members': 'Timeout Members', 'manage_messages': 'Manage Messages',
-            'view_audit_log': 'View Audit Log'}
-    return [label for attr, label in need.items() if not getattr(p, attr, False)]
+    cfg = antiraid_cfg(guild.id)
+    needed = []
+
+    def require_permission(permission):
+        if permission not in needed:
+            needed.append(permission)
+
+    def require_action(action):
+        require_permission({
+            'kick': 'kick_members',
+            'ban': 'ban_members',
+            'timeout': 'moderate_members',
+        }.get(action, 'kick_members'))
+
+    if cfg['enabled']:
+        require_action(cfg['action'])
+        if cfg['unverified_bots_enabled']:
+            require_permission('kick_members')
+        if cfg['spam_enabled']:
+            require_permission('moderate_members')
+            require_permission('manage_messages')
+        if cfg['mass_ban_enabled']:
+            require_permission('view_audit_log')
+    if cfg['alt_enabled']:
+        require_action(cfg['alt_action'])
+
+    labels = {
+        'kick_members': 'Kick Members',
+        'ban_members': 'Ban Members',
+        'moderate_members': 'Timeout Members',
+        'manage_messages': 'Manage Messages',
+        'view_audit_log': 'View Audit Log',
+    }
+    return [labels[permission] for permission in needed if not getattr(p, permission, False)]
 
 
 def antiraid_status_embed(guild, title='Estado del Anti-Raid'):
@@ -7087,10 +7126,13 @@ def antiraid_status_embed(guild, title='Estado del Anti-Raid'):
 def ar_enable(guild, on):
     cfg = antiraid_cfg(guild.id)
     if on:
-        if cfg['enabled']:
+        was_enabled = cfg['enabled']
+        changed = not cfg['enabled'] or not cfg['unverified_bots_enabled']
+        if not changed:
             raise JarvisError('El anti-raid ya esta activado.')
         cfg['enabled'] = True
-        title = 'Anti-Raid Activado'
+        cfg['unverified_bots_enabled'] = True
+        title = 'Anti-Raid Actualizado' if was_enabled else 'Anti-Raid Activado'
     else:
         if not cfg['enabled']:
             raise JarvisError('El anti-raid ya esta desactivado.')
@@ -7287,6 +7329,17 @@ def antiraid_regex_intent(text, nwords):
             return ar('antiraid_lockdown_off')
         dm = DURATION_RE.search(text)
         return ar('antiraid_lockdown_on', duration=dm.group(1).strip() if dm else None)
+    bool_settings = (
+        (r'\b(?:bots?|bot\s+sin\s+verificar|bots?\s+sin\s+verificar)\b', 'bots'),
+        (r'\b(?:spam|antispam)\b', 'spam'),
+        (r'\b(?:bans?\s+masivos?|banes?\s+masivos?)\b', 'bansmasivos'),
+        (r'\b(?:anti\s*alt|antialt)\b', 'antialt'),
+    )
+    setting = None
+    if stop or re.search(r'\b(?:configura\w*|ajusta\w*|cambia\w*)\b', nn):
+        setting = next((key for pattern, key in bool_settings if re.search(pattern, nn)), None)
+    if setting:
+        return ar('antiraid_config', setting=setting, text='off' if stop else 'on')
     if re.search(r'\d', nn):
         return True, None            # "activa el anti raid con 5 joins en 10s" -> lo entiende la IA
     if stop:
