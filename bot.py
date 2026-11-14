@@ -33,6 +33,7 @@ import aiohttp
 # CONFIG
 # ============================================================================
 DISCORD_TOKEN   = (os.environ.get('DISCORD_TOKEN') or '').strip() or None
+AUDIUS_API_KEY  = (os.environ.get('AUDIUS_API_KEY') or '').strip()
 GROQ_API_KEY    = os.environ.get('GROQ_API_KEY')
 OWNER_ID        = os.environ.get('OWNER_ID', '596764844791824417')
 PREFIX          = '>>'
@@ -2451,13 +2452,14 @@ async def groq_json(system, user, max_tokens=500, temperature=0.15):
         print(f'[Groq] Error: {e}')
         return None
 # ============================================================================
-# MUSIC SYSTEM (SoundCloud via yt-dlp + FFmpeg)
+# MUSIC SYSTEM (SoundCloud/Audius via yt-dlp + FFmpeg)
 # ============================================================================
 # Requisitos:
 #   pip install -U "discord.py[voice]" "yt-dlp[default]"
 #   ffmpeg + libopus instalados en el servidor (si no puedes instalar ffmpeg:
 #   `pip install imageio-ffmpeg` y el bot lo detecta solo)
 # Opcional (variables de entorno):
+#   AUDIUS_API_KEY   API key de solo lectura para buscar tambien en Audius
 #   FFMPEG_PATH       ruta al ejecutable de ffmpeg
 try:
     import yt_dlp
@@ -2509,7 +2511,8 @@ DAVE_OK            = bool(getattr(_vc_mod, 'has_dave', False))
 
 def music_status_line():
     return (
-        f'[Music] yt-dlp={"OK" if YTDLP_AVAILABLE else "NO"} | ffmpeg={FFMPEG_EXE or "NO"} | '
+        f'[Music] yt-dlp={"OK" if YTDLP_AVAILABLE else "NO"} | '
+        f'audius={"ON" if AUDIUS_API_KEY else "OFF (falta AUDIUS_API_KEY)"} | ffmpeg={FFMPEG_EXE or "NO"} | '
         f'opus={"OK" if OPUS_OK else "NO"} | pynacl={"OK" if NACL_OK else "NO"} | '
         f'davey={"OK" if DAVE_OK else "NO"}'
     )
@@ -2562,7 +2565,7 @@ def friendly_ytdl_error(e):
     if 'confirm you' in low and 'bot' in low:
         return 'El proveedor rechazo la solicitud. Intenta con otra pista publica de SoundCloud.'
     if 'unsupported url' in low:
-        return 'Ese enlace no es compatible. Usa un enlace publico de SoundCloud o Bandcamp, o busca por nombre.'
+        return 'Ese enlace no es compatible. Usa un enlace publico de SoundCloud, Audius o Bandcamp, o busca por nombre.'
     if 'private video' in low or 'video unavailable' in low or 'not available' in low:
         return 'Esa pista no esta disponible (privada, borrada o bloqueada en la region del servidor).'
     if 'age' in low and 'sign in' in low:
@@ -2678,6 +2681,67 @@ async def ytdl_run(query, noplaylist=True, flat=False):
         raise MusicError(friendly_ytdl_error(e))
 
 
+async def audius_search_tracks(query, member):
+    if not AUDIUS_API_KEY:
+        raise MusicError(
+            'No encontre una pista reproducible en SoundCloud. Configura `AUDIUS_API_KEY` '
+            'en el servidor para habilitar la busqueda en Audius.'
+        )
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                'https://api.audius.co/v1/tracks/search',
+                params={'query': query, 'limit': 5},
+                headers={'x-api-key': AUDIUS_API_KEY},
+            ) as response:
+                if response.status != 200:
+                    raise MusicError(f'Audius respondio con HTTP {response.status} al buscar.')
+                payload = await response.json()
+    except asyncio.TimeoutError:
+        raise MusicError('La busqueda en Audius tardo demasiado. Intenta de nuevo.')
+    except aiohttp.ClientError as e:
+        raise MusicError(f'No pude conectar con Audius: {short_error(e)}')
+    except json.JSONDecodeError as e:
+        raise MusicError(f'Audius devolvio una respuesta invalida: {short_error(e)}')
+
+    entries = payload.get('data') if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        raise MusicError('Audius devolvio una respuesta de busqueda inesperada.')
+
+    tracks = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get('is_streamable') is False:
+            continue
+        stream = entry.get('stream')
+        stream_url = stream.get('url') if isinstance(stream, dict) else None
+        permalink = entry.get('permalink')
+        if not stream_url or not permalink:
+            continue
+        webpage_url = permalink if MUSIC_URL_RE.match(permalink) else f'https://audius.co/{permalink.lstrip("/")}'
+        user = entry.get('user') or {}
+        artwork = entry.get('artwork') or {}
+        duration = entry.get('duration')
+        try:
+            duration = int(duration) if duration else None
+        except (TypeError, ValueError):
+            duration = None
+        track = Track(
+            title=entry.get('title') or 'Desconocido',
+            webpage_url=webpage_url,
+            duration=duration,
+            thumbnail=artwork.get('480x480') or artwork.get('150x150'),
+            uploader=user.get('name') or user.get('handle') or entry.get('artist'),
+            requester_id=member.id,
+            requester_name=member.display_name,
+            stream_url=stream_url,
+            resolved_at=time.time(),
+        )
+        tracks.append(track)
+    return tracks
+
+
 def is_playlist_url(url):
     u = url.lower()
     return 'list=' in u or '/sets/' in u or '/playlist' in u or '/album/' in u
@@ -2711,25 +2775,42 @@ async def resolve_tracks(query, member):
             raise MusicError('No pude leer ese enlace.')
         data = await ytdl_run(query, noplaylist=True)
     else:
-        data = await ytdl_run(f'scsearch5:{query}', noplaylist=True, flat=True)
-        entries = [e for e in (data or {}).get('entries', []) if e]
-        if not entries:
-            raise MusicError('No encontre resultados para esa busqueda en SoundCloud. Tambien puedes pegar un enlace publico de Bandcamp.')
         errors = []
-        for entry in entries:
-            track = _track_from_info(entry, member, full=False)
+        try:
+            data = await ytdl_run(f'scsearch5:{query}', noplaylist=True, flat=True)
+            entries = [e for e in (data or {}).get('entries', []) if e]
+            for entry in entries:
+                track = _track_from_info(entry, member, full=False)
+                try:
+                    await _resolve_stream(track)
+                    return [track], None, False
+                except MusicError as e:
+                    errors.append(e)
+        except MusicError as e:
+            errors.append(e)
+
+        try:
+            audius_tracks = await audius_search_tracks(query, member)
+        except MusicError as e:
+            errors.append(e)
+            audius_tracks = []
+        for track in audius_tracks:
             try:
-                await _resolve_stream(track)
+                await ensure_stream(track)
                 return [track], None, False
             except MusicError as e:
                 errors.append(e)
+
         if errors:
             detail = short_error(errors[-1], 160)
             raise MusicError(
-                f'No pude reproducir ninguno de los primeros resultados de SoundCloud. '
+                f'No encontre una pista reproducible en SoundCloud ni Audius. '
                 f'Prueba otra busqueda o pega un enlace publico de Bandcamp. Detalle: {detail}'
             )
-        raise MusicError('No encontre pistas reproducibles en SoundCloud.')
+        raise MusicError(
+            'No encontre pistas reproducibles en SoundCloud ni Audius. '
+            'Tambien puedes pegar un enlace publico de Bandcamp.'
+        )
     if data and data.get('entries') is not None:
         data = next((e for e in list(data['entries']) if e), None)
     if not data:
@@ -3044,13 +3125,30 @@ class MusicPlayer:
                 played = self.position()
                 playback_error = self._playback_error
                 short_track = bool(track.duration and track.duration <= 2)
-                failed = reason == 'end' and (playback_error or (played < MUSIC_MIN_PLAY_SECS and not short_track))
+                ended_early = bool(
+                    track.duration
+                    and track.duration > 2
+                    and played < track.duration - max(5, track.duration * 0.05)
+                )
+                failed = reason == 'end' and bool(
+                    playback_error
+                    or (played < MUSIC_MIN_PLAY_SECS and not short_track)
+                    or ended_early
+                )
                 if failed and attempt == 0:
                     attempt += 1
-                    print(f'[Music] El stream fallo al iniciar; renovando URL: {track.webpage_url}')
+                    print(
+                        f'[Music] El stream termino antes de tiempo ({int(played)}s/'
+                        f'{track.duration or "?"}s); renovando URL: {track.webpage_url}'
+                    )
                     continue
                 if failed:
-                    detail = short_error(playback_error) if playback_error else 'El audio se corto al empezar.'
+                    if playback_error:
+                        detail = short_error(playback_error)
+                    elif ended_early:
+                        detail = f'El stream termino tras {int(played)}s de {track.duration}s.'
+                    else:
+                        detail = 'El audio se corto al empezar.'
                     await self.say(embed=simple_embed(
                         'Fallo la reproduccion',
                         f'{track.link()}\n{detail} No pude recuperarlo; paso a la siguiente.',
@@ -3263,7 +3361,7 @@ async def music_play(guild, member, query, text_channel, play_next=False):
         raise MusicError('Dime que quieres escuchar: un nombre o un link.')
     low = query.lower()
     if 'open.spotify.com' in low or low.startswith('spotify:'):
-        raise MusicError('Los links de Spotify no se pueden reproducir directamente. Escribe el nombre para buscar en SoundCloud o pega un enlace publico de Bandcamp.')
+        raise MusicError('Los links de Spotify no se pueden reproducir directamente. Escribe el nombre para buscar en SoundCloud/Audius o pega un enlace publico de Bandcamp.')
 
     tracks, playlist_title, is_playlist = await resolve_tracks(query, member)
 
@@ -5416,7 +5514,7 @@ def build_help_embed():
         inline=False,
     )
     embed.add_field(name='Voz', value='`jarvis desconecta a @user`\n`jarvis mueve a @user a #canal-voz`', inline=False)
-    embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link de SoundCloud/Bandcamp>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
+    embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link de SoundCloud/Audius/Bandcamp>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
     embed.add_field(name='Encuestas', value='`/poll` — Crear encuesta con botones', inline=False)
     embed.add_field(name='Giveaways', value='`/giveaway` `/gend` `/greroll`', inline=False)
     embed.add_field(name='Recordatorios', value='`/remind` `/reminders` `/remindcancel`', inline=False)
@@ -10362,8 +10460,8 @@ async def music_slash(interaction: discord.Interaction, coro):
 
 
 # ── PLAY ──
-@client.tree.command(name='play', description='Busca en SoundCloud o reproduce un enlace de SoundCloud/Bandcamp')
-@app_commands.describe(busqueda='Nombre o enlace publico de SoundCloud/Bandcamp', siguiente='Ponerla de siguiente en la cola')
+@client.tree.command(name='play', description='Busca en SoundCloud/Audius o reproduce un enlace')
+@app_commands.describe(busqueda='Nombre (Audius requiere API key) o enlace publico', siguiente='Ponerla de siguiente en la cola')
 @app_commands.guild_only()
 async def slash_play(interaction: discord.Interaction, busqueda: str, siguiente: bool = False):
     try:
