@@ -55,7 +55,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="sub" id="sub">Cargando...</div>
 <div id="err"></div>
 <div class="grid" id="cards"></div>
-<div class="wrap"><table><thead><tr><th>Servidor</th><th>Miembros</th><th>Musica</th></tr></thead>
+<div class="wrap"><table><thead><tr><th>Servidor</th><th>Miembros</th></tr></thead>
 <tbody id="guilds"></tbody></table></div>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
@@ -76,11 +76,11 @@ async function load(){
     document.getElementById('sub').textContent='Activo hace '+fmtUp(d.uptime_seconds);
     const cards=document.getElementById('cards'); cards.replaceChildren(
       card('Latencia', d.latency_ms+' ms'), card('Servidores', d.guild_count),
-      card('Miembros', d.member_count), card('Reproductores', d.music_players),
+      card('Miembros', d.member_count),
       ...Object.entries(d.extra||{}).map(([k,v])=>card(k,v)));
     const tb=document.getElementById('guilds'); tb.replaceChildren();
     d.guilds.forEach(g=>{ const tr=document.createElement('tr');
-      [g.name,g.members,g.music?'Sonando':'-'].forEach(x=>{const td=document.createElement('td'); td.textContent=x; tr.append(td);});
+      [g.name,g.members].forEach(x=>{const td=document.createElement('td'); td.textContent=x; tr.append(td);});
       tb.append(tr); });
   }catch(e){ document.getElementById('err').textContent=String(e.message||e); document.getElementById('dot').className='dot'; }
 }
@@ -118,8 +118,6 @@ def _build_app(client, extra: Optional[Callable[[], dict]], token: str) -> web.A
     async def status(request):
         guard(request)
         guilds = list(client.guilds)
-        players = getattr(request.app['music_getter'](), 'keys', lambda: [])()
-        playing = set(players)
         data = {
             'ready': client.is_ready(),
             'uptime_seconds': int(time.time() - START_TIME),
@@ -128,9 +126,8 @@ def _build_app(client, extra: Optional[Callable[[], dict]], token: str) -> web.A
                     'id': str(client.user.id) if client.user else None},
             'guild_count': len(guilds),
             'member_count': sum(g.member_count or 0 for g in guilds),
-            'music_players': len(playing),
             'guilds': [
-                {'id': str(g.id), 'name': g.name, 'members': g.member_count or 0, 'music': g.id in playing}
+                {'id': str(g.id), 'name': g.name, 'members': g.member_count or 0}
                 for g in sorted(guilds, key=lambda g: -(g.member_count or 0))
             ],
         }
@@ -151,8 +148,7 @@ def _build_app(client, extra: Optional[Callable[[], dict]], token: str) -> web.A
     return app
 
 
-async def start(client, extra: Optional[Callable[[], dict]] = None,
-                music_players_getter: Optional[Callable[[], dict]] = None) -> Optional[web.AppRunner]:
+async def start(client, extra: Optional[Callable[[], dict]] = None) -> Optional[web.AppRunner]:
     """Arranca el servidor en el loop actual. Devuelve el runner (o None si no hay puerto)."""
     port = os.environ.get('PORT') or os.environ.get('WEB_PORT')
     if not port:
@@ -161,7 +157,6 @@ async def start(client, extra: Optional[Callable[[], dict]] = None,
     token = os.environ.get('DASHBOARD_TOKEN', '').strip()
 
     app = _build_app(client, extra, token)
-    app['music_getter'] = music_players_getter or (lambda: {})
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

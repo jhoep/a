@@ -383,7 +383,6 @@ NL_SUMMARY = re.compile(
     r'que\s+me\s+perdi|cuentame\s+que\s+paso|que\s+(?:ha\s+)?pasado|que\s+paso)\b(?P<rest>.*)$'
 )
 STRONG_VERBS = ('ponme al dia', 'ponme al tanto', 'que me perdi')
-BARE_NOT_OK = ('resume', 'resumeme', 'resumir')          # "jarvis resume" a secas = reanudar musica
 WINDOW_HINT = re.compile(
     r'\d|ultim|hora|minuto|hoy|ayer|rato|chat|canal|conversacion|charla|discusion|mensajes|aqui|aca|'
     r'mientras|ausente|lo\s+que|todo|dia|semana'
@@ -405,10 +404,7 @@ async def handle_summary_natural(ctx):
     verb, rest = m.group('verb'), m.group('rest').strip()
     chan_m = CHAN_RE.search(text)
 
-    if not rest:
-        if verb in BARE_NOT_OK:
-            return False
-    elif not (verb in STRONG_VERBS or WINDOW_HINT.search(rest) or chan_m):
+    if rest and not (verb in STRONG_VERBS or WINDOW_HINT.search(rest) or chan_m):
         return False        # p. ej. "resume este articulo..." o "que paso con pepe": que lo vea el cerebro
 
     seconds = parse_window(rest)

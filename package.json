@@ -1,19 +1,14 @@
 {
   "name": "discord-bot",
   "version": "1.0.0",
-  "description": "Discord bot with music, Jarvis AI and moderation",
+  "description": "Discord bot with Jarvis AI and moderation",
   "main": "bot_completo.js",
   "scripts": {
     "start": "node bot_completo.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
-    "discord-player": "^6.7.1",
-    "@discord-player/extractor": "^4.5.0",
-    "node-fetch": "^2.7.0",
-    "genius-lyrics": "^4.4.7",
-    "ffmpeg-static": "^5.2.0",
-    "sodium-native": "^4.0.0"
+    "node-fetch": "^2.7.0"
   },
   "engines": {
     "node": ">=18.0.0"

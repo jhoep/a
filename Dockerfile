@@ -1,8 +1,7 @@
 FROM python:3.11-slim
 
-# Instalar ffmpeg, yt-dlp y dependencias de audio/compilación
+# Instalar dependencias de compilación
 RUN apt-get update && apt-get install -y \
-    ffmpeg \
     build-essential \
     curl \
     libtool \
@@ -13,8 +12,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --break-system-packages -r requirements.txt \
-    && pip install --no-cache-dir --break-system-packages yt-dlp
+RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 COPY . .
 
