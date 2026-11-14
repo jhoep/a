@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from discord import app_commands
 import discord
@@ -2449,16 +2450,13 @@ async def groq_json(system, user, max_tokens=500, temperature=0.15):
         print(f'[Groq] Error: {e}')
         return None
 # ============================================================================
-# MUSIC SYSTEM (yt-dlp + FFmpeg)
+# MUSIC SYSTEM (SoundCloud via yt-dlp + FFmpeg)
 # ============================================================================
 # Requisitos:
 #   pip install -U "discord.py[voice]" "yt-dlp[default]"
 #   ffmpeg + libopus instalados en el servidor (si no puedes instalar ffmpeg:
 #   `pip install imageio-ffmpeg` y el bot lo detecta solo)
-#   un runtime de JavaScript para YouTube (Deno recomendado; Node o Bun tambien sirven)
 # Opcional (variables de entorno):
-#   YTDLP_COOKIES     ruta a un cookies.txt (si YouTube pide "confirma que no eres un bot")
-#   YTDLP_JS_RUNTIME  deno | node | bun | quickjs (fuerza el runtime de JavaScript)
 #   FFMPEG_PATH       ruta al ejecutable de ffmpeg
 try:
     import yt_dlp
@@ -2475,15 +2473,6 @@ MUSIC_DEFAULT_VOLUME = 50         # volumen inicial (%)
 MUSIC_STREAM_TTL     = 3 * 3600   # los links directos caducan; se renuevan pasado este tiempo
 MUSIC_MIN_PLAY_SECS  = 1.5        # si una cancion suena menos que esto sin que nadie la salte, se considera fallo
 QUEUE_PER_PAGE       = 10
-_cookies_src  = os.environ.get('YTDLP_COOKIES')
-YTDLP_COOKIES = None
-if _cookies_src and os.path.isfile(_cookies_src):
-    try:
-        YTDLP_COOKIES = str(DATA_DIR / 'yt_cookies.txt')
-        shutil.copyfile(_cookies_src, YTDLP_COOKIES)
-    except Exception as e:
-        print(f'[Music] No pude copiar las cookies: {e}')
-        YTDLP_COOKIES = None
 FFMPEG_BEFORE_OPTS   = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
 MUSIC_URL_RE         = re.compile(r'^https?://', re.IGNORECASE)
 LOOP_LABELS          = {'off': 'Apagado', 'track': 'Cancion', 'queue': 'Cola'}
@@ -2510,31 +2499,18 @@ def _opus_ready():
         return False
 
 
-def _detect_js_runtimes():
-    forced = (os.environ.get('YTDLP_JS_RUNTIME') or '').strip().lower()
-    if forced:
-        return {forced: {}}
-    found = {}
-    for name in ('deno', 'node', 'bun'):
-        if shutil.which(name):
-            found[name] = {}
-    return found or None
-
-
 _vc_mod            = getattr(discord, 'voice_client', None)
 FFMPEG_EXE         = _find_ffmpeg()
 OPUS_OK            = _opus_ready()
 NACL_OK            = bool(getattr(_vc_mod, 'has_nacl', False))
 DAVE_OK            = bool(getattr(_vc_mod, 'has_dave', False))
-YTDLP_JS_RUNTIMES  = _detect_js_runtimes()
 
 
 def music_status_line():
-    js = ', '.join(YTDLP_JS_RUNTIMES) if YTDLP_JS_RUNTIMES else 'NO (YouTube puede fallar)'
     return (
         f'[Music] yt-dlp={"OK" if YTDLP_AVAILABLE else "NO"} | ffmpeg={FFMPEG_EXE or "NO"} | '
         f'opus={"OK" if OPUS_OK else "NO"} | pynacl={"OK" if NACL_OK else "NO"} | '
-        f'davey={"OK" if DAVE_OK else "NO"} | js={js}'
+        f'davey={"OK" if DAVE_OK else "NO"}'
     )
 
 
@@ -2581,14 +2557,13 @@ def friendly_ytdl_error(e):
     msg = short_error(e, 400)
     low = msg.lower()
     if 'confirm you' in low and 'bot' in low:
-        return ('YouTube esta pidiendo verificacion anti-bot a este servidor. '
-                'Configura la variable `YTDLP_COOKIES` con un cookies.txt o prueba con otro enlace.')
+        return 'El proveedor rechazo la solicitud. Intenta con otra pista publica de SoundCloud.'
     if 'unsupported url' in low:
-        return 'Ese enlace no es compatible. Usa YouTube, SoundCloud, Bandcamp... o escribe el nombre de la cancion.'
+        return 'Ese enlace no es compatible. Usa un enlace publico de SoundCloud o busca por nombre.'
     if 'private video' in low or 'video unavailable' in low or 'not available' in low:
-        return 'Ese video no esta disponible (privado, borrado o bloqueado en la region del servidor).'
+        return 'Esa pista no esta disponible (privada, borrada o bloqueada en la region del servidor).'
     if 'age' in low and 'sign in' in low:
-        return 'Ese video tiene restriccion de edad y necesita cookies (`YTDLP_COOKIES`) para reproducirse.'
+        return 'Esa pista tiene una restriccion de acceso y no se puede reproducir desde el servidor.'
     return msg
 
 
@@ -2637,8 +2612,6 @@ class Track:
 
 def _entry_url(e):
     url = e.get('webpage_url') or e.get('original_url') or e.get('url') or ''
-    if url and not MUSIC_URL_RE.match(url) and e.get('id'):
-        url = f'https://www.youtube.com/watch?v={e["id"]}'
     return url
 
 
@@ -2673,16 +2646,11 @@ def _ytdl_opts(noplaylist=True, flat=False):
         'noplaylist': noplaylist,
         'playlistend': MUSIC_MAX_PLAYLIST,
         'socket_timeout': 15,
-        'source_address': '0.0.0.0',   # fuerza IPv4 (YouTube bloquea mas rangos IPv6)
     }
     if flat:
         opts['extract_flat'] = 'in_playlist'
     else:
         opts['format'] = 'bestaudio/best'
-    if YTDLP_COOKIES and os.path.isfile(YTDLP_COOKIES):
-        opts['cookiefile'] = YTDLP_COOKIES
-    if YTDLP_JS_RUNTIMES:
-        opts['js_runtimes'] = YTDLP_JS_RUNTIMES
     return opts
 
 
@@ -2704,15 +2672,23 @@ async def ytdl_run(query, noplaylist=True, flat=False):
 
 def is_playlist_url(url):
     u = url.lower()
-    if 'watch?v=' in u or 'youtu.be/' in u or '/shorts/' in u:
-        return False
     return 'list=' in u or '/sets/' in u or '/playlist' in u or '/album/' in u
+
+
+def is_youtube_url(url):
+    host = (urlparse(url).hostname or '').lower().rstrip('.')
+    return any(
+        host == domain or host.endswith('.' + domain)
+        for domain in ('youtube.com', 'youtu.be', 'youtube-nocookie.com')
+    )
 
 
 async def resolve_tracks(query, member):
     """Devuelve (tracks, titulo_playlist, es_playlist)."""
     query = query.strip()
     if MUSIC_URL_RE.match(query):
+        if is_youtube_url(query):
+            raise MusicError('Este bot no reproduce enlaces de YouTube. Busca la cancion para encontrarla en SoundCloud.')
         if is_playlist_url(query):
             data = await ytdl_run(query, noplaylist=False, flat=True)
             if data and data.get('entries') is not None:
@@ -2727,7 +2703,7 @@ async def resolve_tracks(query, member):
             raise MusicError('No pude leer ese enlace.')
         data = await ytdl_run(query, noplaylist=True)
     else:
-        data = await ytdl_run(f'ytsearch1:{query}', noplaylist=True)
+        data = await ytdl_run(f'scsearch1:{query}', noplaylist=True)
     if data and data.get('entries') is not None:
         data = next((e for e in list(data['entries']) if e), None)
     if not data:
@@ -2782,7 +2758,7 @@ def now_playing_embed(player, track, with_progress=False):
     if track.thumbnail:
         embed.set_thumbnail(url=track.thumbnail)
     if track.uploader:
-        embed.add_field(name='Canal', value=clean_title(track.uploader, 40), inline=True)
+        embed.add_field(name='Artista', value=clean_title(track.uploader, 40), inline=True)
     embed.add_field(name='Duracion', value=track.duration_text(), inline=True)
     embed.add_field(name='Pedida por', value=f'<@{track.requester_id}>', inline=True)
     embed.add_field(name='Volumen', value=f'{int(round(player.volume * 100))}%', inline=True)
@@ -3229,7 +3205,7 @@ async def music_play(guild, member, query, text_channel, play_next=False):
         raise MusicError('Dime que quieres escuchar: un nombre o un link.')
     low = query.lower()
     if 'open.spotify.com' in low or low.startswith('spotify:'):
-        raise MusicError('Los links de Spotify no se pueden reproducir directamente. Escribe el nombre de la cancion y la busco.')
+        raise MusicError('Los links de Spotify no se pueden reproducir directamente. Escribe el nombre y la busco en SoundCloud.')
 
     tracks, playlist_title, is_playlist = await resolve_tracks(query, member)
 
@@ -5382,7 +5358,7 @@ def build_help_embed():
         inline=False,
     )
     embed.add_field(name='Voz', value='`jarvis desconecta a @user`\n`jarvis mueve a @user a #canal-voz`', inline=False)
-    embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
+    embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link de SoundCloud>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
     embed.add_field(name='Encuestas', value='`/poll` — Crear encuesta con botones', inline=False)
     embed.add_field(name='Giveaways', value='`/giveaway` `/gend` `/greroll`', inline=False)
     embed.add_field(name='Recordatorios', value='`/remind` `/reminders` `/remindcancel`', inline=False)
@@ -6027,7 +6003,7 @@ def tempnick_resume():
 
 
 NICKRULES_FILE = DATA_DIR / 'nick_rules.json'
-nick_rules = load_json(NICKRULES_FILE, [])   # [{guildId, userId, oldNick, newNick, until}]
+nick_rules = load_json(NICKRULES_FILE, [])   # until=None means permanent
 _nickrules_resumed = False
 
 
@@ -6058,10 +6034,28 @@ async def _fire_nickrule(entry):
 
 
 def schedule_nickrule(entry):
+    if entry.get('until') is None:
+        return
+
     async def _wait():
         await asyncio.sleep(max(0.0, entry['until'] - time.time()))
         await _fire_nickrule(entry)
     spawn(_wait())
+
+
+async def _enforce_permanent_nickrule(entry):
+    if entry not in nick_rules or entry.get('until') is not None:
+        return
+    try:
+        guild = client.get_guild(int(entry['guildId'])) or await client.fetch_guild(int(entry['guildId']))
+        uid = int(entry['userId'])
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        if member.nick != entry['newNick']:
+            await member.edit(nick=entry['newNick'], reason='[Jarvis] Regla permanente de apodo activa')
+    except discord.NotFound:
+        return
+    except Exception as e:
+        print(f'[NickRule] No pude aplicar la regla permanente: {e}')
 
 
 def nickrules_resume():
@@ -6070,7 +6064,10 @@ def nickrules_resume():
         return
     _nickrules_resumed = True
     for entry in list(nick_rules):
-        schedule_nickrule(entry)
+        if entry.get('until') is None:
+            spawn(_enforce_permanent_nickrule(entry))
+        else:
+            schedule_nickrule(entry)
 
 
 QUARANTINE_FILE = DATA_DIR / 'quarantines.json'
@@ -9068,7 +9065,7 @@ async def handle_command(message: discord.Message):
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `robar` `quitar_icono` (quita 🩸 de los canales)\n`jarvis <pregunta>` - Asistente IA', inline=False)
         embed.add_field(name='Musica', value='`play` (`p`) `playnext` `skip` (`s`) `stop` `pause` `resume` `queue` (`q`)\n`np` `volume` (`vol`) `loop` `shuffle` `remove` `clear` `leave` (`dc`)', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla_apodo`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla` (`/quitar_regla_apodo`)\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner` `syncslash`\n`>>syncslash` — Sincronizar los slash commands en este servidor\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
@@ -9097,7 +9094,7 @@ async def sync_slash():
             scope = 'global'
         names = sorted(command.name for command in synced)
         print(f'[Slash] {len(synced)} comandos ({scope}): {", ".join(names)}')
-        faltan = {'auditoria', 'regla_apodo'} - set(names)
+        faltan = {'auditoria', 'regla_apodo', 'quitar_regla'} - set(names)
         if faltan:
             print(f'[Slash] NO llegaron a Discord: {faltan}')
     except Exception as e:
@@ -9337,7 +9334,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         entry = next((e for e in nick_rules
                       if e['guildId'] == str(after.guild.id) and e['userId'] == str(after.id)), None)
         if entry:
-            if entry['until'] <= time.time():
+            until = entry.get('until')
+            if until is not None and until <= time.time():
                 if after.nick != entry['oldNick']:
                     spawn(_fire_nickrule(entry))
             elif after.nick != entry['newNick']:
@@ -9848,10 +9846,10 @@ def can_manage_member_nickname(guild, actor, member):
     return None
 
 
-@client.tree.command(name='regla_apodo', description='Forzar un apodo durante un periodo')
+@client.tree.command(name='regla_apodo', description='Forzar un apodo temporal o permanente')
 @app_commands.guild_only()
-@app_commands.describe(usuario='Miembro del servidor', apodo='Apodo que Jarvis mantendra', duracion='Duracion (ej: 30m, 2h, 3d)')
-async def slash_regla_apodo(interaction: discord.Interaction, usuario: discord.Member, apodo: str, duracion: str):
+@app_commands.describe(usuario='Miembro del servidor', apodo='Apodo que Jarvis mantendra', duracion='permanente o una duracion (ej: 30m, 2h, 3d)')
+async def slash_regla_apodo(interaction: discord.Interaction, usuario: discord.Member, apodo: str, duracion: str = 'permanente'):
     await interaction.response.defer(ephemeral=True)
     member = usuario
     error = can_manage_member_nickname(interaction.guild, interaction.user, member)
@@ -9861,9 +9859,10 @@ async def slash_regla_apodo(interaction: discord.Interaction, usuario: discord.M
     nickname = apodo.strip()
     if not nickname or len(nickname) > 32:
         return await interaction.followup.send('El apodo debe tener entre 1 y 32 caracteres.')
-    seconds = parse_duration(duracion)
-    if not seconds or seconds < 1 or seconds > 365 * 24 * 3600:
-        return await interaction.followup.send('Duracion invalida. Usa de 1 segundo a 365 dias (ej: 30m, 2h, 3d).')
+    permanent = normalize_for_compare(duracion) in ('permanente', 'permanentemente', 'para siempre', 'indefinido', 'indefinidamente')
+    seconds = None if permanent else parse_duration(duracion)
+    if not permanent and (not seconds or seconds < 1 or seconds > 365 * 24 * 3600):
+        return await interaction.followup.send('Duracion invalida. Usa `permanente` o una duracion de hasta 365 dias (ej: 30m, 2h, 3d).')
 
     existing = next((e for e in nick_rules
                      if e['guildId'] == str(interaction.guild.id) and e['userId'] == str(member.id)), None)
@@ -9880,21 +9879,20 @@ async def slash_regla_apodo(interaction: discord.Interaction, usuario: discord.M
         'userId': str(member.id),
         'oldNick': old_nick,
         'newNick': nickname,
-        'until': time.time() + seconds,
+        'until': None if permanent else time.time() + seconds,
     }
     nick_rules.append(entry)
     _save_nickrules()
     schedule_nickrule(entry)
+    duration_text = 'permanentemente' if permanent else f'durante **{format_duration(seconds)}**'
+    finish_text = 'y al quitar la regla restaurara su apodo anterior.' if permanent else 'y al terminar restaurara su apodo anterior.'
     await interaction.followup.send(
-        f'Aplicare **{nickname}** a {member.mention} durante **{format_duration(seconds)}**. '
-        f'Jarvis lo volvera a poner si se lo cambian y al terminar restaurara su apodo anterior.',
+        f'Aplicare **{nickname}** a {member.mention} {duration_text}. '
+        f'Jarvis lo volvera a poner si se lo cambian {finish_text}',
     )
 
 
-@client.tree.command(name='quitar_regla_apodo', description='Quitar la regla de apodo de un miembro')
-@app_commands.guild_only()
-@app_commands.describe(usuario='Miembro del servidor')
-async def slash_quitar_regla_apodo(interaction: discord.Interaction, usuario: discord.Member):
+async def _remove_nickname_rule(interaction: discord.Interaction, usuario: discord.Member):
     await interaction.response.defer(ephemeral=True)
     member = usuario
     error = can_manage_member_nickname(interaction.guild, interaction.user, member)
@@ -9914,6 +9912,20 @@ async def slash_quitar_regla_apodo(interaction: discord.Interaction, usuario: di
         _save_nickrules()
         return await interaction.followup.send(f'No pude restaurar el apodo: {short_error(e)}')
     await interaction.followup.send(f'Regla de apodo quitada y apodo anterior restaurado para {member.mention}.')
+
+
+@client.tree.command(name='quitar_regla_apodo', description='Quitar la regla de apodo de un miembro')
+@app_commands.guild_only()
+@app_commands.describe(usuario='Miembro del servidor')
+async def slash_quitar_regla_apodo(interaction: discord.Interaction, usuario: discord.Member):
+    await _remove_nickname_rule(interaction, usuario)
+
+
+@client.tree.command(name='quitar_regla', description='Quitar la regla de apodo de un miembro')
+@app_commands.guild_only()
+@app_commands.describe(usuario='Miembro del servidor')
+async def slash_quitar_regla(interaction: discord.Interaction, usuario: discord.Member):
+    await _remove_nickname_rule(interaction, usuario)
 
 
 # ── VOICEJAIL ──
@@ -10292,8 +10304,8 @@ async def music_slash(interaction: discord.Interaction, coro):
 
 
 # ── PLAY ──
-@client.tree.command(name='play', description='Reproduce una cancion o playlist (nombre o link de YouTube/SoundCloud)')
-@app_commands.describe(busqueda='Nombre de la cancion o link', siguiente='Ponerla de siguiente en la cola')
+@client.tree.command(name='play', description='Busca en SoundCloud o reproduce una pista o playlist')
+@app_commands.describe(busqueda='Nombre o link publico de SoundCloud', siguiente='Ponerla de siguiente en la cola')
 @app_commands.guild_only()
 async def slash_play(interaction: discord.Interaction, busqueda: str, siguiente: bool = False):
     try:
