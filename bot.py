@@ -32,7 +32,7 @@ import aiohttp
 # ============================================================================
 # CONFIG
 # ============================================================================
-DISCORD_TOKEN   = os.environ.get('DISCORD_TOKEN')
+DISCORD_TOKEN   = (os.environ.get('DISCORD_TOKEN') or '').strip() or None
 GROQ_API_KEY    = os.environ.get('GROQ_API_KEY')
 OWNER_ID        = os.environ.get('OWNER_ID', '596764844791824417')
 PREFIX          = '>>'
@@ -11023,6 +11023,9 @@ async def main():
             try:
                 await client.start(DISCORD_TOKEN)
                 break
+            except discord.LoginFailure:
+                print('[Login] Token de Discord invalido. Revisa DISCORD_TOKEN en la configuracion del servicio.')
+                raise SystemExit(1)
             except Exception as err:
                 attempt += 1
                 delay = min(30 * 2 ** attempt, 900)
