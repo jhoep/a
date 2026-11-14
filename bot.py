@@ -8112,7 +8112,7 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
 # ============================================================================
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-\[Music\]'[Music] voice_state_update: {e}')
+
 
     guild = member.guild
     user_id = member.id
@@ -9655,6 +9655,9 @@ jarvis_gestion.install(sys.modules[__name__])
 
 import jarvis_devolver_rol
 jarvis_devolver_rol.install(sys.modules[__name__])
+
+import jarvis_musica
+jarvis_musica.install(sys.modules[__name__])
 
 
 # ============================================================================
