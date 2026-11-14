@@ -13,6 +13,7 @@ import unicodedata
 import threading
 import http.server
 import sqlite3
+import shlex
 from contextlib import closing
 from collections import deque
 from dataclasses import dataclass, field
@@ -2595,6 +2596,7 @@ class Track:
     requester_name: str = ''
     stream_url: Optional[str] = None
     user_agent: Optional[str] = None
+    http_headers: Optional[dict] = field(default=None, repr=False, compare=False)
     resolved_at: float = 0.0
     announced: bool = False
     resolving: Optional[object] = field(default=None, repr=False, compare=False)
@@ -2634,7 +2636,11 @@ def _track_from_info(info, member, full):
     )
     if full and info.get('url'):
         t.stream_url = info['url']
-        t.user_agent = (info.get('http_headers') or {}).get('User-Agent')
+        t.http_headers = info.get('http_headers') or {}
+        t.user_agent = next(
+            (value for name, value in t.http_headers.items() if name.lower() == 'user-agent'),
+            None,
+        )
         t.resolved_at = time.time()
     return t
 
@@ -2747,7 +2753,11 @@ async def _resolve_stream(track):
     if not url:
         raise MusicError('No pude obtener el audio de esta cancion.')
     track.stream_url = url
-    track.user_agent = (data.get('http_headers') or {}).get('User-Agent')
+    track.http_headers = data.get('http_headers') or {}
+    track.user_agent = next(
+        (value for name, value in track.http_headers.items() if name.lower() == 'user-agent'),
+        None,
+    )
     track.resolved_at = time.time()
     track.is_live = bool(data.get('is_live'))
     if data.get('duration') and not track.duration:
@@ -2767,7 +2777,15 @@ async def ensure_stream(track, force=False):
 def make_source(track, volume):
     before = FFMPEG_BEFORE_OPTS
     if track.user_agent:
-        before += ' -user_agent "' + track.user_agent.replace('"', '') + '"'
+        before += ' -user_agent ' + shlex.quote(track.user_agent)
+    headers = [
+        f'{name}: {value}'
+        for name, value in (track.http_headers or {}).items()
+        if name.lower() != 'user-agent'
+        and not any(char in str(name) + str(value) for char in '\r\n')
+    ]
+    if headers:
+        before += ' -headers ' + shlex.quote('\r\n'.join(headers) + '\r\n')
     audio = discord.FFmpegPCMAudio(track.stream_url, executable=FFMPEG_EXE, before_options=before, options='-vn')
     return discord.PCMVolumeTransformer(audio, volume=volume)
 
@@ -2856,6 +2874,7 @@ class MusicPlayer:
         self.paused_total = 0.0
         self._wake = asyncio.Event()
         self._next = asyncio.Event()
+        self._playback_error = None
         self._end_reason = 'end'        # end | skip | stop
         self._task = None
         self._alone_task = None
@@ -2929,6 +2948,7 @@ class MusicPlayer:
     # ---- ciclo principal ----
     def _after(self, error):
         if error:
+            self._playback_error = str(error)
             print(f'[Music] Error de reproduccion en {self.guild.id}: {error}')
         try:
             self.loop.call_soon_threadsafe(self._next.set)
@@ -2980,47 +3000,65 @@ class MusicPlayer:
                 await self.destroy()
                 return
 
-            try:
-                await ensure_stream(track)
-                source = make_source(track, self.volume)
-            except Exception as e:
-                await self.say(embed=simple_embed('No pude reproducir', f'{track.link()}\n{short_error(e)}', 0xe74c3c))
-                continue
+            attempt = 0
+            while True:
+                try:
+                    await ensure_stream(track, force=attempt > 0)
+                    source = make_source(track, self.volume)
+                except Exception as e:
+                    if attempt == 0:
+                        attempt += 1
+                        print(f'[Music] Renovando stream de {track.webpage_url}: {short_error(e)}')
+                        continue
+                    await self.say(embed=simple_embed('No pude reproducir', f'{track.link()}\n{short_error(e)}', 0xe74c3c))
+                    break
 
-            # el usuario pudo pedir skip/stop mientras se cargaba la cancion
-            if self._end_reason != 'end':
-                self._requeue(track, self._end_reason)
+                if self._end_reason != 'end':
+                    self._requeue(track, self._end_reason)
+                    self._end_reason = 'end'
+                    break
+
+                self._next.clear()
+                self._playback_error = None
+                self.paused_since = None
+                self.paused_total = 0.0
+                self.started_at = time.monotonic()
+                try:
+                    vc.play(source, after=self._after)
+                except Exception as e:
+                    source.cleanup()
+                    if attempt == 0:
+                        attempt += 1
+                        print(f'[Music] Reintentando reproduccion de {track.webpage_url}: {short_error(e)}')
+                        continue
+                    await self.say(embed=simple_embed('No pude reproducir', f'{track.link()}\n{short_error(e)}', 0xe74c3c))
+                    break
+
+                if not track.announced:
+                    await self._announce(track)
+                self._prefetch_next()
+                await self._next.wait()
+
+                reason = self._end_reason
                 self._end_reason = 'end'
-                continue
-
-            self._next.clear()
-            self.paused_since = None
-            self.paused_total = 0.0
-            self.started_at = time.monotonic()
-            try:
-                vc.play(source, after=self._after)
-            except Exception as e:
-                await self.say(embed=simple_embed('No pude reproducir', f'{track.link()}\n{short_error(e)}', 0xe74c3c))
-                continue
-
-            if not track.announced:
-                await self._announce(track)
-            self._prefetch_next()
-
-            await self._next.wait()
-
-            reason = self._end_reason
-            self._end_reason = 'end'
-            played = self.position()
-            short_track = bool(track.duration and track.duration <= 2)
-            if reason == 'end' and played < MUSIC_MIN_PLAY_SECS and not short_track:
-                await self.say(embed=simple_embed(
-                    'Fallo la reproduccion',
-                    f'{track.link()}\nEl audio se corto al empezar. Paso a la siguiente.',
-                    0xe74c3c,
-                ))
-            else:
-                self._requeue(track, reason)
+                played = self.position()
+                playback_error = self._playback_error
+                short_track = bool(track.duration and track.duration <= 2)
+                failed = reason == 'end' and (playback_error or (played < MUSIC_MIN_PLAY_SECS and not short_track))
+                if failed and attempt == 0:
+                    attempt += 1
+                    print(f'[Music] El stream fallo al iniciar; renovando URL: {track.webpage_url}')
+                    continue
+                if failed:
+                    detail = short_error(playback_error) if playback_error else 'El audio se corto al empezar.'
+                    await self.say(embed=simple_embed(
+                        'Fallo la reproduccion',
+                        f'{track.link()}\n{detail} No pude recuperarlo; paso a la siguiente.',
+                        0xe74c3c,
+                    ))
+                else:
+                    self._requeue(track, reason)
+                break
 
     def _prefetch_next(self):
         if not self.queue or (self._prefetch_task is not None and not self._prefetch_task.done()):
