@@ -2182,6 +2182,20 @@ def simple_embed(title, description=None, color=0x3498db):
 # ============================================================================
 # NORMALIZAR TEXTO
 # ============================================================================
+def short_error(error, max_chars=160):
+    text = str(error).strip() or type(error).__name__
+    max_chars = max(0, max_chars)
+    if len(text) > max_chars:
+        if max_chars <= 3:
+            return text[:max_chars]
+        return text[:max(0, max_chars - 3)].rstrip() + '...'
+    return text
+
+
+def clean_nl_query(text):
+    return re.sub(r'\s+', ' ', str(text or '')).strip()
+
+
 def normalize_for_compare(s):
     s = s.lower()
     s = unicodedata.normalize('NFD', s)
