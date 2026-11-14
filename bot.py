@@ -2556,6 +2556,8 @@ def short_error(e, limit=300):
 def friendly_ytdl_error(e):
     msg = short_error(e, 400)
     low = msg.lower()
+    if 'drm protected' in low or 'drm-protected' in low:
+        return 'SoundCloud protegio esta pista con DRM y no se puede reproducir. Intenta buscar otra version de la cancion.'
     if 'confirm you' in low and 'bot' in low:
         return 'El proveedor rechazo la solicitud. Intenta con otra pista publica de SoundCloud.'
     if 'unsupported url' in low:
@@ -2703,7 +2705,23 @@ async def resolve_tracks(query, member):
             raise MusicError('No pude leer ese enlace.')
         data = await ytdl_run(query, noplaylist=True)
     else:
-        data = await ytdl_run(f'scsearch1:{query}', noplaylist=True)
+        data = await ytdl_run(f'scsearch5:{query}', noplaylist=True, flat=True)
+        entries = [e for e in (data or {}).get('entries', []) if e]
+        if not entries:
+            raise MusicError('No encontre resultados para esa busqueda en SoundCloud.')
+        last_drm_error = None
+        for entry in entries:
+            track = _track_from_info(entry, member, full=False)
+            try:
+                await _resolve_stream(track)
+                return [track], None, False
+            except MusicError as e:
+                if 'drm protected' not in str(e).lower() and 'drm-protected' not in str(e).lower():
+                    raise
+                last_drm_error = e
+        if last_drm_error:
+            raise MusicError('Los primeros resultados de SoundCloud estan protegidos con DRM. Intenta con otra busqueda o con un enlace de otra version.')
+        raise MusicError('No encontre pistas reproducibles para esa busqueda en SoundCloud.')
     if data and data.get('entries') is not None:
         data = next((e for e in list(data['entries']) if e), None)
     if not data:
