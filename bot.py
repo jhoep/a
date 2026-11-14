@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from discord import app_commands
 import discord
@@ -33,7 +33,6 @@ import aiohttp
 # CONFIG
 # ============================================================================
 DISCORD_TOKEN   = (os.environ.get('DISCORD_TOKEN') or '').strip() or None
-AUDIUS_API_KEY  = (os.environ.get('AUDIUS_API_KEY') or '').strip()
 GROQ_API_KEY    = os.environ.get('GROQ_API_KEY')
 OWNER_ID        = os.environ.get('OWNER_ID', '596764844791824417')
 PREFIX          = '>>'
@@ -2452,15 +2451,13 @@ async def groq_json(system, user, max_tokens=500, temperature=0.15):
         print(f'[Groq] Error: {e}')
         return None
 # ============================================================================
-# MUSIC SYSTEM (SoundCloud/Audius via yt-dlp + FFmpeg)
+# YOUTUBE SEARCH
 # ============================================================================
 # Requisitos:
 #   pip install -U "discord.py[voice]" "yt-dlp[default]"
 #   ffmpeg + libopus instalados en el servidor (si no puedes instalar ffmpeg:
 #   `pip install imageio-ffmpeg` y el bot lo detecta solo)
-# Opcional (variables de entorno):
-#   AUDIUS_API_KEY   API key de solo lectura para buscar tambien en Audius
-#   FFMPEG_PATH       ruta al ejecutable de ffmpeg
+# Solo busca videos y comparte enlaces; no descarga ni reproduce audio.
 try:
     import yt_dlp
     YTDLP_AVAILABLE = True
@@ -2510,12 +2507,7 @@ DAVE_OK            = bool(getattr(_vc_mod, 'has_dave', False))
 
 
 def music_status_line():
-    return (
-        f'[Music] yt-dlp={"OK" if YTDLP_AVAILABLE else "NO"} | '
-        f'audius={"ON" if AUDIUS_API_KEY else "OFF (falta AUDIUS_API_KEY)"} | ffmpeg={FFMPEG_EXE or "NO"} | '
-        f'opus={"OK" if OPUS_OK else "NO"} | pynacl={"OK" if NACL_OK else "NO"} | '
-        f'davey={"OK" if DAVE_OK else "NO"}'
-    )
+    return f'[Music] youtube-search={"OK" if YTDLP_AVAILABLE else "NO"}'
 
 
 class MusicError(Exception):
@@ -2561,15 +2553,15 @@ def friendly_ytdl_error(e):
     msg = short_error(e, 400)
     low = msg.lower()
     if 'drm protected' in low or 'drm-protected' in low:
-        return 'SoundCloud protegio esta pista con DRM y no se puede reproducir. Intenta buscar otra version de la cancion.'
+        return 'Ese video tiene proteccion DRM y no se puede reproducir desde el bot.'
     if 'confirm you' in low and 'bot' in low:
-        return 'El proveedor rechazo la solicitud. Intenta con otra pista publica de SoundCloud.'
+        return 'YouTube bloqueo la busqueda desde este servidor. Intenta de nuevo mas tarde.'
     if 'unsupported url' in low:
-        return 'Ese enlace no es compatible. Usa un enlace publico de SoundCloud, Audius o Bandcamp, o busca por nombre.'
+        return 'Ese enlace no es compatible. Pega un enlace de YouTube o busca por nombre.'
     if 'private video' in low or 'video unavailable' in low or 'not available' in low:
-        return 'Esa pista no esta disponible (privada, borrada o bloqueada en la region del servidor).'
+        return 'Ese video no esta disponible (privado, borrado o bloqueado en la region del servidor).'
     if 'age' in low and 'sign in' in low:
-        return 'Esa pista tiene una restriccion de acceso y no se puede reproducir desde el servidor.'
+        return 'Ese video tiene una restriccion de acceso y no aparece en los resultados disponibles.'
     return msg
 
 
@@ -2681,67 +2673,6 @@ async def ytdl_run(query, noplaylist=True, flat=False):
         raise MusicError(friendly_ytdl_error(e))
 
 
-async def audius_search_tracks(query, member):
-    if not AUDIUS_API_KEY:
-        raise MusicError(
-            'No encontre una pista reproducible en SoundCloud. Configura `AUDIUS_API_KEY` '
-            'en el servidor para habilitar la busqueda en Audius.'
-        )
-
-    timeout = aiohttp.ClientTimeout(total=20)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                'https://api.audius.co/v1/tracks/search',
-                params={'query': query, 'limit': 5},
-                headers={'x-api-key': AUDIUS_API_KEY},
-            ) as response:
-                if response.status != 200:
-                    raise MusicError(f'Audius respondio con HTTP {response.status} al buscar.')
-                payload = await response.json()
-    except asyncio.TimeoutError:
-        raise MusicError('La busqueda en Audius tardo demasiado. Intenta de nuevo.')
-    except aiohttp.ClientError as e:
-        raise MusicError(f'No pude conectar con Audius: {short_error(e)}')
-    except json.JSONDecodeError as e:
-        raise MusicError(f'Audius devolvio una respuesta invalida: {short_error(e)}')
-
-    entries = payload.get('data') if isinstance(payload, dict) else None
-    if not isinstance(entries, list):
-        raise MusicError('Audius devolvio una respuesta de busqueda inesperada.')
-
-    tracks = []
-    for entry in entries:
-        if not isinstance(entry, dict) or entry.get('is_streamable') is False:
-            continue
-        stream = entry.get('stream')
-        stream_url = stream.get('url') if isinstance(stream, dict) else None
-        permalink = entry.get('permalink')
-        if not stream_url or not permalink:
-            continue
-        webpage_url = permalink if MUSIC_URL_RE.match(permalink) else f'https://audius.co/{permalink.lstrip("/")}'
-        user = entry.get('user') or {}
-        artwork = entry.get('artwork') or {}
-        duration = entry.get('duration')
-        try:
-            duration = int(duration) if duration else None
-        except (TypeError, ValueError):
-            duration = None
-        track = Track(
-            title=entry.get('title') or 'Desconocido',
-            webpage_url=webpage_url,
-            duration=duration,
-            thumbnail=artwork.get('480x480') or artwork.get('150x150'),
-            uploader=user.get('name') or user.get('handle') or entry.get('artist'),
-            requester_id=member.id,
-            requester_name=member.display_name,
-            stream_url=stream_url,
-            resolved_at=time.time(),
-        )
-        tracks.append(track)
-    return tracks
-
-
 def is_playlist_url(url):
     u = url.lower()
     return 'list=' in u or '/sets/' in u or '/playlist' in u or '/album/' in u
@@ -2755,67 +2686,68 @@ def is_youtube_url(url):
     )
 
 
-async def resolve_tracks(query, member):
-    """Devuelve (tracks, titulo_playlist, es_playlist)."""
+async def search_youtube(query):
     query = query.strip()
     if MUSIC_URL_RE.match(query):
         if is_youtube_url(query):
-            raise MusicError('Este bot no reproduce enlaces de YouTube. Busca la cancion por nombre o pega un enlace publico de SoundCloud o Bandcamp.')
-        if is_playlist_url(query):
-            data = await ytdl_run(query, noplaylist=False, flat=True)
-            if data and data.get('entries') is not None:
-                entries = [e for e in list(data['entries']) if e]
-                tracks = [_track_from_info(e, member, full=False) for e in entries[:MUSIC_MAX_PLAYLIST]]
-                tracks = [t for t in tracks if t.webpage_url]
-                if not tracks:
-                    raise MusicError('La playlist esta vacia o no pude leerla.')
-                return tracks, (data.get('title') or 'Playlist'), True
-            if data:
-                return [_track_from_info(data, member, full=False)], None, False
-            raise MusicError('No pude leer ese enlace.')
-        data = await ytdl_run(query, noplaylist=True)
-    else:
-        errors = []
-        try:
-            data = await ytdl_run(f'scsearch5:{query}', noplaylist=True, flat=True)
-            entries = [e for e in (data or {}).get('entries', []) if e]
-            for entry in entries:
-                track = _track_from_info(entry, member, full=False)
-                try:
-                    await _resolve_stream(track)
-                    return [track], None, False
-                except MusicError as e:
-                    errors.append(e)
-        except MusicError as e:
-            errors.append(e)
+            safe_url = quote(query, safe=':/?=&%#')
+            return [{
+                'title': 'Enlace de YouTube',
+                'webpage_url': safe_url,
+                'uploader': '',
+                'duration': None,
+            }]
+        raise MusicError('Pega un enlace de YouTube o escribe el nombre de la cancion para buscarlo.')
 
-        try:
-            audius_tracks = await audius_search_tracks(query, member)
-        except MusicError as e:
-            errors.append(e)
-            audius_tracks = []
-        for track in audius_tracks:
-            try:
-                await ensure_stream(track)
-                return [track], None, False
-            except MusicError as e:
-                errors.append(e)
+    data = await ytdl_run(f'ytsearch5:{query}', noplaylist=True, flat=True)
+    entries = [entry for entry in (data or {}).get('entries', []) if isinstance(entry, dict)]
+    results = []
+    for entry in entries:
+        video_id = str(entry.get('id') or '')
+        if re.fullmatch(r'[\w-]{11}', video_id):
+            url = f'https://www.youtube.com/watch?v={video_id}'
+        else:
+            url = entry.get('webpage_url') or ''
+            if not MUSIC_URL_RE.match(url) or not is_youtube_url(url):
+                continue
+        results.append({
+            'title': entry.get('title') or 'Video sin titulo',
+            'webpage_url': url,
+            'uploader': entry.get('uploader') or entry.get('channel') or '',
+            'duration': entry.get('duration'),
+        })
+    if not results:
+        raise MusicError('No encontre resultados para esa busqueda en YouTube.')
+    return results
 
-        if errors:
-            detail = short_error(errors[-1], 160)
-            raise MusicError(
-                f'No encontre una pista reproducible en SoundCloud ni Audius. '
-                f'Prueba otra busqueda o pega un enlace publico de Bandcamp. Detalle: {detail}'
-            )
-        raise MusicError(
-            'No encontre pistas reproducibles en SoundCloud ni Audius. '
-            'Tambien puedes pegar un enlace publico de Bandcamp.'
-        )
-    if data and data.get('entries') is not None:
-        data = next((e for e in list(data['entries']) if e), None)
-    if not data:
-        raise MusicError('No encontre resultados para esa busqueda.')
-    return [_track_from_info(data, member, full=True)], None, False
+
+async def music_play(guild, member, query, text_channel, play_next=False):
+    """Busca en YouTube y responde con enlaces oficiales, sin reproducir audio."""
+    query = (query or '').strip().strip('<>').strip()
+    if not query:
+        raise MusicError('Escribe el nombre de una cancion o pega un enlace de YouTube.')
+
+    results = await search_youtube(query)
+    lines = []
+    for index, result in enumerate(results, start=1):
+        title = clean_title(result['title'], 100)
+        url = quote(result['webpage_url'], safe=':/?=&%#')
+        metadata = []
+        if result.get('uploader'):
+            metadata.append(clean_title(result['uploader'], 50))
+        if result.get('duration'):
+            metadata.append(fmt_clock(result['duration']))
+        suffix = f'\n{" · ".join(metadata)}' if metadata else ''
+        lines.append(f'**{index}. [{title}]({url})**{suffix}')
+
+    embed = discord.Embed(
+        title='Resultados de YouTube',
+        description='\n'.join(lines)[:4000],
+        color=0xe62117,
+    )
+    embed.set_footer(text='Solo comparto enlaces oficiales; no reproduzco ni descargo audio.')
+    embed.timestamp = datetime.now(timezone.utc)
+    return embed, False
 
 
 async def _resolve_stream(track):
@@ -3351,72 +3283,6 @@ async def music_connect(guild, channel):
         except Exception:
             pass
     return vc
-
-
-async def music_play(guild, member, query, text_channel, play_next=False):
-    """Devuelve (embed, silencioso). silencioso=True: la tarjeta 'Reproduciendo ahora' ya avisa, no hace falta responder."""
-    user_ch = music_precheck_play(guild, member)
-    query = (query or '').strip().strip('<>').strip()
-    if not query:
-        raise MusicError('Dime que quieres escuchar: un nombre o un link.')
-    low = query.lower()
-    if 'open.spotify.com' in low or low.startswith('spotify:'):
-        raise MusicError('Los links de Spotify no se pueden reproducir directamente. Escribe el nombre para buscar en SoundCloud/Audius o pega un enlace publico de Bandcamp.')
-
-    tracks, playlist_title, is_playlist = await resolve_tracks(query, member)
-
-    user_ch = music_precheck_play(guild, member)   # el usuario pudo moverse mientras se buscaba
-
-    player = music_players.get(guild.id)
-    if player is None:
-        player = MusicPlayer(guild)
-        music_players[guild.id] = player
-
-    async with player.lock:
-        if player.destroyed:
-            raise MusicError('El reproductor se cerro mientras buscaba. Intenta de nuevo.')
-        try:
-            await music_connect(guild, user_ch)
-        except Exception as e:
-            if not player.queue and not player.current:
-                music_players.pop(guild.id, None)
-            raise MusicError(f'No pude conectarme al canal de voz: {short_error(e)}')
-
-        room = MUSIC_MAX_QUEUE - len(player.queue)
-        if room <= 0:
-            raise MusicError(f'La cola esta llena (maximo {MUSIC_MAX_QUEUE} canciones).')
-        skipped = max(0, len(tracks) - room)
-        tracks = tracks[:room]
-
-        player.text_channel = text_channel
-        started_now = player.current is None and not player.queue
-        queued_before = len(player.queue)
-        if play_next:
-            player.queue[0:0] = tracks
-        else:
-            player.queue.extend(tracks)
-        player.start()
-
-    if is_playlist:
-        desc = f'**{clean_title(playlist_title, 80)}**\n**{len(tracks)}** canciones agregadas a la cola.'
-        if skipped:
-            desc += f'\nSe omitieron {skipped} por el limite de {MUSIC_MAX_QUEUE} en cola.'
-        return simple_embed('Playlist anadida', desc, 0x3498db), False
-
-    t = tracks[0]
-    embed = discord.Embed(
-        title='Reproduciendo' if started_now else 'Anadida a la cola',
-        description=f'**{t.link(80)}**',
-        color=0x1DB954 if started_now else 0x3498db,
-    )
-    if t.thumbnail:
-        embed.set_thumbnail(url=t.thumbnail)
-    embed.add_field(name='Duracion', value=t.duration_text(), inline=True)
-    if not started_now:
-        embed.add_field(name='Posicion', value=f'#{1 if play_next else queued_before + 1}', inline=True)
-    embed.add_field(name='Pedida por', value=member.mention, inline=True)
-    embed.timestamp = datetime.now(timezone.utc)
-    return embed, bool(started_now and can_announce(text_channel, guild))
 
 
 async def music_pause(guild, member):
@@ -4246,7 +4112,7 @@ ACCIONES (action) y sus campos:
 - antialt_allow | antialt_disallow: target_ids (o target_query con el ID): dejar entrar a esa persona aunque su cuenta sea nueva / quitar la excepcion
 - blacklist_add | blacklist_remove: target_query (ID, mencion o tag/nombre exacto del servidor); blacklist_show: ver la lista negra. Anadir banea ahora si el usuario ya esta dentro y tambien al volver a entrar.
 - bardear: target_ids. Jarvis se DEFIENDE de alguien que lo molesta con una respuesta con humor (sin insultos) y un apodo temporal que se restaura solo. Usalo cuando el JEFE diga "bardealo", "bardea a X", "defiendete de ese"
-- music_play: query | music_skip | music_stop | music_pause | music_resume | music_queue | music_nowplaying | music_shuffle | music_leave | music_volume: value (0-200) | music_loop: mode (off|track|queue)
+- music_play: buscar en YouTube y compartir enlaces oficiales (no reproducir audio)
 - chat: el JEFE solo conversa, pregunta o bromea -> escribe en "reply"
 - clarify: no puedes decidir con seguridad -> pregunta corta en "clarify"
 
@@ -5514,7 +5380,7 @@ def build_help_embed():
         inline=False,
     )
     embed.add_field(name='Voz', value='`jarvis desconecta a @user`\n`jarvis mueve a @user a #canal-voz`', inline=False)
-    embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link de SoundCloud/Audius/Bandcamp>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
+    embed.add_field(name='YouTube', value='`/play <busqueda>` o `jarvis reproduce <cancion>` — busca en YouTube y comparte hasta 5 enlaces oficiales. El bot no reproduce ni descarga audio.', inline=False)
     embed.add_field(name='Encuestas', value='`/poll` — Crear encuesta con botones', inline=False)
     embed.add_field(name='Giveaways', value='`/giveaway` `/gend` `/greroll`', inline=False)
     embed.add_field(name='Recordatorios', value='`/remind` `/reminders` `/remindcancel`', inline=False)
@@ -9220,8 +9086,8 @@ async def handle_command(message: discord.Message):
         embed.timestamp = datetime.now(timezone.utc)
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `robar` `quitar_icono` (quita 🩸 de los canales)\n`jarvis <pregunta>` - Asistente IA', inline=False)
-        embed.add_field(name='Musica', value='`play` (`p`) `playnext` `skip` (`s`) `stop` `pause` `resume` `queue` (`q`)\n`np` `volume` (`vol`) `loop` `shuffle` `remove` `clear` `leave` (`dc`)', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla` (`/quitar_regla_apodo`)\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/remove` `/clearqueue` `/leave`', inline=False)
+        embed.add_field(name='YouTube', value='`play` (`p`) busca por nombre y comparte enlaces oficiales. No reproduce ni descarga audio.', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla` (`/quitar_regla_apodo`)\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)\n`/play` — buscar en YouTube y compartir enlaces; no reproduce audio', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner` `syncslash`\n`>>syncslash` — Sincronizar los slash commands en este servidor\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
@@ -10460,31 +10326,18 @@ async def music_slash(interaction: discord.Interaction, coro):
 
 
 # ── PLAY ──
-@client.tree.command(name='play', description='Busca en SoundCloud/Audius o reproduce un enlace')
-@app_commands.describe(busqueda='Nombre (Audius requiere API key) o enlace publico', siguiente='Ponerla de siguiente en la cola')
+@client.tree.command(name='play', description='Buscar en YouTube y compartir enlaces oficiales')
+@app_commands.describe(busqueda='Nombre de la cancion o enlace de YouTube')
 @app_commands.guild_only()
-async def slash_play(interaction: discord.Interaction, busqueda: str, siguiente: bool = False):
-    try:
-        music_precheck_play(interaction.guild, interaction.user)
-    except MusicError as e:
-        return await interaction.response.send_message(str(e), ephemeral=True)
-
+async def slash_play(interaction: discord.Interaction, busqueda: str):
     await interaction.response.defer()
     try:
-        embed, quiet = await music_play(interaction.guild, interaction.user, busqueda, interaction.channel, siguiente)
+        embed, _ = await music_play(interaction.guild, interaction.user, busqueda, interaction.channel)
     except MusicError as e:
         return await interaction.followup.send(str(e))
     except Exception as e:
         print(f'[Music] /play: {e}')
         return await interaction.followup.send(f'Error inesperado: {short_error(e)}')
-
-    if quiet:
-        # la tarjeta "Reproduciendo ahora" ya avisa; quito el mensaje de "pensando..."
-        try:
-            await interaction.delete_original_response()
-            return
-        except Exception:
-            pass
     await interaction.followup.send(embed=embed)
 
 
