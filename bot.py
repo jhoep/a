@@ -4818,9 +4818,36 @@ NICKRULES_FILE = DATA_DIR / 'nick_rules.json'
 nick_rules = load_json(NICKRULES_FILE, [])   # until=None means permanent
 _nickrules_resumed = False
 
+NICKRULE_LOG_FILE = DATA_DIR / 'nick_rule_logs.json'
+nick_rule_logs = load_json(NICKRULE_LOG_FILE, [])
+if not isinstance(nick_rule_logs, list):
+    nick_rule_logs = []
+nick_rule_logs = [
+    item for item in nick_rule_logs
+    if isinstance(item, dict)
+    and item.get('guildId') is not None
+    and item.get('userId') is not None
+    and item.get('action') in {'creada', 'actualizada', 'quitada', 'expirada'}
+    and isinstance(item.get('timestamp'), (int, float))
+][-1000:]
+
 
 def _save_nickrules():
     save_json(NICKRULES_FILE, nick_rules)
+
+
+def _log_nickrule(entry, action, actor_id=None):
+    nick_rule_logs.append({
+        'guildId': str(entry['guildId']),
+        'userId': str(entry['userId']),
+        'actorId': str(actor_id) if actor_id is not None else None,
+        'action': action,
+        'nickname': entry.get('newNick'),
+        'timestamp': time.time(),
+    })
+    if len(nick_rule_logs) > 1000:
+        del nick_rule_logs[:-1000]
+    save_json(NICKRULE_LOG_FILE, nick_rule_logs)
 
 
 async def _fire_nickrule(entry):
@@ -4843,6 +4870,7 @@ async def _fire_nickrule(entry):
     if entry in nick_rules:
         nick_rules.remove(entry)
         _save_nickrules()
+        _log_nickrule(entry, 'expirada')
 
 
 def schedule_nickrule(entry):
@@ -7870,7 +7898,7 @@ async def handle_command(message: discord.Message):
         embed.timestamp = datetime.now(timezone.utc)
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `robar` `quitar_icono` (quita 🩸 de los canales)\n`jarvis <pregunta>` - Asistente IA', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla` (`/quitar_regla_apodo`)\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla` (`/quitar_regla_apodo`) `/show_logs`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner` `syncslash`\n`>>syncslash` — Sincronizar los slash commands en este servidor\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
@@ -7899,7 +7927,7 @@ async def sync_slash():
             scope = 'global'
         names = sorted(command.name for command in synced)
         print(f'[Slash] {len(synced)} comandos ({scope}): {", ".join(names)}')
-        faltan = {'auditoria', 'regla_apodo', 'quitar_regla'} - set(names)
+        faltan = {'auditoria', 'regla_apodo', 'quitar_regla', 'show_logs'} - set(names)
         if faltan:
             print(f'[Slash] NO llegaron a Discord: {faltan}')
     except Exception as e:
@@ -8683,6 +8711,7 @@ async def slash_regla_apodo(interaction: discord.Interaction, usuario: discord.M
     }
     nick_rules.append(entry)
     _save_nickrules()
+    _log_nickrule(entry, 'actualizada' if existing else 'creada', interaction.user.id)
     schedule_nickrule(entry)
     duration_text = 'permanentemente' if permanent else f'durante **{format_duration(seconds)}**'
     finish_text = 'y al quitar la regla restaurara su apodo anterior.' if permanent else 'y al terminar restaurara su apodo anterior.'
@@ -8711,6 +8740,7 @@ async def _remove_nickname_rule(interaction: discord.Interaction, usuario: disco
         nick_rules.append(entry)
         _save_nickrules()
         return await interaction.followup.send(f'No pude restaurar el apodo: {short_error(e)}')
+    _log_nickrule(entry, 'quitada', interaction.user.id)
     await interaction.followup.send(f'Regla de apodo quitada y apodo anterior restaurado para {member.mention}.')
 
 
@@ -8726,6 +8756,46 @@ async def slash_quitar_regla_apodo(interaction: discord.Interaction, usuario: di
 @app_commands.describe(usuario='Miembro del servidor')
 async def slash_quitar_regla(interaction: discord.Interaction, usuario: discord.Member):
     await _remove_nickname_rule(interaction, usuario)
+
+
+@client.tree.command(name='show_logs', description='Ver quién creó, quitó o dejó vencer reglas de apodo')
+@app_commands.guild_only()
+@app_commands.describe(usuario='Filtrar por miembro (opcional)')
+async def slash_show_logs(interaction: discord.Interaction, usuario: discord.Member = None):
+    if not interaction.user.guild_permissions.manage_nicknames:
+        return await interaction.response.send_message(
+            'Necesitas el permiso **Manage Nicknames** para consultar estos registros.', ephemeral=True)
+
+    records = [
+        item for item in nick_rule_logs
+        if item.get('guildId') == str(interaction.guild.id)
+        and (usuario is None or item.get('userId') == str(usuario.id))
+    ][-20:]
+    if not records:
+        text = 'No hay registros de reglas de apodo todavía. El historial empieza a guardarse desde ahora.'
+    else:
+        lines = []
+        action_labels = {
+            'creada': 'creó',
+            'actualizada': 'actualizó',
+            'quitada': 'quitó',
+            'expirada': 'dejó vencer automáticamente',
+        }
+        for item in reversed(records):
+            actor_id = item.get('actorId')
+            actor = f'<@{actor_id}>' if actor_id else 'Jarvis (vencimiento automático)'
+            action = action_labels.get(item.get('action'), 'modificó')
+            timestamp = int(item['timestamp'])
+            lines.append(
+                f'<t:{timestamp}:R> — {actor} {action} la regla de <@{item["userId"]}>'
+            )
+        text = '\n'.join(lines)
+
+    embed = discord.Embed(title='Historial de reglas de apodo', description=text, color=0x5865F2)
+    if usuario:
+        embed.set_footer(text=f'Filtrado por {usuario.display_name} ({usuario.id})')
+    await interaction.response.send_message(
+        embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ── VOICEJAIL ──
