@@ -9,6 +9,9 @@ RUN apt-get update && apt-get install -y \
     automake \
     && rm -rf /var/lib/apt/lists/*
 
+# Deno: yt-dlp lo necesita para resolver los desafios JS de YouTube
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
 COPY requirements.txt .

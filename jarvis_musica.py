@@ -61,7 +61,7 @@ MAX_PLAYLIST = _env_int('JARVIS_MUSIC_MAX_PLAYLIST', 50)
 MAX_DURATION = _env_int('JARVIS_MUSIC_MAX_MINUTES', 180) * 60
 COOKIES = (os.environ.get('JARVIS_YT_COOKIES') or '').strip()
 PROXY = (os.environ.get('JARVIS_YT_PROXY') or '').strip()
-JS_RUNTIME = (os.environ.get('JARVIS_YT_JS_RUNTIME') or '').strip()
+JS_RUNTIME = (os.environ.get('JARVIS_YT_JS_RUNTIME') or '').strip() or ('deno' if shutil.which('deno') else '')
 REMOTE_COMPONENTS = [x.strip() for x in (os.environ.get('JARVIS_YT_REMOTE_COMPONENTS') or '').split(',') if x.strip()]
 
 IDLE_LEAVE_SECS = 180        # sin nada en la cola: me salgo del canal
@@ -1270,7 +1270,11 @@ def install(mod):
             try:
                 if defer:
                     await interaction.response.defer()
-                result = await dispatch(action, interaction.guild, interaction.user, interaction.channel, arg)
+                result = await asyncio.wait_for(
+                    dispatch(action, interaction.guild, interaction.user, interaction.channel, arg),
+                    timeout=75)
+            except asyncio.TimeoutError:
+                return await _slash_send(interaction, content='Tardo demasiado (YouTube o la conexion de voz no respondieron). Intenta de nuevo.', ephemeral=True)
             except mod.JarvisError as e:
                 return await _slash_send(interaction, content=str(e), ephemeral=True)
             except Exception as e:
