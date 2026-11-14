@@ -2561,7 +2561,7 @@ def friendly_ytdl_error(e):
     if 'confirm you' in low and 'bot' in low:
         return 'El proveedor rechazo la solicitud. Intenta con otra pista publica de SoundCloud.'
     if 'unsupported url' in low:
-        return 'Ese enlace no es compatible. Usa un enlace publico de SoundCloud o busca por nombre.'
+        return 'Ese enlace no es compatible. Usa un enlace publico de SoundCloud o Bandcamp, o busca por nombre.'
     if 'private video' in low or 'video unavailable' in low or 'not available' in low:
         return 'Esa pista no esta disponible (privada, borrada o bloqueada en la region del servidor).'
     if 'age' in low and 'sign in' in low:
@@ -2690,7 +2690,7 @@ async def resolve_tracks(query, member):
     query = query.strip()
     if MUSIC_URL_RE.match(query):
         if is_youtube_url(query):
-            raise MusicError('Este bot no reproduce enlaces de YouTube. Busca la cancion para encontrarla en SoundCloud.')
+            raise MusicError('Este bot no reproduce enlaces de YouTube. Busca la cancion por nombre o pega un enlace publico de SoundCloud o Bandcamp.')
         if is_playlist_url(query):
             data = await ytdl_run(query, noplaylist=False, flat=True)
             if data and data.get('entries') is not None:
@@ -2708,20 +2708,22 @@ async def resolve_tracks(query, member):
         data = await ytdl_run(f'scsearch5:{query}', noplaylist=True, flat=True)
         entries = [e for e in (data or {}).get('entries', []) if e]
         if not entries:
-            raise MusicError('No encontre resultados para esa busqueda en SoundCloud.')
-        last_drm_error = None
+            raise MusicError('No encontre resultados para esa busqueda en SoundCloud. Tambien puedes pegar un enlace publico de Bandcamp.')
+        errors = []
         for entry in entries:
             track = _track_from_info(entry, member, full=False)
             try:
                 await _resolve_stream(track)
                 return [track], None, False
             except MusicError as e:
-                if 'drm protected' not in str(e).lower() and 'drm-protected' not in str(e).lower():
-                    raise
-                last_drm_error = e
-        if last_drm_error:
-            raise MusicError('Los primeros resultados de SoundCloud estan protegidos con DRM. Intenta con otra busqueda o con un enlace de otra version.')
-        raise MusicError('No encontre pistas reproducibles para esa busqueda en SoundCloud.')
+                errors.append(e)
+        if errors:
+            detail = short_error(errors[-1], 160)
+            raise MusicError(
+                f'No pude reproducir ninguno de los primeros resultados de SoundCloud. '
+                f'Prueba otra busqueda o pega un enlace publico de Bandcamp. Detalle: {detail}'
+            )
+        raise MusicError('No encontre pistas reproducibles en SoundCloud.')
     if data and data.get('entries') is not None:
         data = next((e for e in list(data['entries']) if e), None)
     if not data:
@@ -3223,7 +3225,7 @@ async def music_play(guild, member, query, text_channel, play_next=False):
         raise MusicError('Dime que quieres escuchar: un nombre o un link.')
     low = query.lower()
     if 'open.spotify.com' in low or low.startswith('spotify:'):
-        raise MusicError('Los links de Spotify no se pueden reproducir directamente. Escribe el nombre y la busco en SoundCloud.')
+        raise MusicError('Los links de Spotify no se pueden reproducir directamente. Escribe el nombre para buscar en SoundCloud o pega un enlace publico de Bandcamp.')
 
     tracks, playlist_title, is_playlist = await resolve_tracks(query, member)
 
@@ -5376,7 +5378,7 @@ def build_help_embed():
         inline=False,
     )
     embed.add_field(name='Voz', value='`jarvis desconecta a @user`\n`jarvis mueve a @user a #canal-voz`', inline=False)
-    embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link de SoundCloud>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
+    embed.add_field(name='Musica', value='`jarvis reproduce <cancion o link de SoundCloud/Bandcamp>` `jarvis salta` `jarvis pausa` `jarvis reanuda`\n`jarvis cola` `jarvis que suena` `jarvis volumen 80` `jarvis repite` `jarvis mezcla`\n`jarvis para la musica` `jarvis desconectate`\n`/play` `/skip` `/stop` `/queue` `/nowplaying` `/volume` `/loop` `/shuffle` `/leave`', inline=False)
     embed.add_field(name='Encuestas', value='`/poll` — Crear encuesta con botones', inline=False)
     embed.add_field(name='Giveaways', value='`/giveaway` `/gend` `/greroll`', inline=False)
     embed.add_field(name='Recordatorios', value='`/remind` `/reminders` `/remindcancel`', inline=False)
@@ -10322,8 +10324,8 @@ async def music_slash(interaction: discord.Interaction, coro):
 
 
 # ── PLAY ──
-@client.tree.command(name='play', description='Busca en SoundCloud o reproduce una pista o playlist')
-@app_commands.describe(busqueda='Nombre o link publico de SoundCloud', siguiente='Ponerla de siguiente en la cola')
+@client.tree.command(name='play', description='Busca en SoundCloud o reproduce un enlace de SoundCloud/Bandcamp')
+@app_commands.describe(busqueda='Nombre o enlace publico de SoundCloud/Bandcamp', siguiente='Ponerla de siguiente en la cola')
 @app_commands.guild_only()
 async def slash_play(interaction: discord.Interaction, busqueda: str, siguiente: bool = False):
     try:
