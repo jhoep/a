@@ -16,6 +16,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
+# yt-dlp nightly: YouTube cambia seguido y la version estable queda vieja rapido
+RUN pip install --no-cache-dir --break-system-packages -U --pre "yt-dlp[default]"
 
 COPY . .
 

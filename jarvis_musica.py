@@ -59,7 +59,39 @@ def _env_int(name, default):
 MAX_QUEUE = _env_int('JARVIS_MUSIC_MAX_QUEUE', 200)
 MAX_PLAYLIST = _env_int('JARVIS_MUSIC_MAX_PLAYLIST', 50)
 MAX_DURATION = _env_int('JARVIS_MUSIC_MAX_MINUTES', 180) * 60
-COOKIES = (os.environ.get('JARVIS_YT_COOKIES') or '').strip()
+def _find_cookies():
+    """Busca un cookies.txt (formato Netscape) con cookies de YouTube.
+    Orden: JARVIS_YT_COOKIES, junto a este archivo, directorio actual, /app y /etc/secrets (Render).
+    Usa una copia en /tmp porque yt-dlp reescribe el archivo al cerrar."""
+    import tempfile
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [(os.environ.get('JARVIS_YT_COOKIES') or '').strip(),
+             os.path.join(here, 'cookies.txt'), os.path.join(os.getcwd(), 'cookies.txt'),
+             '/app/cookies.txt', '/etc/secrets/cookies.txt']
+    for path in cands:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+        except OSError:
+            continue
+        if 'youtube.com' not in content and 'google.com' not in content:
+            print(f'[Musica] {path} encontrado pero NO tiene cookies de youtube.com/google.com; lo ignoro.')
+            continue
+        dst = os.path.join(tempfile.gettempdir(), 'jarvis_yt_cookies.txt')
+        try:
+            with open(dst, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except OSError:
+            dst = path
+        print(f'[Musica] Usando cookies de YouTube desde {path}')
+        return dst
+    print('[Musica] No encontre cookies.txt con cookies de YouTube (opcional).')
+    return ''
+
+
+COOKIES = _find_cookies()
 PROXY = (os.environ.get('JARVIS_YT_PROXY') or '').strip()
 JS_RUNTIME = (os.environ.get('JARVIS_YT_JS_RUNTIME') or '').strip() or ('deno' if shutil.which('deno') else '')
 REMOTE_COMPONENTS = [x.strip() for x in (os.environ.get('JARVIS_YT_REMOTE_COMPONENTS') or '').split(',') if x.strip()]
@@ -243,10 +275,24 @@ def _ydl_opts(flat=False, playlist=False, fmt='bestaudio/best'):
     return opts
 
 
+# Clientes alternativos de YouTube: se prueban si el cliente por defecto no devuelve "player response".
+_FALLBACK_CLIENTS = ['android_vr', 'web_safari', 'mweb', 'tv']
+
+
 def _extract(query, flat=False, playlist=False, fmt='bestaudio/best'):
     yt = _load_ytdlp()
-    with yt.YoutubeDL(_ydl_opts(flat, playlist, fmt)) as ydl:
-        return ydl.extract_info(query, download=False)
+    try:
+        with yt.YoutubeDL(_ydl_opts(flat, playlist, fmt)) as ydl:
+            return ydl.extract_info(query, download=False)
+    except Exception as e:
+        low = str(e).lower()
+        if flat or 'player response' not in low:
+            raise
+        # reintento con otros clientes de YouTube
+        opts = _ydl_opts(flat, playlist, fmt)
+        opts['extractor_args'] = {'youtube': {'player_client': _FALLBACK_CLIENTS}}
+        with yt.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(query, download=False)
 
 
 async def _blocking(fn, *args, timeout=60):
