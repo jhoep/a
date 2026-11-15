@@ -16,9 +16,12 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
-# yt-dlp nightly: YouTube cambia seguido y la version estable queda vieja rapido
-RUN pip install --no-cache-dir --break-system-packages -U --pre "yt-dlp[default]"
 
 COPY . .
+
+# yt-dlp nightly: YouTube cambia seguido y la version estable queda vieja rapido.
+# Va despues de COPY para que cada deploy con cambios invalide esta capa y no reutilice
+# una version vieja de la cache de Docker (causa de "Failed to extract any player response").
+RUN pip install --no-cache-dir --break-system-packages -U --pre "yt-dlp[default]"
 
 CMD ["python3", "bot.py"]
