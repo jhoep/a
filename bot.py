@@ -66,6 +66,7 @@ XPCHANNELS_FILE = DATA_DIR / 'xp_channels.json'
 DELWATCH_FILE  = DATA_DIR / 'delwatch.json'
 DELWATCH_COUNTS_FILE = DATA_DIR / 'delwatch_counts.json'
 WHITELIST_FILE = DATA_DIR / 'whitelist.json'
+AUTORESP_FILE  = DATA_DIR / 'autorespuestas_off.json'
 VOICEKICK_FILE = DATA_DIR / 'voicekick.json'
 BACKUP_DIR     = DATA_DIR / 'backups'
 JARVIS_KNOWLEDGE_DB = DATA_DIR / 'jarvis_knowledge.sqlite3'
@@ -1479,7 +1480,7 @@ RESPUESTAS_FT       = ['Bro, realmente pidio ft, el malo este']
 autorespuesta_cooldown = {}
 COOLDOWN_TIEMPO = 0
 # estado de autorespuestas por guild (set de guildIds con autorespuestas OFF)
-autorespuestas_desactivadas = set()
+autorespuestas_desactivadas = set(load_json(AUTORESP_FILE, []))
 
 groq_cooldown = {}
 GROQ_COOLDOWN_SECS = 4
@@ -7425,9 +7426,11 @@ async def handle_command(message: discord.Message):
         gid = guild.id
         if gid in autorespuestas_desactivadas:
             autorespuestas_desactivadas.discard(gid)
+            save_json(AUTORESP_FILE, sorted(autorespuestas_desactivadas))
             return await message.reply(embed=simple_embed('Autorespuestas Activadas', 'Las autorespuestas están ahora **activadas** en este servidor.', 0x2ecc71))
         else:
             autorespuestas_desactivadas.add(gid)
+            save_json(AUTORESP_FILE, sorted(autorespuestas_desactivadas))
             return await message.reply(embed=simple_embed('Autorespuestas Desactivadas', 'Las autorespuestas están ahora **desactivadas** en este servidor.', 0xe74c3c))
 
     # ── NIVEL (owner only) ──

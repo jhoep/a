@@ -295,6 +295,17 @@ def _extract(query, flat=False, playlist=False, fmt='bestaudio/best'):
             return ydl.extract_info(query, download=False)
 
 
+def _extract_search(query):
+    """Busqueda rapida: solo metadatos del resultado, sin resolver formatos ni retos JS."""
+    yt = _load_ytdlp()
+    opts = _ydl_opts(flat=True)
+    opts['extract_flat'] = True
+    opts['retries'] = 2
+    opts['socket_timeout'] = 10
+    with yt.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(f'ytsearch1:{query}', download=False)
+
+
 async def _blocking(fn, *args, timeout=60):
     loop = asyncio.get_running_loop()
     try:
@@ -409,17 +420,22 @@ async def resolve_query(query, member):
     try:
         if is_playlist:
             info = await _blocking(_extract, q, True, True, timeout=90)
-        else:
-            target = q if is_url else f'ytsearch1:{q}'
+        elif is_url:
             try:
-                info = await _blocking(_extract, target, False, False)
+                info = await _blocking(_extract, q, False, False)
             except _m.JarvisError:
                 raise
             except Exception as e:
                 if 'requested format' in str(e).lower():
-                    info = await _blocking(_extract, target, False, False, 'best')
+                    info = await _blocking(_extract, q, False, False, 'best')
                 else:
                     raise
+        else:
+            t0 = time.time()
+            info = await _blocking(_extract_search, q, timeout=30)
+            took = time.time() - t0
+            if took > 5:
+                print(f'[Musica] La busqueda de "{_trunc(q, 60)}" tardo {took:.1f}s')
     except _m.JarvisError:
         raise
     except Exception as e:
@@ -432,7 +448,7 @@ async def resolve_query(query, member):
     if entries is not None and not is_playlist:
         entries = entries[:1]
     raw = entries if entries is not None else [info]
-    flat = is_playlist
+    flat = is_playlist or not is_url
     tracks, skipped = [], 0
     for e in raw[:MAX_PLAYLIST if is_playlist else 1]:
         t = _track_from_info(e, member, flat)
