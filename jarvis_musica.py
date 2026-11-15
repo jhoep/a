@@ -14,7 +14,8 @@ DEPENDENCIAS (requirements.txt)
   Ademas, para YouTube yt-dlp necesita un runtime de JavaScript en el host: Deno (recomendado) o Node 22+.
 
 VARIABLES DE ENTORNO (todas opcionales)
-    JARVIS_YT_COOKIES          ruta a un cookies.txt (formato Netscape). Ayuda cuando YouTube pide "confirma que no eres un bot".
+    JARVIS_YT_COOKIES          ruta o contenido de un cookies.txt (formato Netscape). Ayuda cuando YouTube pide "confirma que no eres un bot".
+    JARVIS_YT_COOKIES_B64      lo mismo pero en base64 (comodo para variables de entorno en la nube).
     JARVIS_YT_PROXY            proxy para yt-dlp (ej: http://usuario:clave@host:puerto)
     JARVIS_YT_JS_RUNTIME       runtime JS: "node", "deno", o "node:/ruta/a/node"
     JARVIS_YT_REMOTE_COMPONENTS  ej: "ejs:github" (deja que yt-dlp descargue el solver de retos si falta)
@@ -30,10 +31,12 @@ USO
              jarvis volumen 70 | jarvis repite la cancion | jarvis mezcla la cola | jarvis para la musica
 """
 import asyncio
+import base64
 import os
 import random
 import re
 import shutil
+import tempfile
 import time
 import traceback
 from collections import deque
@@ -59,13 +62,44 @@ def _env_int(name, default):
 MAX_QUEUE = _env_int('JARVIS_MUSIC_MAX_QUEUE', 200)
 MAX_PLAYLIST = _env_int('JARVIS_MUSIC_MAX_PLAYLIST', 50)
 MAX_DURATION = _env_int('JARVIS_MUSIC_MAX_MINUTES', 180) * 60
+
+
+def _cookies_from_text(content, origin):
+    """Guarda cookies Netscape en /tmp porque yt-dlp reescribe el archivo al cerrar."""
+    if 'youtube.com' not in content and 'google.com' not in content:
+        print(f'[Musica] {origin} no tiene cookies de youtube.com/google.com; lo ignoro.')
+        return ''
+    dst = os.path.join(tempfile.gettempdir(), 'jarvis_yt_cookies.txt')
+    try:
+        with open(dst, 'w', encoding='utf-8') as f:
+            f.write(content)
+    except OSError as e:
+        print(f'[Musica] No pude guardar las cookies de {origin}: {e}')
+        return ''
+    print(f'[Musica] Usando cookies de YouTube desde {origin}')
+    return dst
+
+
 def _find_cookies():
-    """Busca un cookies.txt (formato Netscape) con cookies de YouTube.
-    Orden: JARVIS_YT_COOKIES, junto a este archivo, directorio actual, /app y /etc/secrets (Render).
-    Usa una copia en /tmp porque yt-dlp reescribe el archivo al cerrar."""
-    import tempfile
+    """Busca cookies de YouTube en JARVIS_YT_COOKIES (ruta o contenido), JARVIS_YT_COOKIES_B64,
+    junto a este archivo, directorio actual, /app y /etc/secrets (Render)."""
+    env = (os.environ.get('JARVIS_YT_COOKIES') or '').strip()
+    if env and not os.path.isfile(env) and ('\n' in env or '\t' in env):
+        path = _cookies_from_text(env, 'JARVIS_YT_COOKIES')
+        if path:
+            return path
+    b64 = (os.environ.get('JARVIS_YT_COOKIES_B64') or '').strip()
+    if b64:
+        try:
+            content = base64.b64decode(b64).decode('utf-8', errors='ignore')
+        except Exception:
+            print('[Musica] JARVIS_YT_COOKIES_B64 no es base64 valido; lo ignoro.')
+        else:
+            path = _cookies_from_text(content, 'JARVIS_YT_COOKIES_B64')
+            if path:
+                return path
     here = os.path.dirname(os.path.abspath(__file__))
-    cands = [(os.environ.get('JARVIS_YT_COOKIES') or '').strip(),
+    cands = [env,
              os.path.join(here, 'cookies.txt'), os.path.join(os.getcwd(), 'cookies.txt'),
              '/app/cookies.txt', '/etc/secrets/cookies.txt']
     for path in cands:
@@ -79,14 +113,8 @@ def _find_cookies():
         if 'youtube.com' not in content and 'google.com' not in content:
             print(f'[Musica] {path} encontrado pero NO tiene cookies de youtube.com/google.com; lo ignoro.')
             continue
-        dst = os.path.join(tempfile.gettempdir(), 'jarvis_yt_cookies.txt')
-        try:
-            with open(dst, 'w', encoding='utf-8') as f:
-                f.write(content)
-        except OSError:
-            dst = path
-        print(f'[Musica] Usando cookies de YouTube desde {path}')
-        return dst
+        dst = _cookies_from_text(content, path)
+        return dst or path
     print('[Musica] No encontre cookies.txt con cookies de YouTube (opcional).')
     return ''
 
@@ -243,8 +271,10 @@ def _check_deps():
     except ImportError:
         raise _err('Me falta el paquete `davey` (cifrado DAVE de voz). Instala `discord.py[voice]` y reinicia el bot.')
     _ffmpeg_exe()
-    _load_ytdlp()
+    yt = _load_ytdlp()
     _deps_ok = True
+    print(f'[Musica] yt-dlp {getattr(yt.version, "__version__", "?")} | cookies={"si" if COOKIES else "no"} | '
+          f'JS={JS_RUNTIME or "ninguno"} | proxy={"si" if PROXY else "no"}')
 
 
 # ============================================================================
@@ -320,6 +350,10 @@ def _explain(e):
     low = msg.lower()
     if 'requested format' in low:
         return 'No encontre un formato de audio reproducible para eso.'
+    if 'failed to extract any player response' in low:
+        return ('YouTube no entrego el reproductor de ese video (suele bloquear la IP del servidor o exigir '
+                'cookies validas). Configura cookies con `JARVIS_YT_COOKIES`/`/etc/secrets/cookies.txt`, '
+                'actualiza yt-dlp y verifica el runtime JS; si sigue, usa `JARVIS_YT_PROXY`.')
     if ('confirm' in low and 'bot' in low) or 'sign in to' in low:
         return ('YouTube esta bloqueando al servidor del bot ("confirma que no eres un bot"). '
                 'Configura cookies con `JARVIS_YT_COOKIES` o cambia de host/IP.')
