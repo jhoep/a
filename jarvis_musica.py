@@ -136,6 +136,7 @@ FFMPEG_OPTIONS = '-vn'
 
 URL_RE = re.compile(r'^https?://\S+$', re.IGNORECASE)
 BARE_DOMAIN_RE = re.compile(r'^(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be|soundcloud\.com)/', re.IGNORECASE)
+YOUTUBE_URL_RE = re.compile(r'^https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/', re.IGNORECASE)
 
 
 # ============================================================================
@@ -280,15 +281,15 @@ def _check_deps():
 # ============================================================================
 # yt-dlp
 # ============================================================================
-def _ydl_opts(flat=False, playlist=False, fmt='bestaudio/best'):
+def _ydl_opts(flat=False, playlist=False, fmt='bestaudio/best', retries=3, socket_timeout=15):
     opts = {
         'format': fmt,
         'quiet': True,
         'no_warnings': True,
         'noplaylist': not playlist,
         'default_search': 'ytsearch',
-        'socket_timeout': 15,
-        'retries': 3,
+        'socket_timeout': socket_timeout,
+        'retries': retries,
         'extract_flat': 'in_playlist' if flat else False,
         'playlistend': MAX_PLAYLIST,
         'source_address': '0.0.0.0',      # fuerza IPv4 (el IPv6 de muchos hosts esta bloqueado)
@@ -309,17 +310,18 @@ def _ydl_opts(flat=False, playlist=False, fmt='bestaudio/best'):
 _FALLBACK_CLIENTS = ['android_vr', 'web_safari', 'mweb', 'tv']
 
 
-def _extract(query, flat=False, playlist=False, fmt='bestaudio/best'):
+def _extract(query, flat=False, playlist=False, fmt='bestaudio/best', retries=3, socket_timeout=15):
     yt = _load_ytdlp()
     try:
-        with yt.YoutubeDL(_ydl_opts(flat, playlist, fmt)) as ydl:
+        with yt.YoutubeDL(_ydl_opts(flat, playlist, fmt, retries, socket_timeout)) as ydl:
             return ydl.extract_info(query, download=False)
     except Exception as e:
         low = str(e).lower()
-        if flat or 'player response' not in low:
+        if flat or not any(k in low for k in (
+                'player response', 'timed out', 'timeout', 'connection', 'nsig', 'n challenge')):
             raise
-        # reintento con otros clientes de YouTube
-        opts = _ydl_opts(flat, playlist, fmt)
+        # reintento con otros clientes de YouTube, con esperas cortas para que quepan en el timeout
+        opts = _ydl_opts(flat, playlist, fmt, 0, 8)
         opts['extractor_args'] = {'youtube': {'player_client': _FALLBACK_CLIENTS}}
         with yt.YoutubeDL(opts) as ydl:
             return ydl.extract_info(query, download=False)
@@ -341,7 +343,7 @@ async def _blocking(fn, *args, timeout=60):
     try:
         return await asyncio.wait_for(loop.run_in_executor(None, fn, *args), timeout)
     except asyncio.TimeoutError:
-        raise _err('Tardo demasiado en responder la busqueda. Intenta de nuevo en un momento.')
+        raise _err('YouTube tardo demasiado en responder. Intenta de nuevo en un momento.')
 
 
 def _explain(e):
@@ -350,6 +352,8 @@ def _explain(e):
     low = msg.lower()
     if 'requested format' in low:
         return 'No encontre un formato de audio reproducible para eso.'
+    if 'timed out' in low or 'timeout' in low:
+        return 'YouTube tardo demasiado en responder (conexion lenta o bloqueada). Intenta de nuevo en un momento.'
     if 'failed to extract any player response' in low:
         return ('YouTube no entrego el reproductor de ese video (suele bloquear la IP del servidor o exigir '
                 'cookies validas). Configura cookies con `JARVIS_YT_COOKIES`/`/etc/secrets/cookies.txt`, '
@@ -441,15 +445,17 @@ async def resolve_query(query, member):
     """Devuelve (lista_de_tracks, cuantas_se_saltaron_por_largas)."""
     q = query.strip()
     if re.search(r'open\.spotify\.com|spotify:', q, re.IGNORECASE):
-        raise _err('Spotify no se puede reproducir directo (esta protegido). Pasame el nombre de la cancion o un link de YouTube/SoundCloud.')
+        raise _err('Solo reproduzco musica de YouTube. Pasame un link de YouTube o el nombre de la cancion.')
     if BARE_DOMAIN_RE.match(q):
         q = 'https://' + q
 
     is_url = bool(URL_RE.match(q))
+    if is_url and not YOUTUBE_URL_RE.match(q):
+        raise _err('Solo reproduzco musica de YouTube. Pasame un link de YouTube o el nombre de la cancion.')
     low = q.lower()
     is_playlist = is_url and (
         ('list=' in low and 'watch?v=' not in low and 'youtu.be/' not in low)
-        or '/playlist?' in low or '/sets/' in low
+        or '/playlist?' in low
     )
     try:
         if is_playlist:
@@ -505,12 +511,12 @@ async def resolve_stream(track):
         return
     try:
         try:
-            info = await _blocking(_extract, track.url, False, False)
+            info = await _blocking(_extract, track.url, False, False, 'bestaudio/best', 0, 10, timeout=75)
         except _m.JarvisError:
             raise
         except Exception as e:
             if 'requested format' in str(e).lower():
-                info = await _blocking(_extract, track.url, False, False, 'best')
+                info = await _blocking(_extract, track.url, False, False, 'best', 0, 10, timeout=75)
             else:
                 raise
     except _m.JarvisError:
@@ -1116,7 +1122,7 @@ async def do_clear(guild, member):
 
 
 def music_help_embed():
-    e = _embed('Musica de Jarvis', 'Pide canciones por nombre o con link (YouTube, SoundCloud...). Tienes que estar en un canal de voz.')
+    e = _embed('Musica de Jarvis', 'Pide canciones por nombre o con un link de YouTube. Tienes que estar en un canal de voz.')
     e.add_field(
         name='Slash',
         value='`/play` `/pause` `/resume` `/skip` `/stop` `/queue` `/nowplaying`\n`/volume` `/loop` `/shuffle` `/remove` `/clearqueue`',
@@ -1135,7 +1141,7 @@ def music_help_embed():
     e.add_field(
         name='Notas',
         value='Los botones de la tarjeta "Reproduciendo ahora" tambien controlan la musica. '
-              'Si el modo AFK esta activo, no me salgo del canal al terminar. Spotify no se puede reproducir directo.',
+              'Si el modo AFK esta activo, no me salgo del canal al terminar. Solo reproduzco musica de YouTube.',
         inline=False)
     return e
 
@@ -1381,7 +1387,7 @@ def install(mod):
 
         @tree.command(name='play', description='Reproduce una cancion o playlist (nombre o link)')
         @app_commands.guild_only()
-        @app_commands.describe(busqueda='Nombre de la cancion o link (YouTube, SoundCloud...)')
+        @app_commands.describe(busqueda='Nombre de la cancion o link de YouTube')
         async def slash_play(interaction: discord.Interaction, busqueda: str):
             await _slash(interaction, 'play', busqueda, defer=True)
 
