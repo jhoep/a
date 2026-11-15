@@ -334,32 +334,46 @@ _ANON_CLIENTS = ['android_vr', 'tv', 'web_safari']
 _FALLBACK_CLIENTS = ['mweb', 'tv', 'web_safari', 'android_vr', 'tv_downgraded']
 PLAYER_CLIENTS = [x.strip() for x in (os.environ.get('JARVIS_YT_PLAYER_CLIENTS') or '').split(',') if x.strip()] \
     or _FALLBACK_CLIENTS
+_best_clients = None    # (clientes, player_skip) que funciono la ultima vez; se prueba primero
+
+
+def _yt_opts(flat, playlist, fmt, clients, skip_webpage=False):
+    opts = _ydl_opts(flat, playlist, fmt, 0, 10)
+    args = {'player_client': clients}
+    if skip_webpage:
+        args['player_skip'] = ['webpage']
+    opts['extractor_args'] = {'youtube': args}
+    return opts
 
 
 def _extract(query, flat=False, playlist=False, fmt='bestaudio/best', retries=3, socket_timeout=15):
     """Extrae info. Si falla, prueba varios conjuntos de clientes de YouTube en orden."""
+    global _best_clients
     yt = _load_ytdlp()
-    attempts = []
+    variants = []
     if not flat:
-        anon = _ydl_opts(flat, playlist, fmt, 0, 10)
-        anon['extractor_args'] = {'youtube': {
-            'player_client': _ANON_CLIENTS,
-            'player_skip': ['webpage'],
-        }}
-        attempts.append((anon, 'clientes ' + ','.join(_ANON_CLIENTS)))
-    attempts.append((_ydl_opts(flat, playlist, fmt, min(retries, 1), socket_timeout), 'por defecto'))
-    if not flat and PLAYER_CLIENTS != _ANON_CLIENTS:
-        extra = _ydl_opts(flat, playlist, fmt, 0, 10)
-        extra['extractor_args'] = {'youtube': {'player_client': PLAYER_CLIENTS}}
-        attempts.append((extra, 'clientes ' + ','.join(PLAYER_CLIENTS)))
+        if _best_clients:
+            variants.append(_best_clients)
+        if _best_clients != (_ANON_CLIENTS, True):
+            variants.append((_ANON_CLIENTS, True))
+    variants.append(None)
+    if not flat and PLAYER_CLIENTS not in [v[0] for v in variants if v]:
+        variants.append((PLAYER_CLIENTS, False))
 
     last = None
-    for opts, label in attempts:
+    for variant in variants:
+        if variant:
+            clients, skip = variant
+            opts, label = _yt_opts(flat, playlist, fmt, clients, skip), 'clientes ' + ','.join(clients)
+        else:
+            opts = _ydl_opts(flat, playlist, fmt, min(retries, 1), socket_timeout)
+            label = 'por defecto'
         try:
             with yt.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(query, download=False)
             if info:
-                if len(attempts) > 1:
+                _best_clients = variant
+                if len(variants) > 1:
                     print(f'[Musica] Extraccion OK con {label}')
                 return info
         except Exception as e:
@@ -377,8 +391,8 @@ def _extract_search(query):
     yt = _load_ytdlp()
     opts = _ydl_opts(flat=True)
     opts['extract_flat'] = True
-    opts['retries'] = 2
-    opts['socket_timeout'] = 10
+    opts['retries'] = 1
+    opts['socket_timeout'] = 8
     with yt.YoutubeDL(opts) as ydl:
         return ydl.extract_info(f'ytsearch1:{query}', download=False)
 
@@ -437,6 +451,7 @@ class Track:
     stream_url: Optional[str] = None
     resolved_at: float = 0.0
     retries: int = 0
+    stream_task: Optional[asyncio.Task] = None
 
 
 def _page_url(info, flat):
@@ -552,10 +567,26 @@ async def resolve_query(query, member):
     return tracks, skipped
 
 
+def _quiet_task(task):
+    """Evita el aviso 'Task exception was never retrieved' si nadie consume la prefetch."""
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
 async def resolve_stream(track):
     """Obtiene (o renueva) el link de audio directo justo antes de reproducir."""
     if track.stream_url and time.time() - track.resolved_at < STREAM_TTL:
         return
+    # Si do_play ya la esta resolviendo en paralelo, espera esa misma tarea.
+    task = track.stream_task
+    if task is not None and task is not asyncio.current_task():
+        track.stream_task = None
+        await task
+        if track.stream_url and time.time() - track.resolved_at < STREAM_TTL:
+            return
+    t0 = time.time()
     try:
         try:
             info = await _blocking(_extract, track.url, False, False, 'bestaudio/best', 0, 10, timeout=75)
@@ -582,6 +613,9 @@ async def resolve_stream(track):
             track.duration = int(info['duration'])
         except (TypeError, ValueError):
             pass
+    took = time.time() - t0
+    if took > 5:
+        print(f'[Musica] Resolver el audio de "{_trunc(track.title, 50)}" tardo {took:.1f}s')
 
 
 # ============================================================================
@@ -971,17 +1005,23 @@ async def do_play(guild, member, query, text_channel):
     _check_deps()
     _check_join(guild, ch)
 
-    tracks, skipped = await resolve_query(query, member)
-
-    await _join(guild, ch)
-    afk = _afk_entry(guild.id)
-    if afk and not afk.get('anti') and int(afk.get('channel', 0)) != ch.id:
-        afk['channel'] = ch.id              # el modo AFK sin anti-disconnect sigue al bot
-        _m._afk_save()
+    # Conectar a voz y buscar la cancion a la vez: se ahorra la suma de ambos tiempos.
+    t0 = time.time()
+    join_task = asyncio.create_task(_join(guild, ch))
+    join_task.add_done_callback(_quiet_task)
+    try:
+        tracks, skipped = await resolve_query(query, member)
+    except BaseException:
+        join_task.cancel()
+        raise
+    took = time.time() - t0
+    if took > 5:
+        print(f'[Musica] Buscar "{_trunc(query, 50)}" tardo {took:.1f}s')
 
     player = get_player(guild)
     room = MAX_QUEUE - len(player.queue)
     if room <= 0:
+        join_task.cancel()
         raise _err(f'La cola esta llena ({MAX_QUEUE} canciones).')
     trimmed = len(tracks) > room
     tracks = tracks[:room]
@@ -993,6 +1033,28 @@ async def do_play(guild, member, query, text_channel):
         pend = [t.duration for t in player.queue]
         if player.current.duration and all(pend):
             eta = max(0, player.current.duration - player.elapsed()) + sum(pend)
+
+    # Resolver el audio del primer tema mientras termina la conexion de voz.
+    if not busy and tracks:
+        first = tracks[0]
+        if not (first.stream_url and time.time() - first.resolved_at < STREAM_TTL):
+            first.stream_task = asyncio.create_task(resolve_stream(first))
+            first.stream_task.add_done_callback(_quiet_task)
+
+    t1 = time.time()
+    try:
+        await join_task
+    except BaseException:
+        raise
+    finally:
+        took = time.time() - t1
+        if took > 5:
+            print(f'[Musica] Conectar a voz tardo {took:.1f}s')
+
+    afk = _afk_entry(guild.id)
+    if afk and not afk.get('anti') and int(afk.get('channel', 0)) != ch.id:
+        afk['channel'] = ch.id              # el modo AFK sin anti-disconnect sigue al bot
+        _m._afk_save()
 
     player.text_channel_id = text_channel.id
     player.add(tracks)
