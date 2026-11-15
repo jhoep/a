@@ -956,6 +956,8 @@ async def timeout_member(member, secs, reason):
     Si es admin, le quita temporalmente los roles con Administrator y se los devuelve al terminar el
     silencio (o al quitarselo). Devuelve la lista de roles quitados."""
     guild, me = member.guild, member.guild.me
+    if str(member.id) == str(OWNER_ID):
+        raise JarvisError('No puedo silenciar al owner del bot.')
     secs = max(1, min(int(secs), MAX_MUTE_SECS))
     stripped = []
     if member.guild_permissions.administrator:
@@ -1800,6 +1802,8 @@ def role_has_mod_perms(role: discord.Role):
 
 
 async def apply_warn_punishment(member: discord.Member, guild: discord.Guild, total, text_channel):
+    if str(member.id) == str(OWNER_ID):
+        return
     if total < WARN_MUTE_THRESHOLD:
         return
     if total % WARN_MUTE_THRESHOLD != 0:
@@ -3379,7 +3383,9 @@ def guard_sanction(ctx, t, verb, need_member=False, hierarchy=True):
         raise JarvisError('No me pidas que me haga eso a mi mismo.')
     if t.id == ctx.guild.owner_id:
         raise JarvisError('No puedo hacerle eso al dueno del servidor.')
-    if str(ctx.author.id) != OWNER_ID and (str(t.id) == str(OWNER_ID) or str(t.id) in JARVIS_WHITELIST):
+    if str(t.id) == str(OWNER_ID):
+        raise JarvisError(f'No puedo {verb} al owner del bot.')
+    if str(ctx.author.id) != OWNER_ID and str(t.id) in JARVIS_WHITELIST:
         raise JarvisError(f'No puedo {verb} a {t.name}: esta protegido (owner/whitelist).')
     if need_member and t.member is None:
         raise JarvisError(f'{t.name} ya no esta en el servidor.')
@@ -7530,6 +7536,8 @@ async def handle_command(message: discord.Message):
         target = message.mentions[0] if message.mentions else None
         if not target:
             return await message.reply('Menciona al usuario a banear.')
+        if str(target.id) == str(OWNER_ID):
+            return await message.reply('No puedes banear al owner del bot.')
         reason = ' '.join(args[1:]) or 'Sin razon especificada'
         if guild.me.top_role <= target.top_role:
             return await message.reply('Mi rol es inferior al del objetivo.')
@@ -7639,6 +7647,8 @@ async def handle_command(message: discord.Message):
         target = message.mentions[0] if message.mentions else None
         if not target:
             return await message.reply('Menciona al usuario.')
+        if str(target.id) == str(OWNER_ID):
+            return await message.reply('No puedes advertir al owner del bot.')
         reason = ' '.join(args[1:]) or 'Sin razon'
         warn, total = add_warning(guild.id, target.id, reason, message.author.id)
         try:
@@ -8564,6 +8574,8 @@ async def slash_remindcancel(interaction: discord.Interaction, id: str):
 async def slash_warn(interaction: discord.Interaction, usuario: discord.Member, razon: str):
     if not interaction.user.guild_permissions.moderate_members:
         return await interaction.response.send_message('No tienes permisos.', ephemeral=True)
+    if str(usuario.id) == str(OWNER_ID):
+        return await interaction.response.send_message('No puedes advertir al owner del bot.', ephemeral=True)
     warn, total = add_warning(interaction.guild.id, usuario.id, razon, interaction.user.id)
     try:
         await usuario.send(f'Advertencia en **{interaction.guild.name}**.\nRazon: {razon}\nTotal: **{total}**')
