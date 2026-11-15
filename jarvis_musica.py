@@ -19,6 +19,8 @@ VARIABLES DE ENTORNO (todas opcionales)
     JARVIS_YT_PROXY            proxy para yt-dlp (ej: http://usuario:clave@host:puerto)
     JARVIS_YT_JS_RUNTIME       runtime JS: "node", "deno", o "node:/ruta/a/node"
     JARVIS_YT_REMOTE_COMPONENTS  ej: "ejs:github" (deja que yt-dlp descargue el solver de retos si falta)
+    JARVIS_YT_PLAYER_CLIENTS     clientes de YouTube a probar si falla el principal,
+                                 separados por coma (android_vr,tv_downgraded,web_creator,mweb,web_embedded)
     JARVIS_MUSIC_MAX_QUEUE     maximo de canciones en cola (200)
     JARVIS_MUSIC_MAX_PLAYLIST  maximo de canciones que se cargan de una playlist (50)
     JARVIS_MUSIC_MAX_MINUTES   rechaza canciones mas largas que esto (180; 0 = sin limite)
@@ -275,7 +277,8 @@ def _check_deps():
     yt = _load_ytdlp()
     _deps_ok = True
     print(f'[Musica] yt-dlp {getattr(yt.version, "__version__", "?")} | cookies={"si" if COOKIES else "no"} | '
-          f'JS={JS_RUNTIME or "ninguno"} | proxy={"si" if PROXY else "no"}')
+          f'JS={JS_RUNTIME or "ninguno"} | proxy={"si" if PROXY else "no"} | '
+          f'clientes={",".join(PLAYER_CLIENTS)}')
 
 
 # ============================================================================
@@ -307,7 +310,11 @@ def _ydl_opts(flat=False, playlist=False, fmt='bestaudio/best', retries=3, socke
 
 
 # Clientes alternativos de YouTube: se prueban si el cliente por defecto no devuelve "player response".
-_FALLBACK_CLIENTS = ['android_vr', 'web_safari', 'mweb', 'tv']
+# YouTube bloquea IPs de datacenter y pide PO token al cliente "web"; estos clientes suelen seguir
+# entregando el player response. Se puede cambiar sin tocar codigo con JARVIS_YT_PLAYER_CLIENTS.
+_FALLBACK_CLIENTS = ['android_vr', 'tv_downgraded', 'web_creator', 'mweb', 'web_embedded']
+PLAYER_CLIENTS = [x.strip() for x in (os.environ.get('JARVIS_YT_PLAYER_CLIENTS') or '').split(',') if x.strip()] \
+    or _FALLBACK_CLIENTS
 
 
 def _extract(query, flat=False, playlist=False, fmt='bestaudio/best', retries=3, socket_timeout=15):
@@ -320,9 +327,15 @@ def _extract(query, flat=False, playlist=False, fmt='bestaudio/best', retries=3,
         if flat or not any(k in low for k in (
                 'player response', 'timed out', 'timeout', 'connection', 'nsig', 'n challenge')):
             raise
-        # reintento con otros clientes de YouTube, con esperas cortas para que quepan en el timeout
-        opts = _ydl_opts(flat, playlist, fmt, 0, 8)
-        opts['extractor_args'] = {'youtube': {'player_client': _FALLBACK_CLIENTS}}
+        # Reintento con otros clientes de YouTube. player_skip=webpage evita una peticion extra
+        # (la que mas se corta desde IPs de datacenter) y deja que el cliente pida solo lo necesario.
+        print(f'[Musica] Extraccion fallo ({_trunc(str(e), 120)}); reintento con clientes '
+              f'{",".join(PLAYER_CLIENTS)}')
+        opts = _ydl_opts(flat, playlist, fmt, 0, 10)
+        opts['extractor_args'] = {'youtube': {
+            'player_client': PLAYER_CLIENTS,
+            'player_skip': ['webpage'],
+        }}
         with yt.YoutubeDL(opts) as ydl:
             return ydl.extract_info(query, download=False)
 
