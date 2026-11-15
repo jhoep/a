@@ -104,6 +104,12 @@ def _find_cookies():
     cands = [env,
              os.path.join(here, 'cookies.txt'), os.path.join(os.getcwd(), 'cookies.txt'),
              '/app/cookies.txt', '/etc/secrets/cookies.txt']
+    # Render: cualquier Secret File con cookies de YouTube sirve, sin importar el nombre.
+    if os.path.isdir('/etc/secrets'):
+        try:
+            cands += [os.path.join('/etc/secrets', n) for n in sorted(os.listdir('/etc/secrets'))]
+        except OSError:
+            pass
     for path in cands:
         if not path or not os.path.isfile(path):
             continue
@@ -297,6 +303,10 @@ def _check_deps():
         print('[Musica] AVISO: sin cookies de YouTube. En hosts con IP de datacenter (Render/Fly) '
               'YouTube puede responder "Failed to extract any player response". Sube cookies.txt '
               'como Secret File (/etc/secrets/cookies.txt) o define JARVIS_YT_COOKIES_B64.')
+    elif 'sesion=NO' in _cookie_summary():
+        print('[Musica] AVISO: las cookies cargadas no traen SID (sesion de cuenta). YouTube las '
+              'trata como anonimas y puede seguir bloqueando la IP. Exporta las cookies con la '
+              'cuenta logueada (extension "Get cookies.txt LOCALLY").')
 
 
 # ============================================================================
@@ -331,10 +341,22 @@ def _ydl_opts(flat=False, playlist=False, fmt='bestaudio/best', retries=3, socke
 # android_vr/tv no piden PO token y suelen entregar el player response desde la nube.
 # Se puede cambiar sin tocar codigo con JARVIS_YT_PLAYER_CLIENTS.
 _ANON_CLIENTS = ['android_vr', 'tv', 'web_safari']
-_FALLBACK_CLIENTS = ['mweb', 'tv', 'web_safari', 'android_vr', 'tv_downgraded']
+# Con cookies de una cuenta, el cliente que realmente usa la sesion es "web".
+_COOKIE_CLIENTS = ['web', 'tv']
+_FALLBACK_CLIENTS = ['mweb', 'tv', 'web_safari', 'android_vr', 'tv_downgraded', 'web']
 PLAYER_CLIENTS = [x.strip() for x in (os.environ.get('JARVIS_YT_PLAYER_CLIENTS') or '').split(',') if x.strip()] \
     or _FALLBACK_CLIENTS
 _best_clients = None    # (clientes, player_skip) que funciono la ultima vez; se prueba primero
+
+
+def _yt_status():
+    """Resumen de una linea para diagnosticar fallos de extraccion."""
+    try:
+        ver = getattr(_load_ytdlp().version, '__version__', '?')
+    except Exception:
+        ver = '?'
+    return (f'yt-dlp {ver} | cookies={_cookie_summary()} | JS={JS_RUNTIME or "ninguno"} | '
+            f'proxy={"si" if PROXY else "no"}')
 
 
 def _yt_opts(flat, playlist, fmt, clients, skip_webpage=False):
@@ -351,14 +373,18 @@ def _extract(query, flat=False, playlist=False, fmt='bestaudio/best', retries=3,
     global _best_clients
     yt = _load_ytdlp()
     variants = []
-    if not flat:
+    if flat:
+        variants.append(None)
+    else:
         if _best_clients:
             variants.append(_best_clients)
-        if _best_clients != (_ANON_CLIENTS, True):
+        if COOKIES and (_COOKIE_CLIENTS, False) not in variants:
+            variants.append((_COOKIE_CLIENTS, False))
+        if (_ANON_CLIENTS, True) not in variants:
             variants.append((_ANON_CLIENTS, True))
-    variants.append(None)
-    if not flat and PLAYER_CLIENTS not in [v[0] for v in variants if v]:
-        variants.append((PLAYER_CLIENTS, False))
+        variants.append(None)
+        if PLAYER_CLIENTS not in [c for c, _ in (v for v in variants if v)]:
+            variants.append((PLAYER_CLIENTS, False))
 
     last = None
     for variant in variants:
@@ -372,7 +398,8 @@ def _extract(query, flat=False, playlist=False, fmt='bestaudio/best', retries=3,
             with yt.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(query, download=False)
             if info:
-                _best_clients = variant
+                if not flat:        # la busqueda plana no borra el cliente que ya funcionaba
+                    _best_clients = variant
                 if len(variants) > 1:
                     print(f'[Musica] Extraccion OK con {label}')
                 return info
@@ -383,6 +410,7 @@ def _extract(query, flat=False, playlist=False, fmt='bestaudio/best', retries=3,
             print(f'[Musica] Extraccion con {label} fallo: {_trunc(str(e), 160)}')
     if last is None:
         raise _err('YouTube no devolvio informacion para eso. Intenta de nuevo en un momento.')
+    print(f'[Musica] Ningun cliente extrajo "{_trunc(query, 60)}". {_yt_status()}')
     raise last
 
 
@@ -414,11 +442,11 @@ def _explain(e):
     if 'timed out' in low or 'timeout' in low:
         return 'YouTube tardo demasiado en responder (conexion lenta o bloqueada). Intenta de nuevo en un momento.'
     if 'failed to extract any player response' in low:
-        return ('YouTube no le entrego el reproductor al servidor: esta bloqueando la IP del host '
-                '(Render/Fly son IPs de datacenter) hasta que se envie una sesion valida. '
-                'Sube cookies.txt como Secret File en `/etc/secrets/cookies.txt` o define '
-                '`JARVIS_YT_COOKIES_B64`, actualiza yt-dlp y, si sigue, usa `JARVIS_YT_PROXY` '
-                '(proxy residencial).')
+        return ('YouTube no le entrego el reproductor al servidor: bloquea la IP del host '
+                '(Render/Fly son IPs de datacenter) o las cookies vencieron. Sube cookies.txt '
+                'como Secret File en `/etc/secrets/cookies.txt` (o define `JARVIS_YT_COOKIES_B64`), '
+                'y si sigue, usa `JARVIS_YT_PROXY` con un proxy residencial.\n'
+                f'Diagnostico: {_yt_status()}')
     if ('confirm' in low and 'bot' in low) or 'sign in to' in low:
         return ('YouTube esta bloqueando al servidor del bot ("confirma que no eres un bot"). '
                 'Configura cookies con `JARVIS_YT_COOKIES` o cambia de host/IP.')
