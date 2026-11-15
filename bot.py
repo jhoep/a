@@ -9706,10 +9706,32 @@ def keep_alive():
 # ============================================================================
 # STARTUP
 # ============================================================================
+def _voice_dep_versions():
+    from importlib.metadata import PackageNotFoundError, version
+
+    def _get(name):
+        try:
+            return version(name)
+        except PackageNotFoundError:
+            return None
+
+    dp, dv = _get('discord.py'), _get('davey')
+    if dp is None:
+        return 'discord.py no instalado'
+    if dv is None:
+        return f'discord.py {dp} | davey FALTA (la voz E2EE de Discord no funcionara)'
+    warn = ''
+    if dv.split('.')[:2] == ['0', '2']:
+        warn = ' <- INCOMPATIBLE con discord.py 2.7: fija davey<0.2 en requirements.txt'
+    return f'discord.py {dp} | davey {dv}{warn}'
+
+
 async def main():
     if not DISCORD_TOKEN:
         print('FATAL: DISCORD_TOKEN no configurado.')
         raise SystemExit(1)
+
+    print(f'[Voz] {_voice_dep_versions()}')
 
     await webserver.start(
         client,

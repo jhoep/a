@@ -1,5 +1,10 @@
 
-discord.py[voice]>=2.7
+# discord.py 2.7.x usa la API de davey 0.1 (process_welcome/process_commit instalan
+# las claves). davey 0.2 rompio esa API (transiciones MLS preparar/ejecutar) y el
+# handshake de voz muere con "Cannot write to closing transport". Fijar <0.2 hasta
+# que discord.py publique soporte para davey 0.2.
+discord.py[voice]==2.7.1
+davey==0.1.7
 aiohttp>=3.9.0
 edge-tts
 gTTS

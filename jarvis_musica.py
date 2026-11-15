@@ -982,7 +982,8 @@ def _check_join(guild, ch):
 
 async def _join(guild, ch):
     fn = getattr(_m, '_afk_join', None)     # reutiliza la conexion rapida del modulo AFK
-    try:
+
+    async def _attempt():
         if fn:
             return await fn(guild, ch)
         vc = guild.voice_client
@@ -991,8 +992,18 @@ async def _join(guild, ch):
                 await vc.move_to(ch)
             return vc
         return await ch.connect(timeout=10, reconnect=True, self_deaf=True)
-    except Exception as e:
-        raise _err(f'No pude conectarme a {ch.mention}: {_short(e)}')
+
+    try:
+        return await _attempt()
+    except Exception as first:
+        # El handshake de voz (DAVE) a veces se corta con "Cannot write to closing
+        # transport" antes de completar; un segundo intento normalmente entra.
+        print(f'[Musica] Primer intento de voz fallo: {_short(first)}; reintentando')
+        await asyncio.sleep(1.5)
+        try:
+            return await _attempt()
+        except Exception as e:
+            raise _err(f'No pude conectarme a {ch.mention}: {_short(e)}')
 
 
 async def do_play(guild, member, query, text_channel):
