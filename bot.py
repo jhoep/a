@@ -12,6 +12,7 @@ import unicodedata
 import threading
 import http.server
 import sqlite3
+import shutil
 from contextlib import closing
 from collections import deque
 from dataclasses import dataclass, field
@@ -7762,7 +7763,32 @@ async def handle_command(message: discord.Message):
             except aiohttp.ClientError as e:
                 return await message.reply(f'No pude descargar la imagen: {e}')
 
-            if cmd == 'sticker':
+            if cmd in ('gif', 'sticker'):
+                if is_gif:
+                    ffmpeg_exe = shutil.which('ffmpeg')
+                    if not ffmpeg_exe:
+                        try:
+                            import imageio_ffmpeg
+                            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+                        except ImportError:
+                            return await message.reply('Necesito FFmpeg para convertir el GIF en sticker animado.')
+                    process = await asyncio.create_subprocess_exec(
+                        ffmpeg_exe, '-hide_banner', '-loglevel', 'error',
+                        '-f', 'gif', '-i', 'pipe:0', '-t', '5',
+                        '-vf', 'fps=20,scale=320:320:force_original_aspect_ratio=decrease:flags=lanczos,'
+                               'pad=320:320:(ow-iw)/2:(oh-ih)/2:color=0x00000000,format=rgba',
+                        '-plays', '0', '-f', 'apng', 'pipe:1',
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    img_bytes, ffmpeg_error = await process.communicate(img_bytes)
+                    if process.returncode or not img_bytes:
+                        detail = ffmpeg_error.decode('utf-8', errors='replace').strip()
+                        return await message.reply(f'No pude convertir el GIF en sticker: {detail or "error de FFmpeg"}')
+                    filename = f'{Path(filename).stem or "sticker"}.png'
+                if len(img_bytes) > 512 * 1024:
+                    return await message.reply('La imagen supera el límite de 512 KB para stickers.')
                 sticker_name = re.sub(r'[^a-zA-Z0-9_ -]', '_', name or Path(filename).stem)[:30].strip() or 'sticker'
                 new_s = await guild.create_sticker(
                     name=sticker_name, description='Sticker importado', emoji='⭐',
