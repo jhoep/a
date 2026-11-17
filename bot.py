@@ -7679,97 +7679,106 @@ async def handle_command(message: discord.Message):
             await message.reply(f'Error: {e}')
         return
 
-    # ROBAR
-    if cmd == 'robar':
+    # IMPORTAR GIF, STICKER O EMOJI
+    if cmd in ('gif', 'sticker', 'emoji'):
+        if guild is None:
+            return await message.reply('Este comando solo funciona dentro de un servidor.')
         target = message
         if message.reference and message.reference.message_id:
             try:
                 target = await message.channel.fetch_message(message.reference.message_id)
             except Exception:
                 target = message
-        content_to_check = ' '.join(args) or target.content or ''
+        content_to_check = f'{target.content or ""} {" ".join(args)}'
         custom_emoji_re = re.compile(r'<(a?):([A-Za-z0-9_]+):(\d+)>')
-        img_url_re = re.compile(r'(https?://\S+\.(?:png|jpe?g|gif|webp))', re.IGNORECASE)
-        kind, name, ident, url, desc = 'Desconocido', '', '', '', ''
-
+        img_url_re = re.compile(r'(https?://\S+\.(?:png|jpe?g|gif|webp)(?:\?[^\s]*)?)', re.IGNORECASE)
+        name, ident, url, filename, content_type = '', '', '', '', ''
         if target.stickers:
             sticker = target.stickers[0]
-            kind = 'Sticker'
             name = sticker.name or ''
             ident = str(sticker.id or '')
-            fmt = 'gif' if str(sticker.format) == 'StickerFormatType.apng' or str(sticker.format) == 'StickerFormatType.gif' else 'png'
-            url = f'https://cdn.discordapp.com/stickers/{ident}.{fmt}'
-            desc = f'Sticker name: {name}\nSticker id: {ident}'
+            fmt = str(sticker.format)
+            extension = 'gif' if fmt.endswith('.gif') else 'png'
+            url = f'https://cdn.discordapp.com/stickers/{ident}.{extension}'
+            filename = f'{name}.{extension}'
+            content_type = 'image/gif' if extension == 'gif' else 'image/png'
         else:
             emoji_match = custom_emoji_re.search(content_to_check)
             if emoji_match:
                 animated, name, ident = emoji_match.group(1), emoji_match.group(2), emoji_match.group(3)
-                kind = 'Emoji personalizado'
-                url = f'https://cdn.discordapp.com/emojis/{ident}.{"gif" if animated == "a" else "png"}'
-                desc = f'Nombre: {name}\nID: {ident}\nAnimado: {"si" if animated == "a" else "no"}'
-            elif target.attachments:
-                att = target.attachments[0]
-                if (att.content_type and att.content_type.startswith('image')) or img_url_re.search(att.url):
-                    kind = 'Adjunto'
-                    name = att.filename or ''
-                    url = att.url
-                    desc = f'Archivo: {name}\nURL: {url}'
+                extension = 'gif' if animated == 'a' else 'png'
+                url = f'https://cdn.discordapp.com/emojis/{ident}.{extension}'
+                filename = f'{name}.{extension}'
+                content_type = f'image/{extension}'
             else:
+                for att in target.attachments:
+                    if (att.content_type and att.content_type.startswith('image/')) or img_url_re.search(att.url):
+                        name = att.filename or ''
+                        filename = name
+                        url = att.url
+                        content_type = att.content_type or ''
+                        break
+                if not url:
+                    for embed_item in target.embeds:
+                        for preview in (embed_item.image, embed_item.thumbnail):
+                            preview_url = getattr(preview, 'url', None)
+                            if preview_url:
+                                url = preview_url
+                                filename = url.rsplit('/', 1)[-1].split('?', 1)[0]
+                                break
+                        if url:
+                            break
+            if not url:
                 url_match = img_url_re.search(content_to_check)
                 if url_match:
-                    kind = 'URL de imagen'
                     url = url_match.group(1)
-                    desc = f'URL: {url}'
+                    filename = url.rsplit('/', 1)[-1].split('?', 1)[0]
 
-        embed = discord.Embed(title='Robado!', color=0xFFCC00)
-        embed.set_footer(text=f'Robado por {message.author}', icon_url=message.author.display_avatar.url)
-        embed.add_field(name='Tipo', value=kind, inline=True)
-        if name:
-            embed.add_field(name='Nombre', value=name, inline=True)
-        if ident:
-            embed.add_field(name='ID', value=ident, inline=True)
-        if desc:
-            embed.description = desc
-        if url:
-            embed.set_image(url=url)
-
-        if kind == 'Desconocido':
-            embed.title = 'Nada que robar'
-            embed.description = 'No encontre sticker, emoji personalizado, adjunto ni URL de imagen.'
-            return await message.reply(embed=embed)
+        if not url:
+            return await message.reply(f'Responde a una imagen o proporciona su URL para usar `>>{cmd}`.')
+        is_gif = content_type.lower().split(';', 1)[0] == 'image/gif' or bool(
+            re.search(r'\.gif(?:\?|$)', url, re.IGNORECASE)
+        ) or filename.lower().endswith('.gif')
+        if cmd == 'gif' and not is_gif:
+            return await message.reply('`>>gif` necesita un GIF. Responde al GIF o proporciona su URL.')
 
         bot_member = guild.me
-        if not bot_member.guild_permissions.manage_expressions if hasattr(bot_member.guild_permissions, 'manage_expressions') else not bot_member.guild_permissions.manage_emojis:
-            embed.add_field(name='Sin permisos', value='No tengo permiso para Manage Expressions.')
-            return await message.reply(embed=embed)
+        can_manage_expressions = (
+            getattr(bot_member.guild_permissions, 'manage_expressions', False)
+            if bot_member else False
+        )
+        if not can_manage_expressions and bot_member:
+            can_manage_expressions = getattr(bot_member.guild_permissions, 'manage_emojis', False)
+        if not can_manage_expressions:
+            return await message.reply('No tengo permiso para administrar emojis y stickers (Manage Expressions).')
 
-        if kind in ('Emoji personalizado', 'Adjunto', 'URL de imagen') and url:
+        try:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url) as resp:
+                        resp.raise_for_status()
                         img_bytes = await resp.read()
-                emoji_name = re.sub(r'[^a-zA-Z0-9_]', '_', (name or f'robar_{ident or message.id}'))[:32] or 'robado'
-                new_emoji = await guild.create_custom_emoji(name=emoji_name, image=img_bytes, reason=f'Robado por {message.author}')
-                embed.add_field(name='Anadido', value=f'Emoji anadido: <:{new_emoji.name}:{new_emoji.id}>')
-            except Exception as e:
-                embed.add_field(name='Error', value=f'No se pudo anadir: {e}')
-        elif kind == 'Sticker' and url:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url) as resp:
-                        buf = await resp.read()
-                s_name = (name or f'sticker_{ident or message.id}')[:30]
-                fname = 'sticker.gif' if url.endswith('.gif') else 'sticker.png'
-                new_s = await guild.create_sticker(
-                    name=s_name, description='robado', emoji='⭐',
-                    file=discord.File(fp=__import__('io').BytesIO(buf), filename=fname),
-                    reason=f'Robado por {message.author}',
-                )
-                embed.add_field(name='Anadido', value=f'Sticker anadido: **{new_s.name}**')
-            except Exception as e:
-                embed.add_field(name='Error', value=f'No se pudo anadir: {e}')
 
-        return await message.reply(embed=embed)
+            except aiohttp.ClientError as e:
+                return await message.reply(f'No pude descargar la imagen: {e}')
+
+            if cmd == 'sticker':
+                sticker_name = re.sub(r'[^a-zA-Z0-9_ -]', '_', name or Path(filename).stem)[:30].strip() or 'sticker'
+                new_s = await guild.create_sticker(
+                    name=sticker_name, description='Sticker importado', emoji='⭐',
+                    file=discord.File(fp=io.BytesIO(img_bytes), filename=filename or 'sticker.png'),
+                    reason=f'Importado por {message.author}',
+                )
+                return await message.reply(f'Sticker añadido: **{new_s.name}**')
+
+            emoji_name = re.sub(r'[^a-zA-Z0-9_]', '_', name or Path(filename).stem)[:32].strip('_') or 'emoji'
+            new_emoji = await guild.create_custom_emoji(
+                name=emoji_name, image=img_bytes, reason=f'Importado por {message.author}',
+            )
+            emoji_tag = f'<{"a" if new_emoji.animated else ""}:{new_emoji.name}:{new_emoji.id}>'
+            return await message.reply(f'Emoji añadido: {emoji_tag}')
+        except Exception as e:
+            return await message.reply(f'No se pudo añadir el {cmd}: {e}')
 
     # SERVER (owner only)
     if cmd == 'server':
@@ -7924,7 +7933,7 @@ async def handle_command(message: discord.Message):
         embed = discord.Embed(title='Comandos Disponibles', description=f'Prefijo: `{PREFIX}`', color=0x5865F2)
         embed.timestamp = datetime.now(timezone.utc)
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
-        embed.add_field(name='Utilidades', value='`ping` `robar` `quitar_icono` (quita 🩸 de los canales)\n`jarvis <pregunta>` - Asistente IA', inline=False)
+        embed.add_field(name='Utilidades', value='`ping` `gif` `sticker` `emoji` `quitar_icono` (quita 🩸 de los canales)\n`jarvis <pregunta>` - Asistente IA', inline=False)
         embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla` (`/quitar_regla_apodo`) `/show_logs`\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
