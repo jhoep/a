@@ -12,7 +12,6 @@ import unicodedata
 import threading
 import http.server
 import sqlite3
-import shutil
 from contextlib import closing
 from collections import deque
 from dataclasses import dataclass, field
@@ -7737,22 +7736,6 @@ async def handle_command(message: discord.Message):
 
         if not url:
             return await message.reply(f'Responde a una imagen o proporciona su URL para usar `>>{cmd}`.')
-        is_gif = content_type.lower().split(';', 1)[0] == 'image/gif' or bool(
-            re.search(r'\.gif(?:\?|$)', url, re.IGNORECASE)
-        ) or filename.lower().endswith('.gif')
-        if cmd == 'gif' and not is_gif:
-            return await message.reply('`>>gif` necesita un GIF. Responde al GIF o proporciona su URL.')
-
-        bot_member = guild.me
-        can_manage_expressions = (
-            getattr(bot_member.guild_permissions, 'manage_expressions', False)
-            if bot_member else False
-        )
-        if not can_manage_expressions and bot_member:
-            can_manage_expressions = getattr(bot_member.guild_permissions, 'manage_emojis', False)
-        if not can_manage_expressions:
-            return await message.reply('No tengo permiso para administrar emojis y stickers (Manage Expressions).')
-
         try:
             try:
                 async with aiohttp.ClientSession() as session:
@@ -7763,8 +7746,28 @@ async def handle_command(message: discord.Message):
             except aiohttp.ClientError as e:
                 return await message.reply(f'No pude descargar la imagen: {e}')
 
-            if cmd in ('gif', 'sticker'):
+            is_gif = img_bytes.startswith((b'GIF87a', b'GIF89a'))
+            if cmd == 'gif':
+                if not is_gif:
+                    return await message.reply('`>>gif` necesita un archivo GIF válido. Responde al GIF o proporciona su URL.')
+                gif_name = Path(filename).stem if filename else f'gif_{ident or message.id}'
+                return await message.reply(
+                    file=discord.File(fp=io.BytesIO(img_bytes), filename=f'{gif_name}.gif')
+                )
+
+            bot_member = guild.me
+            can_manage_expressions = (
+                getattr(bot_member.guild_permissions, 'manage_expressions', False)
+                if bot_member else False
+            )
+            if not can_manage_expressions and bot_member:
+                can_manage_expressions = getattr(bot_member.guild_permissions, 'manage_emojis', False)
+            if not can_manage_expressions:
+                return await message.reply('No tengo permiso para administrar emojis y stickers (Manage Expressions).')
+
+            if cmd == 'sticker':
                 if is_gif:
+                    import shutil
                     ffmpeg_exe = shutil.which('ffmpeg')
                     if not ffmpeg_exe:
                         try:
