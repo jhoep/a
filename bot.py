@@ -4999,8 +4999,13 @@ def _log_nickrule(entry, action, actor_id=None):
     save_json(NICKRULE_LOG_FILE, nick_rule_logs)
 
 
-async def _fire_nickrule(entry):
+async def _fire_nickrule(entry, expected_until=None):
     if entry not in nick_rules:
+        return
+    until = entry.get('until')
+    if expected_until is not None and until != expected_until:
+        return
+    if until is not None and until > time.time():
         return
     try:
         guild = client.get_guild(int(entry['guildId'])) or await client.fetch_guild(int(entry['guildId']))
@@ -5013,7 +5018,7 @@ async def _fire_nickrule(entry):
         print(f'[NickRule] No pude restaurar el apodo: {e}')
         async def _retry():
             await asyncio.sleep(60)
-            await _fire_nickrule(entry)
+            await _fire_nickrule(entry, expected_until)
         spawn(_retry())
         return
     if entry in nick_rules:
@@ -5023,12 +5028,13 @@ async def _fire_nickrule(entry):
 
 
 def schedule_nickrule(entry):
-    if entry.get('until') is None:
+    until = entry.get('until')
+    if until is None:
         return
 
     async def _wait():
-        await asyncio.sleep(max(0.0, entry['until'] - time.time()))
-        await _fire_nickrule(entry)
+        await asyncio.sleep(max(0.0, until - time.time()))
+        await _fire_nickrule(entry, expected_until=until)
     spawn(_wait())
 
 
@@ -7572,13 +7578,15 @@ async def handle_command(message: discord.Message):
         if str(message.author.id) != OWNER_ID:
             return await message.reply('Solo el owner puede sincronizar los slash commands.')
         if guild is None:
-            return await message.reply('Ejecuta `>>syncslash` dentro del servidor donde quieres actualizar los comandos.')
+            return await message.reply('Ejecuta `>>syncslash` dentro de un servidor para limpiar registros duplicados y actualizar los comandos globales.')
         try:
-            sync_guild = discord.Object(id=guild.id)
-            client.tree.copy_global_to(guild=sync_guild)
-            synced = await client.tree.sync(guild=sync_guild)
+            await clear_guild_slash_commands(guild)
+            synced = await client.tree.sync()
             names = ', '.join(sorted(command.name for command in synced))
-            return await message.reply(f'Sincronizados **{len(synced)}** slash commands en **{guild.name}**.\n{names[:1600]}')
+            return await message.reply(
+                f'Limpiados los registros de servidor y sincronizados **{len(synced)}** slash commands globales. '
+                f'Los cambios globales pueden tardar en aparecer.\n{names[:1500]}'
+            )
         except Exception as e:
             print(f'[Slash] Sync manual fallo en {guild.id}: {e}')
             return await message.reply(f'No pude sincronizar los comandos: {short_error(e)}')
@@ -8133,23 +8141,31 @@ async def handle_command(message: discord.Message):
 _slash_sync_done = False
 
 
+async def clear_guild_slash_commands(guild):
+    sync_guild = discord.Object(id=guild.id)
+    client.tree.clear_commands(guild=sync_guild)
+    return await client.tree.sync(guild=sync_guild)
+
+
 async def sync_slash():
     global _slash_sync_done
     if _slash_sync_done:
         return
     _slash_sync_done = True
     try:
-        gid = os.environ.get('SLASH_SYNC_GUILD_ID', '').strip()
-        if gid:
-            guild = discord.Object(id=int(gid))
-            client.tree.copy_global_to(guild=guild)
-            synced = await client.tree.sync(guild=guild)
-            scope = f'servidor {gid}'
-        else:
-            synced = await client.tree.sync()
-            scope = 'global'
+        semaphore = asyncio.Semaphore(5)
+
+        async def clear_guild(guild):
+            async with semaphore:
+                try:
+                    await clear_guild_slash_commands(guild)
+                except discord.DiscordException as error:
+                    print(f'[Slash] No pude limpiar comandos antiguos del servidor {guild.id}: {error}')
+
+        await asyncio.gather(*(clear_guild(guild) for guild in client.guilds))
+        synced = await client.tree.sync()
         names = sorted(command.name for command in synced)
-        print(f'[Slash] {len(synced)} comandos ({scope}): {", ".join(names)}')
+        print(f'[Slash] {len(synced)} comandos globales: {", ".join(names)}')
         faltan = {'auditoria', 'regla_apodo', 'quitar_regla', 'show_logs', 'denegar_permisos', 'activar_permisos'} - set(names)
         if faltan:
             print(f'[Slash] NO llegaron a Discord: {faltan}')
@@ -8936,46 +8952,61 @@ def can_manage_member_nickname(guild, actor, member):
 @app_commands.guild_only()
 @app_commands.describe(usuario='Miembro del servidor', apodo='Apodo que Jarvis mantendra', duracion='permanente o una duracion (ej: 30m, 2h, 3d)')
 async def slash_regla_apodo(interaction: discord.Interaction, usuario: discord.Member, apodo: str, duracion: str = 'permanente'):
-    await interaction.response.defer(ephemeral=True)
     member = usuario
     error = can_manage_member_nickname(interaction.guild, interaction.user, member)
     if error:
-        return await interaction.followup.send(error)
+        return await interaction.response.send_message(error, ephemeral=True)
 
     nickname = apodo.strip()
     if not nickname or len(nickname) > 32:
-        return await interaction.followup.send('El apodo debe tener entre 1 y 32 caracteres.')
+        return await interaction.response.send_message('El apodo debe tener entre 1 y 32 caracteres.', ephemeral=True)
     permanent = normalize_for_compare(duracion) in ('permanente', 'permanentemente', 'para siempre', 'indefinido', 'indefinidamente')
     seconds = None if permanent else parse_duration(duracion)
     if not permanent and (not seconds or seconds < 1 or seconds > 365 * 24 * 3600):
-        return await interaction.followup.send('Duracion invalida. Usa `permanente` o una duracion de hasta 365 dias (ej: 30m, 2h, 3d).')
+        return await interaction.response.send_message(
+            'Duracion invalida. Usa `permanente` o una duracion de hasta 365 dias (ej: 30m, 2h, 3d).',
+            ephemeral=True,
+        )
 
     existing = next((e for e in nick_rules
                      if e['guildId'] == str(interaction.guild.id) and e['userId'] == str(member.id)), None)
     old_nick = existing['oldNick'] if existing else member.nick
+    until = None if permanent else time.time() + seconds
+    previous_rule_state = None
+    if existing:
+        previous_rule_state = (existing['newNick'], existing.get('until'))
+        existing['newNick'] = nickname
+        existing['until'] = until
+        entry = existing
+    else:
+        entry = {
+            'guildId': str(interaction.guild.id),
+            'userId': str(member.id),
+            'oldNick': old_nick,
+            'newNick': nickname,
+            'until': until,
+        }
+
+    await interaction.response.send_message('Aplicando la regla de apodo...', ephemeral=True)
     try:
         await member.edit(nick=nickname, reason=f'[Jarvis] Regla de apodo por {interaction.user}')
-    except Exception as e:
-        return await interaction.followup.send(f'No pude cambiar el apodo: {short_error(e)}')
+    except discord.DiscordException as error:
+        if existing and previous_rule_state is not None:
+            existing['newNick'], existing['until'] = previous_rule_state
+        return await interaction.edit_original_response(
+            content=f'No pude cambiar el apodo: {short_error(error)}',
+        )
 
-    if existing:
-        nick_rules.remove(existing)
-    entry = {
-        'guildId': str(interaction.guild.id),
-        'userId': str(member.id),
-        'oldNick': old_nick,
-        'newNick': nickname,
-        'until': None if permanent else time.time() + seconds,
-    }
-    nick_rules.append(entry)
+    if not existing:
+        nick_rules.append(entry)
     _save_nickrules()
     _log_nickrule(entry, 'actualizada' if existing else 'creada', interaction.user.id)
     schedule_nickrule(entry)
     duration_text = 'permanentemente' if permanent else f'durante **{format_duration(seconds)}**'
     finish_text = 'y al quitar la regla restaurara su apodo anterior.' if permanent else 'y al terminar restaurara su apodo anterior.'
-    await interaction.followup.send(
-        f'Aplicare **{nickname}** a {member.mention} {duration_text}. '
-        f'Jarvis lo volvera a poner si se lo cambian {finish_text}',
+    await interaction.edit_original_response(
+        content=f'Aplicare **{nickname}** a {member.mention} {duration_text}. '
+                f'Jarvis lo volvera a poner si se lo cambian {finish_text}',
     )
 
 
