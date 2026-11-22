@@ -5034,8 +5034,9 @@ async def _ensure_quarantine_role(guild, bot_member):
 
 
 async def _apply_quarantine_overwrites(guild, member, role, entry):
+    channels = list(guild.channels)
     original_by_channel = {item['channelId']: item for item in entry.get('channelOverwrites', [])}
-    for channel in guild.channels:
+    for channel in channels:
         channel_id = str(channel.id)
         original = original_by_channel.get(channel_id)
         if original is None:
@@ -5048,19 +5049,36 @@ async def _apply_quarantine_overwrites(guild, member, role, entry):
             entry.setdefault('channelOverwrites', []).append(original)
             original_by_channel[channel_id] = original
 
-        role_overwrite = _quarantine_overwrite(channel.overwrites_for(role))
-        if channel.overwrites_for(role) != role_overwrite:
-            await channel.set_permissions(
-                role, overwrite=role_overwrite, reason='[Jarvis] Bloquear canales al rol quarantine',
-            )
+    _save_quarantines()
 
-        member_overwrite = _quarantine_overwrite(_deserialize_overwrite(original))
-        if channel.overwrites_for(member) != member_overwrite:
-            await channel.set_permissions(
-                member,
-                overwrite=member_overwrite,
-                reason='[Jarvis] Impedir permisos individuales durante quarantine',
-            )
+    semaphore = asyncio.Semaphore(5)
+
+    async def apply_channel_overwrites(channel):
+        async with semaphore:
+            original = original_by_channel[str(channel.id)]
+            current_role_overwrite = channel.overwrites_for(role)
+            role_overwrite = _quarantine_overwrite(current_role_overwrite)
+            if current_role_overwrite != role_overwrite:
+                await channel.set_permissions(
+                    role, overwrite=role_overwrite, reason='[Jarvis] Bloquear canales al rol quarantine',
+                )
+
+            current_member_overwrite = channel.overwrites_for(member)
+            member_overwrite = _quarantine_overwrite(_deserialize_overwrite(original))
+            if current_member_overwrite != member_overwrite:
+                await channel.set_permissions(
+                    member,
+                    overwrite=member_overwrite,
+                    reason='[Jarvis] Impedir permisos individuales durante quarantine',
+                )
+
+    results = await asyncio.gather(
+        *(apply_channel_overwrites(channel) for channel in channels),
+        return_exceptions=True,
+    )
+    errors = [result for result in results if isinstance(result, BaseException)]
+    if errors:
+        raise errors[0]
     _save_quarantines()
 
 
@@ -5116,10 +5134,34 @@ async def _enforce_quarantine_channel(channel, entry):
     )
 
 
+async def _restore_quarantine_overwrites(guild, target, entry):
+    for saved in entry.get('channelOverwrites', []):
+        channel = guild.get_channel(int(saved['channelId']))
+        if channel is not None:
+            try:
+                await channel.set_permissions(
+                    target,
+                    overwrite=(
+                        _deserialize_overwrite(saved)
+                        if saved.get('hadOverwrite', True) else None
+                    ),
+                    reason='[Jarvis] Restaurar permisos previos a quarantine',
+                )
+            except discord.NotFound:
+                continue
+
+
 async def _restore_quarantine(entry):
     guild = client.get_guild(int(entry['guildId'])) or await client.fetch_guild(int(entry['guildId']))
     uid = int(entry['userId'])
-    member = guild.get_member(uid) or await guild.fetch_member(uid)
+    member = guild.get_member(uid)
+    if member is None:
+        try:
+            member = await guild.fetch_member(uid)
+        except discord.NotFound:
+            user = client.get_user(uid) or await client.fetch_user(uid)
+            await _restore_quarantine_overwrites(guild, user, entry)
+            return
 
     roles = [guild.get_role(int(role_id)) for role_id in entry.get('roleIds', [])]
     roles = [role for role in roles
@@ -5133,17 +5175,7 @@ async def _restore_quarantine(entry):
             quarantine_role, reason='[Jarvis] Fin de quarantine: quitar rol de quarantine',
         )
 
-    for saved in entry.get('channelOverwrites', []):
-        channel = guild.get_channel(int(saved['channelId']))
-        if channel is not None:
-            await channel.set_permissions(
-                member,
-                overwrite=(
-                    _deserialize_overwrite(saved)
-                    if saved.get('hadOverwrite', True) else None
-                ),
-                reason='[Jarvis] Restaurar permisos previos a quarantine',
-            )
+    await _restore_quarantine_overwrites(guild, member, entry)
 
 
 async def _fire_quarantine(entry, force=False):
@@ -8319,6 +8351,18 @@ async def on_member_join(member: discord.Member):
     except Exception as e:
         print(f'[AntiRaid] on_member_join: {e}')
 
+    quarantine = next(
+        (entry for entry in quarantine_data
+         if entry['guildId'] == str(member.guild.id)
+         and entry['userId'] == str(member.id)),
+        None,
+    )
+    if quarantine is not None:
+        if quarantine.get('until') is not None and quarantine['until'] <= time.time():
+            await _fire_quarantine(quarantine, force=True)
+        else:
+            await _resume_quarantine(quarantine)
+
     embed = discord.Embed(title='Nuevo miembro', description=f'{member.mention} se unio al servidor.', color=0x2ecc71)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name='Usuario', value=f'{member} (`{member.id}`)', inline=True)
@@ -8338,6 +8382,18 @@ async def on_member_ban(guild: discord.Guild, user: discord.User):
 
 @client.event
 async def on_member_remove(member: discord.Member):
+    quarantine = next(
+        (entry for entry in quarantine_data
+         if entry['guildId'] == str(member.guild.id)
+         and entry['userId'] == str(member.id)),
+        None,
+    )
+    if quarantine is not None:
+        try:
+            await _restore_quarantine_overwrites(member.guild, member, quarantine)
+        except discord.DiscordException as error:
+            print(f'[Quarantine] No pude limpiar overwrites de {member.id} al salir: {error}')
+
     embed = discord.Embed(title='Miembro salio', description=f'{member} salio del servidor.', color=0xe74c3c)
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name='Usuario', value=f'{member} (`{member.id}`)', inline=True)
