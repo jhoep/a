@@ -98,24 +98,96 @@ def save_json(file_path, data):
 
 
 _bot_command_denials_saved = load_json(BOT_COMMAND_DENY_FILE, [])
-BOT_COMMAND_DENIALS = {
-    str(user_id) for user_id in _bot_command_denials_saved
-    if str(user_id).isdigit()
-} if isinstance(_bot_command_denials_saved, list) else set()
+BOT_COMMAND_DENIALS = {}
+if isinstance(_bot_command_denials_saved, list):
+    for user_id in _bot_command_denials_saved:
+        if str(user_id).isdigit():
+            BOT_COMMAND_DENIALS[str(user_id)] = {'all': True, 'allowed': set()}
+elif isinstance(_bot_command_denials_saved, dict):
+    saved_users = _bot_command_denials_saved.get('users', _bot_command_denials_saved)
+    if isinstance(saved_users, dict):
+        for user_id, state in saved_users.items():
+            if not str(user_id).isdigit():
+                continue
+            if isinstance(state, dict):
+                allowed = state.get('allowed', [])
+                BOT_COMMAND_DENIALS[str(user_id)] = {
+                    'all': bool(state.get('all', True)),
+                    'allowed': {
+                        command for raw in allowed
+                        if (command := ' '.join(str(raw).strip().lower().split()))
+                    } if isinstance(allowed, list) else set(),
+                }
+            else:
+                BOT_COMMAND_DENIALS[str(user_id)] = {'all': True, 'allowed': set()}
 
 
-def _is_bot_command_denied(user):
-    return str(user.id) != OWNER_ID and str(user.id) in BOT_COMMAND_DENIALS
+def _normalize_bot_command_name(command):
+    normalized = ' '.join(str(command or '').strip().lower().split())
+    if normalized.startswith(PREFIX):
+        normalized = normalized[len(PREFIX):].strip()
+    elif normalized.startswith('/'):
+        normalized = normalized[1:].strip()
+    return normalized
+
+
+def _save_bot_command_denials():
+    payload = {
+        'users': {
+            user_id: {'all': state['all'], 'allowed': sorted(state['allowed'])}
+            for user_id, state in BOT_COMMAND_DENIALS.items()
+        }
+    }
+    temp_file = BOT_COMMAND_DENY_FILE.with_name(BOT_COMMAND_DENY_FILE.name + '.tmp')
+    try:
+        with open(temp_file, 'w', encoding='utf-8') as file:
+            json.dump(payload, file, indent=2, ensure_ascii=False)
+        os.replace(temp_file, BOT_COMMAND_DENY_FILE)
+    except OSError as error:
+        print(f'[BotCommandDenial] No pude guardar los permisos de comandos: {error}')
+        raise
+
+
+def _is_bot_command_denied(user, command_name=None):
+    if str(user.id) == OWNER_ID:
+        return False
+    state = BOT_COMMAND_DENIALS.get(str(user.id))
+    if state is None or not state['all']:
+        return False
+    command = _normalize_bot_command_name(command_name)
+    return not command or command not in state['allowed']
 
 
 def _deny_bot_commands(user_id):
     user_id = str(user_id)
-    BOT_COMMAND_DENIALS.add(user_id)
+    previous = BOT_COMMAND_DENIALS.get(user_id)
+    BOT_COMMAND_DENIALS[user_id] = {'all': True, 'allowed': set()}
     try:
-        with open(BOT_COMMAND_DENY_FILE, 'w', encoding='utf-8') as file:
-            json.dump(sorted(BOT_COMMAND_DENIALS), file, indent=2, ensure_ascii=False)
-    except OSError as error:
-        print(f'[BotCommandDenial] No pude guardar el bloqueo de {user_id}: {error}')
+        _save_bot_command_denials()
+    except OSError:
+        if previous is None:
+            BOT_COMMAND_DENIALS.pop(user_id, None)
+        else:
+            BOT_COMMAND_DENIALS[user_id] = previous
+        raise
+
+
+def _activate_bot_commands(user_id, command_name=None):
+    user_id = str(user_id)
+    state = BOT_COMMAND_DENIALS.get(user_id)
+    if state is None or not state['all']:
+        raise ValueError('Ese usuario no tiene un bloqueo de comandos activo.')
+
+    previous = {'all': state['all'], 'allowed': set(state['allowed'])}
+    command = _normalize_bot_command_name(command_name)
+    if command:
+        state['allowed'].add(command)
+    else:
+        BOT_COMMAND_DENIALS.pop(user_id)
+    try:
+        _save_bot_command_denials()
+    except OSError:
+        BOT_COMMAND_DENIALS[user_id] = previous
         raise
 
 
@@ -2128,7 +2200,20 @@ intents.presences = True
 
 class JarvisCommandTree(app_commands.CommandTree):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not _is_bot_command_denied(interaction.user):
+        data = interaction.data or {}
+        command_parts = [str(data.get('name') or '')]
+        options = data.get('options') or []
+        while options:
+            subcommand = next(
+                (option for option in options if option.get('type') in (1, 2)),
+                None,
+            )
+            if subcommand is None:
+                break
+            command_parts.append(str(subcommand.get('name') or ''))
+            options = subcommand.get('options') or []
+        command_name = ' '.join(part for part in command_parts if part)
+        if not _is_bot_command_denied(interaction.user, command_name):
             return True
         if interaction.type == discord.InteractionType.application_command:
             await interaction.response.send_message('No tienes permiso para usar comandos del bot.', ephemeral=True)
@@ -8036,7 +8121,7 @@ async def handle_command(message: discord.Message):
         embed.timestamp = datetime.now(timezone.utc)
         embed.add_field(name='Moderacion', value='`ban` `banid` `unban` `timeout` `untimeout` `warn` `purge`', inline=False)
         embed.add_field(name='Utilidades', value='`ping` `gif` `sticker` `emoji` `quitar_icono` (quita 🩸 de los canales)\n`jarvis <pregunta>` - Asistente IA', inline=False)
-        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla` (`/quitar_regla_apodo`) `/show_logs`\n`/denegar_permisos` (solo owner; incluye blacklist global)\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)', inline=False)
+        embed.add_field(name='Slash (/)', value='`/rank` `/leaderboard` `/setxpchannel` `/jarvis_conocimiento` `/poll` `/giveaway` `/gend` `/greroll`\n`/remind` `/reminders` `/remindcancel`\n`/warns` `/clearwarns` `/setmodlog` `/auditoria`\n`/regla_apodo` `/quitar_regla` (`/quitar_regla_apodo`) `/show_logs`\n`/denegar_permisos` `/activar_permisos` (Discord nativo o MB; solo owner)\n`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`\n`/say` `/sayshow` `/mix`\n`/borrar_mensajes_persona` `/save` `/restore`\n`/antiraid` (activar, desactivar, estado, logs, lockdown, config)\n`/antialt` (activar, desactivar, estado, permitir, quitar_permiso)', inline=False)
         embed.add_field(name='Jarvis IA', value='`jarvis crea un canal ...` `jarvis borra el rol ...` `jarvis banea a ese ...`\nGestiono canales, roles, moderacion y mas con lenguaje natural. Prueba `jarvis ayuda`.', inline=False)
         if is_owner:
             embed.add_field(name='Admin (solo owner)', value='`server` `add` `members` `invite` `unbanowner` `syncslash`\n`>>syncslash` — Sincronizar los slash commands en este servidor\n`nivel @usuario <nivel>` — Asignar nivel manualmente\n`desactivar` — Activar/desactivar autorespuestas', inline=False)
@@ -8065,7 +8150,7 @@ async def sync_slash():
             scope = 'global'
         names = sorted(command.name for command in synced)
         print(f'[Slash] {len(synced)} comandos ({scope}): {", ".join(names)}')
-        faltan = {'auditoria', 'regla_apodo', 'quitar_regla', 'show_logs', 'denegar_permisos'} - set(names)
+        faltan = {'auditoria', 'regla_apodo', 'quitar_regla', 'show_logs', 'denegar_permisos', 'activar_permisos'} - set(names)
         if faltan:
             print(f'[Slash] NO llegaron a Discord: {faltan}')
     except Exception as e:
@@ -8173,8 +8258,14 @@ async def on_message(message: discord.Message):
     except Exception as e:
         print(f'[AntiRaid] on_message: {e}')
 
-    if _is_bot_command_denied(message.author):
-        return
+    if str(message.author.id) != OWNER_ID and str(message.author.id) in BOT_COMMAND_DENIALS:
+        if JARVIS_TRIGGER.match(message.content):
+            return
+        if message.content.startswith(PREFIX):
+            prefix_command = message.content[len(PREFIX):].strip().split(maxsplit=1)
+            command_name = prefix_command[0] if prefix_command else ''
+            if _is_bot_command_denied(message.author, command_name):
+                return
 
     try:
         try:
@@ -9216,124 +9307,166 @@ async def _permission_autocomplete(interaction: discord.Interaction, current: st
     ][:25]
 
 
-@client.tree.command(name='denegar_permisos', description='Deniega un permiso y añade al miembro a la blacklist global (solo owner)')
+_PERMISSION_SYSTEM_CHOICES = [
+    app_commands.Choice(name='Discord nativo', value='discord'),
+    app_commands.Choice(name='MB (comandos del bot)', value='mb'),
+]
+
+
+@client.tree.command(name='denegar_permisos', description='Deniega permisos nativos de Discord o bloquea comandos de MB (solo owner)')
 @app_commands.guild_only()
 @app_commands.describe(
-    permiso='Permiso de canal a denegar',
-    usuario='Miembro al que se le denegara el permiso y se aplicaran los bloqueos globales',
-    canal='Canal concreto (omitir para todos los canales de este servidor)',
+    sistema='Elige permisos nativos de Discord o comandos del bot MB',
+    usuario='Miembro al que se le denegara el permiso',
+    permiso='Permiso nativo de canal (obligatorio para Discord)',
+    canal='Canal concreto (omitir para todos los canales del servidor)',
 )
+@app_commands.choices(sistema=_PERMISSION_SYSTEM_CHOICES)
 @app_commands.autocomplete(permiso=_permission_autocomplete)
 async def slash_denegar_permisos(
     interaction: discord.Interaction,
-    permiso: str,
+    sistema: app_commands.Choice[str],
     usuario: discord.Member,
+    permiso: str = None,
     canal: discord.abc.GuildChannel = None,
 ):
     if str(interaction.user.id) != OWNER_ID:
         return await interaction.response.send_message('Solo el owner del bot puede usar este comando.', ephemeral=True)
+    if str(usuario.id) == OWNER_ID or (client.user and usuario.id == client.user.id):
+        return await interaction.response.send_message('No puedo denegar permisos al owner del bot ni al propio bot.', ephemeral=True)
+
+    if sistema.value == 'mb':
+        try:
+            _deny_bot_commands(usuario.id)
+        except OSError as error:
+            return await interaction.response.send_message(
+                f'No pude guardar el bloqueo de comandos: {short_error(error)}', ephemeral=True,
+            )
+        return await interaction.response.send_message(
+            f'Bloqueé todos los comandos de MB para {usuario.mention} en todos los servidores. '
+            'Usa `/activar_permisos` y elige MB para restaurarlos.',
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     if permiso not in _CHANNEL_PERMISSION_FLAGS:
-        return await interaction.response.send_message('Ese permiso no se puede denegar mediante permisos de canal.', ephemeral=True)
-
+        return await interaction.response.send_message(
+            'Para Discord nativo, elige un permiso válido de canal.', ephemeral=True,
+        )
     guild = interaction.guild
     if canal is not None and canal.guild.id != guild.id:
         return await interaction.response.send_message('El canal debe pertenecer a este servidor.', ephemeral=True)
-    if str(usuario.id) == OWNER_ID or (client.user and usuario.id == client.user.id):
-        return await interaction.response.send_message('No puedo aplicar el bloqueo global al owner del bot ni al propio bot.', ephemeral=True)
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_roles:
+        return await interaction.response.send_message('Me falta **Manage Roles** para cambiar permisos de canal.', ephemeral=True)
 
     channels = [canal] if canal is not None else guild.channels
+    if not channels:
+        return await interaction.response.send_message('Este servidor no tiene canales donde aplicar el permiso.', ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    results = []
+    updated = 0
+    failures = []
+    reason = f'[MB] Permiso {permiso} denegado por {interaction.user} ({interaction.user.id})'
+    for channel in channels:
+        overwrite = channel.overwrites_for(usuario)
+        setattr(overwrite, permiso, False)
+        try:
+            await channel.set_permissions(usuario, overwrite=overwrite, reason=reason)
+            updated += 1
+        except discord.HTTPException as error:
+            failures.append((channel, error))
+
+    scope = canal.mention if canal is not None else 'todos los canales del servidor'
+    response = f'Denegué `{permiso}` a {usuario.mention} en {scope} ({updated} canal(es) actualizado(s)).'
+    if failures:
+        names = ', '.join(f'#{channel.name}' for channel, _ in failures[:5])
+        more = f' y {len(failures) - 5} más' if len(failures) > 5 else ''
+        response += f'\nFalló la actualización de {len(failures)} canal(es): {names}{more}. Error: {short_error(failures[0][1])}'
+    await interaction.followup.send(response, allowed_mentions=discord.AllowedMentions.none())
+
+
+@client.tree.command(name='activar_permisos', description='Restaura permisos nativos de Discord o comandos de MB (solo owner)')
+@app_commands.guild_only()
+@app_commands.describe(
+    sistema='Elige permisos nativos de Discord o comandos del bot MB',
+    usuario='Miembro al que se le restaurara el permiso',
+    permiso='Permiso nativo de canal (obligatorio para Discord)',
+    canal='Canal concreto (omitir para todos los canales del servidor)',
+    comando='Opcional para MB: permitir solo este comando y mantener bloqueados los demas',
+)
+@app_commands.choices(sistema=_PERMISSION_SYSTEM_CHOICES)
+@app_commands.autocomplete(permiso=_permission_autocomplete)
+async def slash_activar_permisos(
+    interaction: discord.Interaction,
+    sistema: app_commands.Choice[str],
+    usuario: discord.Member,
+    permiso: str = None,
+    canal: discord.abc.GuildChannel = None,
+    comando: str = None,
+):
+    if str(interaction.user.id) != OWNER_ID:
+        return await interaction.response.send_message('Solo el owner del bot puede usar este comando.', ephemeral=True)
+    if str(usuario.id) == OWNER_ID or (client.user and usuario.id == client.user.id):
+        return await interaction.response.send_message('El owner del bot y el propio bot no tienen estos bloqueos.', ephemeral=True)
+
+    if sistema.value == 'mb':
+        if comando is not None and not _normalize_bot_command_name(comando):
+            return await interaction.response.send_message('Indica un comando, por ejemplo `regla_apodo` o `>>ban`.', ephemeral=True)
+        try:
+            _activate_bot_commands(usuario.id, comando)
+        except ValueError as error:
+            return await interaction.response.send_message(str(error), ephemeral=True)
+        except OSError as error:
+            return await interaction.response.send_message(
+                f'No pude guardar el cambio de permisos: {short_error(error)}', ephemeral=True,
+            )
+
+        if comando:
+            return await interaction.response.send_message(
+                f'{usuario.mention} ya puede usar `{_normalize_bot_command_name(comando)}`; '
+                'los demas comandos de MB siguen bloqueados.',
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return await interaction.response.send_message(
+            f'Permisos de MB restaurados: {usuario.mention} ya puede usar todos los comandos del bot.',
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    if permiso not in _CHANNEL_PERMISSION_FLAGS:
+        return await interaction.response.send_message(
+            'Para Discord nativo, elige un permiso válido de canal.', ephemeral=True,
+        )
+    guild = interaction.guild
+    if canal is not None and canal.guild.id != guild.id:
+        return await interaction.response.send_message('El canal debe pertenecer a este servidor.', ephemeral=True)
     bot_member = guild.me
-
     if bot_member is None or not bot_member.guild_permissions.manage_roles:
-        results.append('Discord: no pude denegar el permiso; me falta **Manage Roles**.')
-    elif not channels:
-        results.append('Discord: este servidor no tiene canales donde aplicar el permiso.')
-    else:
-        updated = 0
-        failures = []
-        reason = f'[Jarvis] Permiso {permiso} denegado por {interaction.user} ({interaction.user.id})'
-        for channel in channels:
-            overwrite = channel.overwrites_for(usuario)
-            setattr(overwrite, permiso, False)
-            try:
-                await channel.set_permissions(usuario, overwrite=overwrite, reason=reason)
-                updated += 1
-            except discord.HTTPException as error:
-                failures.append((channel, error))
+        return await interaction.response.send_message('Me falta **Manage Roles** para cambiar permisos de canal.', ephemeral=True)
 
-        scope = canal.mention if canal is not None else 'todos los canales del servidor'
-        results.append(f'Discord: `{permiso}` denegado en {scope} ({updated} canal(es) actualizado(s)).')
-        if failures:
-            failure_names = ', '.join(f'#{channel.name}' for channel, _ in failures[:5])
-            more = f' y {len(failures) - 5} más' if len(failures) > 5 else ''
-            results.append(
-                f'Falló la actualización de {len(failures)} canal(es): {failure_names}{more}. '
-                f'Error: {short_error(failures[0][1])}'
-            )
-
-    nick_entry = next(
-        (entry for entry in nick_rules
-         if entry['guildId'] == str(guild.id) and entry['userId'] == str(usuario.id)),
-        None,
-    )
-    if nick_entry is None:
-        results.append('Regla de apodo: no tenía una regla activa.')
-    else:
-        nick_error = can_manage_member_nickname(guild, bot_member, usuario) if bot_member else 'No encuentro mi miembro del servidor.'
-        if nick_error:
-            results.append(f'Regla de apodo: no pude quitarla. {nick_error}')
-        else:
-            nick_rules.remove(nick_entry)
-            _save_nickrules()
-            try:
-                await usuario.edit(
-                    nick=nick_entry['oldNick'],
-                    reason=f'[Jarvis] Regla de apodo retirada por {interaction.user}',
-                )
-            except discord.DiscordException as error:
-                nick_rules.append(nick_entry)
-                _save_nickrules()
-                results.append(f'Regla de apodo: no pude restaurar el apodo. {short_error(error)}')
-            else:
-                _log_nickrule(nick_entry, 'quitada', interaction.user.id)
-                results.append('Regla de apodo: quitada y apodo anterior restaurado.')
-
-    alt_config = antiraid_cfg(guild.id)
-    if str(usuario.id) in alt_config['alt_allow']:
+    channels = [canal] if canal is not None else guild.channels
+    if not channels:
+        return await interaction.response.send_message('Este servidor no tiene canales donde restaurar el permiso.', ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    updated = 0
+    failures = []
+    reason = f'[MB] Permiso {permiso} activado por {interaction.user} ({interaction.user.id})'
+    for channel in channels:
+        overwrite = channel.overwrites_for(usuario)
+        setattr(overwrite, permiso, True)
         try:
-            ar_alt_allow(guild, usuario.id, False)
-            results.append('Anti-alt: excepción eliminada.')
-        except JarvisError as error:
-            results.append(f'Anti-alt: no pude eliminar la excepción. {error}')
-    else:
-        results.append('Anti-alt: no tenía una excepción.')
+            await channel.set_permissions(usuario, overwrite=overwrite, reason=reason)
+            updated += 1
+        except discord.HTTPException as error:
+            failures.append((channel, error))
 
-    try:
-        _deny_bot_commands(usuario.id)
-        results.append('Comandos del bot: bloqueados permanentemente en todos los servidores.')
-    except OSError as error:
-        results.append(f'Comandos del bot: bloqueados durante esta sesión, pero no pude guardarlo. {short_error(error)}')
-
-    if str(usuario.id) in blacklist_data:
-        results.append('Blacklist: ya estaba en la blacklist global.')
-    else:
-        try:
-            user_id, name, banned_count, ban_failures = await blacklist_add_user(
-                guild, str(usuario.id), interaction.user.id,
-            )
-        except JarvisError as error:
-            results.append(f'Blacklist: no pude añadirlo. {error}')
-        else:
-            results.append(
-                f'Blacklist: **{name}** (`{user_id}`) añadido; baneado ahora en {banned_count} servidor(es).'
-            )
-            if ban_failures:
-                results.append('Fallaron estos bans: ' + '; '.join(ban_failures[:5]))
-
-    response = f'Acciones para {usuario.mention}:\n' + '\n'.join(f'• {result}' for result in results)
+    scope = canal.mention if canal is not None else 'todos los canales del servidor'
+    response = f'Permití `{permiso}` a {usuario.mention} en {scope} ({updated} canal(es) actualizado(s)).'
+    if failures:
+        names = ', '.join(f'#{channel.name}' for channel, _ in failures[:5])
+        more = f' y {len(failures) - 5} más' if len(failures) > 5 else ''
+        response += f'\nFalló la actualización de {len(failures)} canal(es): {names}{more}. Error: {short_error(failures[0][1])}'
     await interaction.followup.send(response, allowed_mentions=discord.AllowedMentions.none())
 
 
