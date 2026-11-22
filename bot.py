@@ -9309,20 +9309,21 @@ async def _permission_autocomplete(interaction: discord.Interaction, current: st
 
 _PERMISSION_SYSTEM_CHOICES = [
     app_commands.Choice(name='Discord nativo', value='discord'),
-    app_commands.Choice(name='MB (comandos del bot)', value='mb'),
+    app_commands.Choice(name='MB (todos los slash y comandos >>)', value='mb'),
 ]
 
 
 @client.tree.command(name='denegar_permisos', description='Deniega permisos nativos de Discord o bloquea comandos de MB (solo owner)')
 @app_commands.guild_only()
 @app_commands.describe(
-    sistema='Elige permisos nativos de Discord o comandos del bot MB',
-    usuario='Miembro al que se le denegara el permiso',
-    permiso='Permiso nativo de canal (obligatorio para Discord)',
-    canal='Canal concreto (omitir para todos los canales del servidor)',
+    sistema='Discord nativo cambia permisos de canal; MB bloquea todos los slash y comandos >> del bot',
+    usuario='Miembro al que se le denegara el permiso o se le bloqueara MB',
+    permiso='Solo Discord nativo: permiso de canal a denegar (dejar vacio para MB)',
+    canal='Solo Discord nativo: canal (omitir para todos los canales del servidor)',
 )
 @app_commands.choices(sistema=_PERMISSION_SYSTEM_CHOICES)
 @app_commands.autocomplete(permiso=_permission_autocomplete)
+@app_commands.rename(permiso='permiso_discord')
 async def slash_denegar_permisos(
     interaction: discord.Interaction,
     sistema: app_commands.Choice[str],
@@ -9388,14 +9389,15 @@ async def slash_denegar_permisos(
 @client.tree.command(name='activar_permisos', description='Restaura permisos nativos de Discord o comandos de MB (solo owner)')
 @app_commands.guild_only()
 @app_commands.describe(
-    sistema='Elige permisos nativos de Discord o comandos del bot MB',
-    usuario='Miembro al que se le restaurara el permiso',
-    permiso='Permiso nativo de canal (obligatorio para Discord)',
-    canal='Canal concreto (omitir para todos los canales del servidor)',
-    comando='Opcional para MB: permitir solo este comando y mantener bloqueados los demas',
+    sistema='Discord nativo restaura un permiso de canal; MB restaura comandos slash y comandos >>',
+    usuario='Miembro al que se le restaurara el permiso o MB',
+    permiso='Solo Discord nativo: permiso de canal a permitir (dejar vacio para MB)',
+    canal='Solo Discord nativo: canal (omitir para todos los canales del servidor)',
+    comando='Solo MB: permitir un comando y mantener bloqueados los demas; vacio = permitir todos',
 )
 @app_commands.choices(sistema=_PERMISSION_SYSTEM_CHOICES)
 @app_commands.autocomplete(permiso=_permission_autocomplete)
+@app_commands.rename(permiso='permiso_discord')
 async def slash_activar_permisos(
     interaction: discord.Interaction,
     sistema: app_commands.Choice[str],
