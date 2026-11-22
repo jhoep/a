@@ -3975,7 +3975,9 @@ def _check_quarantine_permissions(ctx, target):
 async def act_quarantine(ctx, t, intent):
     guard_sanction(ctx, t, 'poner en quarantine', need_member=True)
     _check_quarantine_permissions(ctx, t)
+    started_at = time.time()
     until = _quarantine_until(intent.duration)
+    duration_seconds = None if until is None else until - started_at
     role = await _ensure_quarantine_role(ctx.guild, ctx.me)
     entry = next((saved for saved in quarantine_data
                   if saved['guildId'] == str(ctx.guild.id) and saved['userId'] == str(t.id)), None)
@@ -4018,6 +4020,10 @@ async def act_quarantine(ctx, t, intent):
 
     try:
         await _enforce_quarantine(ctx.guild, t.member, entry)
+        if duration_seconds is not None:
+            entry['until'] = time.time() + duration_seconds
+            _save_quarantines()
+            until = entry['until']
     except Exception as e:
         if is_new:
             await _fire_quarantine(entry, force=True)
