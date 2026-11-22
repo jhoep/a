@@ -9202,7 +9202,7 @@ async def slash_borrar_mensajes_persona(interaction: discord.Interaction, usuari
 
 _ALL_CHANNEL_PERMISSIONS = discord.Permissions.all_channel()
 _CHANNEL_PERMISSION_FLAGS = frozenset(
-    permission for permission in discord.PermissionOverwrite.VALID_FLAGS
+    permission for permission in discord.PermissionOverwrite.VALID_NAMES
     if getattr(_ALL_CHANNEL_PERMISSIONS, permission, False)
 )
 
