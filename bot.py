@@ -77,6 +77,15 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _normalize_bot_command_name(command):
+    normalized = ' '.join(str(command or '').strip().lower().split())
+    if normalized.startswith(PREFIX):
+        return PREFIX + normalized[len(PREFIX):].strip()
+    if normalized.startswith('/'):
+        return '/' + normalized[1:].strip()
+    return normalized
+
+
 def load_json(file_path, default=None):
     if default is None:
         default = {}
@@ -102,7 +111,7 @@ BOT_COMMAND_DENIALS = {}
 if isinstance(_bot_command_denials_saved, list):
     for user_id in _bot_command_denials_saved:
         if str(user_id).isdigit():
-            BOT_COMMAND_DENIALS[str(user_id)] = {'all': True, 'allowed': set()}
+            BOT_COMMAND_DENIALS[str(user_id)] = {'all': True, 'allowed': set(), 'denied': set()}
 elif isinstance(_bot_command_denials_saved, dict):
     saved_users = _bot_command_denials_saved.get('users', _bot_command_denials_saved)
     if isinstance(saved_users, dict):
@@ -111,30 +120,102 @@ elif isinstance(_bot_command_denials_saved, dict):
                 continue
             if isinstance(state, dict):
                 allowed = state.get('allowed', [])
+                denied = state.get('denied', [])
                 BOT_COMMAND_DENIALS[str(user_id)] = {
                     'all': bool(state.get('all', True)),
                     'allowed': {
                         command for raw in allowed
-                        if (command := ' '.join(str(raw).strip().lower().split()))
+                        if (command := _normalize_bot_command_name(raw))
                     } if isinstance(allowed, list) else set(),
+                    'denied': {
+                        command for raw in denied
+                        if (command := _normalize_bot_command_name(raw))
+                    } if isinstance(denied, list) else set(),
                 }
             else:
-                BOT_COMMAND_DENIALS[str(user_id)] = {'all': True, 'allowed': set()}
+                BOT_COMMAND_DENIALS[str(user_id)] = {'all': True, 'allowed': set(), 'denied': set()}
 
 
-def _normalize_bot_command_name(command):
-    normalized = ' '.join(str(command or '').strip().lower().split())
-    if normalized.startswith(PREFIX):
-        normalized = normalized[len(PREFIX):].strip()
-    elif normalized.startswith('/'):
-        normalized = normalized[1:].strip()
-    return normalized
+_PREFIX_COMMAND_NAMES = (
+    'quarantine', 'unquarantine', 'quitar_icono', 'syncslash', 'desactivar', 'nivel',
+    'bardealo', 'bardea', 'bardear', 'whitelist', 'wl', 'ping', 'ban', 'banid',
+    'unban', 'timeout', 'mute', 'silence', 'untimeout', 'unmute', 'removetimeout',
+    'warn', 'purge', 'gif', 'sticker', 'emoji', 'server', 'add', 'unbanowner',
+    'members', 'invite', 'help', 'h', 'ayuda', 'commands', 'comandos', 'jarvis',
+)
+
+
+def _bot_command_names():
+    names = {f'{PREFIX}{name}' for name in _PREFIX_COMMAND_NAMES}
+
+    def add_slash_commands(command, path=()):
+        command_path = path + (command.name,)
+        if isinstance(command, app_commands.Group):
+            for child in command.commands:
+                add_slash_commands(child, command_path)
+        else:
+            names.add('/' + ' '.join(command_path))
+
+    for command in client.tree.get_commands():
+        add_slash_commands(command)
+    return sorted(names)
+
+
+def _bot_command_rule_matches(rule, command):
+    normalized_rule = _normalize_bot_command_name(rule)
+    normalized_command = _normalize_bot_command_name(command)
+    if normalized_rule == normalized_command:
+        return True
+    if normalized_rule.startswith('/') and normalized_command.startswith('/'):
+        return normalized_command.startswith(normalized_rule + ' ')
+    if not normalized_rule.startswith((PREFIX, '/')):
+        return normalized_command in (
+            normalized_rule,
+            '/' + normalized_rule,
+            PREFIX + normalized_rule,
+        )
+    return False
+
+
+def _bot_command_selection(command):
+    normalized = _normalize_bot_command_name(command)
+    names = _bot_command_names()
+    if normalized in names:
+        return normalized
+    if not normalized.startswith((PREFIX, '/')):
+        matches = [
+            name for name in names
+            if (name[len(PREFIX):] if name.startswith(PREFIX) else name.rsplit(' ', 1)[-1].lstrip('/')) == normalized
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    raise ValueError('Elige un comando de MB de la lista, por ejemplo `>>ban` o `/regla_apodo`.')
+
+
+async def _bot_command_autocomplete(interaction: discord.Interaction, current: str):
+    query = current.strip().lower()
+    names = [
+        name for name in _bot_command_names()
+        if query in name.lower()
+    ]
+    if not query:
+        slash_names = [name for name in names if name.startswith('/')]
+        prefix_names = [name for name in names if name.startswith(PREFIX)]
+        names = slash_names[:12] + prefix_names[:13]
+    return [
+        app_commands.Choice(name=name, value=name)
+        for name in names[:25]
+    ]
 
 
 def _save_bot_command_denials():
     payload = {
         'users': {
-            user_id: {'all': state['all'], 'allowed': sorted(state['allowed'])}
+            user_id: {
+                'all': state['all'],
+                'allowed': sorted(state['allowed']),
+                'denied': sorted(state.get('denied', set())),
+            }
             for user_id, state in BOT_COMMAND_DENIALS.items()
         }
     }
@@ -152,16 +233,35 @@ def _is_bot_command_denied(user, command_name=None):
     if str(user.id) == OWNER_ID:
         return False
     state = BOT_COMMAND_DENIALS.get(str(user.id))
-    if state is None or not state['all']:
+    if state is None:
         return False
+    if not command_name:
+        return state['all'] or bool(state.get('denied'))
     command = _normalize_bot_command_name(command_name)
-    return not command or command not in state['allowed']
+    if any(_bot_command_rule_matches(rule, command) for rule in state.get('denied', set())):
+        return True
+    if state['all']:
+        return not any(_bot_command_rule_matches(rule, command) for rule in state['allowed'])
+    return False
 
 
-def _deny_bot_commands(user_id):
+def _deny_bot_commands(user_id, command_name=None):
     user_id = str(user_id)
-    previous = BOT_COMMAND_DENIALS.get(user_id)
-    BOT_COMMAND_DENIALS[user_id] = {'all': True, 'allowed': set()}
+    previous_state = BOT_COMMAND_DENIALS.get(user_id)
+    previous = None if previous_state is None else {
+        'all': previous_state['all'],
+        'allowed': set(previous_state['allowed']),
+        'denied': set(previous_state.get('denied', set())),
+    }
+    if command_name:
+        command = _bot_command_selection(command_name)
+        state = BOT_COMMAND_DENIALS.setdefault(
+            user_id,
+            {'all': False, 'allowed': set(), 'denied': set()},
+        )
+        state.setdefault('denied', set()).add(command)
+    else:
+        BOT_COMMAND_DENIALS[user_id] = {'all': True, 'allowed': set(), 'denied': set()}
     try:
         _save_bot_command_denials()
     except OSError:
@@ -175,13 +275,30 @@ def _deny_bot_commands(user_id):
 def _activate_bot_commands(user_id, command_name=None):
     user_id = str(user_id)
     state = BOT_COMMAND_DENIALS.get(user_id)
-    if state is None or not state['all']:
+    if state is None:
         raise ValueError('Ese usuario no tiene un bloqueo de comandos activo.')
 
-    previous = {'all': state['all'], 'allowed': set(state['allowed'])}
-    command = _normalize_bot_command_name(command_name)
+    previous = {
+        'all': state['all'],
+        'allowed': set(state['allowed']),
+        'denied': set(state.get('denied', set())),
+    }
+    command = _bot_command_selection(command_name) if command_name else None
     if command:
-        state['allowed'].add(command)
+        if state['all']:
+            state['denied'] = {
+                rule for rule in state.get('denied', set())
+                if not _bot_command_rule_matches(rule, command)
+                and not _bot_command_rule_matches(command, rule)
+            }
+            state['allowed'].add(command)
+        else:
+            state['denied'] = {
+                rule for rule in state.get('denied', set())
+                if not _bot_command_rule_matches(rule, command)
+            }
+            if not state['denied']:
+                BOT_COMMAND_DENIALS.pop(user_id, None)
     else:
         BOT_COMMAND_DENIALS.pop(user_id)
     try:
@@ -2212,7 +2329,7 @@ class JarvisCommandTree(app_commands.CommandTree):
                 break
             command_parts.append(str(subcommand.get('name') or ''))
             options = subcommand.get('options') or []
-        command_name = ' '.join(part for part in command_parts if part)
+        command_name = '/' + ' '.join(part for part in command_parts if part)
         if not _is_bot_command_denied(interaction.user, command_name):
             return True
         if interaction.type == discord.InteractionType.application_command:
@@ -8276,12 +8393,14 @@ async def on_message(message: discord.Message):
 
     if str(message.author.id) != OWNER_ID and str(message.author.id) in BOT_COMMAND_DENIALS:
         if JARVIS_TRIGGER.match(message.content):
-            return
-        if message.content.startswith(PREFIX):
+            command_name = f'{PREFIX}jarvis'
+        elif message.content.startswith(PREFIX):
             prefix_command = message.content[len(PREFIX):].strip().split(maxsplit=1)
-            command_name = prefix_command[0] if prefix_command else ''
-            if _is_bot_command_denied(message.author, command_name):
-                return
+            command_name = f'{PREFIX}{prefix_command[0]}' if prefix_command else ''
+        else:
+            command_name = None
+        if command_name and _is_bot_command_denied(message.author, command_name):
+            return
 
     try:
         try:
@@ -9340,20 +9459,21 @@ async def _permission_autocomplete(interaction: discord.Interaction, current: st
 
 _PERMISSION_SYSTEM_CHOICES = [
     app_commands.Choice(name='Discord nativo', value='discord'),
-    app_commands.Choice(name='MB (todos los slash y comandos >>)', value='mb'),
+    app_commands.Choice(name='MB (comandos slash y >>)', value='mb'),
 ]
 
 
 @client.tree.command(name='denegar_permisos', description='Deniega permisos nativos de Discord o bloquea comandos de MB (solo owner)')
 @app_commands.guild_only()
 @app_commands.describe(
-    sistema='Discord nativo cambia permisos de canal; MB bloquea todos los slash y comandos >> del bot',
+    sistema='Discord nativo cambia permisos de canal; MB bloquea uno o todos los comandos del bot',
     usuario='Miembro al que se le denegara el permiso o se le bloqueara MB',
-    permiso='Solo Discord nativo: permiso de canal a denegar (dejar vacio para MB)',
+    permiso='Solo Discord nativo: permiso de canal a denegar',
     canal='Solo Discord nativo: canal (omitir para todos los canales del servidor)',
+    comando='Solo MB: elige un comando para bloquear; vacio = bloquear todos',
 )
 @app_commands.choices(sistema=_PERMISSION_SYSTEM_CHOICES)
-@app_commands.autocomplete(permiso=_permission_autocomplete)
+@app_commands.autocomplete(permiso=_permission_autocomplete, comando=_bot_command_autocomplete)
 @app_commands.rename(permiso='permiso_discord')
 async def slash_denegar_permisos(
     interaction: discord.Interaction,
@@ -9361,6 +9481,7 @@ async def slash_denegar_permisos(
     usuario: discord.Member,
     permiso: str = None,
     canal: discord.abc.GuildChannel = None,
+    comando: str = None,
 ):
     if str(interaction.user.id) != OWNER_ID:
         return await interaction.response.send_message('Solo el owner del bot puede usar este comando.', ephemeral=True)
@@ -9369,10 +9490,19 @@ async def slash_denegar_permisos(
 
     if sistema.value == 'mb':
         try:
-            _deny_bot_commands(usuario.id)
+            selected_command = _bot_command_selection(comando) if comando else None
+            _deny_bot_commands(usuario.id, selected_command)
+        except ValueError as error:
+            return await interaction.response.send_message(str(error), ephemeral=True)
         except OSError as error:
             return await interaction.response.send_message(
                 f'No pude guardar el bloqueo de comandos: {short_error(error)}', ephemeral=True,
+            )
+        if selected_command:
+            return await interaction.response.send_message(
+                f'Bloqueé `{selected_command}` para {usuario.mention}. Los demas comandos no cambiaron.',
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
         return await interaction.response.send_message(
             f'Bloqueé todos los comandos de MB para {usuario.mention} en todos los servidores. '
@@ -9381,6 +9511,8 @@ async def slash_denegar_permisos(
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    if comando is not None:
+        return await interaction.response.send_message('El campo `comando` solo se usa con MB.', ephemeral=True)
     if permiso not in _CHANNEL_PERMISSION_FLAGS:
         return await interaction.response.send_message(
             'Para Discord nativo, elige un permiso válido de canal.', ephemeral=True,
@@ -9422,12 +9554,12 @@ async def slash_denegar_permisos(
 @app_commands.describe(
     sistema='Discord nativo restaura un permiso de canal; MB restaura comandos slash y comandos >>',
     usuario='Miembro al que se le restaurara el permiso o MB',
-    permiso='Solo Discord nativo: permiso de canal a permitir (dejar vacio para MB)',
+    permiso='Solo Discord nativo: permiso de canal a permitir',
     canal='Solo Discord nativo: canal (omitir para todos los canales del servidor)',
-    comando='Solo MB: permitir un comando y mantener bloqueados los demas; vacio = permitir todos',
+    comando='Solo MB: activar un comando; vacio = quitar todos los bloqueos',
 )
 @app_commands.choices(sistema=_PERMISSION_SYSTEM_CHOICES)
-@app_commands.autocomplete(permiso=_permission_autocomplete)
+@app_commands.autocomplete(permiso=_permission_autocomplete, comando=_bot_command_autocomplete)
 @app_commands.rename(permiso='permiso_discord')
 async def slash_activar_permisos(
     interaction: discord.Interaction,
@@ -9443,10 +9575,9 @@ async def slash_activar_permisos(
         return await interaction.response.send_message('El owner del bot y el propio bot no tienen estos bloqueos.', ephemeral=True)
 
     if sistema.value == 'mb':
-        if comando is not None and not _normalize_bot_command_name(comando):
-            return await interaction.response.send_message('Indica un comando, por ejemplo `regla_apodo` o `>>ban`.', ephemeral=True)
         try:
-            _activate_bot_commands(usuario.id, comando)
+            selected_command = _bot_command_selection(comando) if comando else None
+            _activate_bot_commands(usuario.id, selected_command)
         except ValueError as error:
             return await interaction.response.send_message(str(error), ephemeral=True)
         except OSError as error:
@@ -9454,10 +9585,15 @@ async def slash_activar_permisos(
                 f'No pude guardar el cambio de permisos: {short_error(error)}', ephemeral=True,
             )
 
-        if comando:
+        if selected_command:
+            if str(usuario.id) not in BOT_COMMAND_DENIALS:
+                return await interaction.response.send_message(
+                    f'{usuario.mention} ya puede usar todos los comandos de MB; no quedan bloqueos activos.',
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             return await interaction.response.send_message(
-                f'{usuario.mention} ya puede usar `{_normalize_bot_command_name(comando)}`; '
-                'los demas comandos de MB siguen bloqueados.',
+                f'{usuario.mention} ya puede usar `{selected_command}`. Los demas bloqueos de MB siguen activos.',
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -9467,6 +9603,8 @@ async def slash_activar_permisos(
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    if comando is not None:
+        return await interaction.response.send_message('El campo `comando` solo se usa con MB.', ephemeral=True)
     if permiso not in _CHANNEL_PERMISSION_FLAGS:
         return await interaction.response.send_message(
             'Para Discord nativo, elige un permiso válido de canal.', ephemeral=True,
