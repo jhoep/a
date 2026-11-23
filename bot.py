@@ -8277,16 +8277,6 @@ async def sync_slash():
         return
     _slash_sync_done = True
     try:
-        semaphore = asyncio.Semaphore(5)
-
-        async def clear_guild(guild):
-            async with semaphore:
-                try:
-                    await clear_guild_slash_commands(guild)
-                except discord.DiscordException as error:
-                    print(f'[Slash] No pude limpiar comandos antiguos del servidor {guild.id}: {error}')
-
-        await asyncio.gather(*(clear_guild(guild) for guild in client.guilds))
         synced = await client.tree.sync()
         names = sorted(command.name for command in synced)
         print(f'[Slash] {len(synced)} comandos globales: {", ".join(names)}')
