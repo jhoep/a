@@ -151,6 +151,7 @@ def _bot_command_names():
     def add_slash_commands(command, path=()):
         command_path = path + (command.name,)
         if isinstance(command, app_commands.Group):
+            names.add('/' + ' '.join(command_path))
             for child in command.commands:
                 add_slash_commands(child, command_path)
         else:
@@ -194,14 +195,20 @@ def _bot_command_selection(command):
 
 async def _bot_command_autocomplete(interaction: discord.Interaction, current: str):
     query = current.strip().lower()
-    names = [
-        name for name in _bot_command_names()
-        if query in name.lower()
-    ]
+    all_names = _bot_command_names()
+    names = [name for name in all_names if query in name.lower()]
     if not query:
-        slash_names = [name for name in names if name.startswith('/')]
-        prefix_names = [name for name in names if name.startswith(PREFIX)]
-        names = slash_names[:12] + prefix_names[:13]
+        slash_names = sorted(name for name in all_names if name.startswith('/'))
+        prefix_names = sorted(name for name in all_names if name.startswith(PREFIX))
+        names = [
+            name
+            for pair in zip(slash_names, prefix_names)
+            for name in pair
+        ]
+        names.extend(slash_names[len(prefix_names):])
+        names.extend(prefix_names[len(slash_names):])
+    else:
+        names.sort(key=lambda name: (not name.lower().startswith(query), name))
     return [
         app_commands.Choice(name=name, value=name)
         for name in names[:25]
