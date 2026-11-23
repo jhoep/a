@@ -10371,6 +10371,11 @@ async def main():
                 attempt += 1
                 delay = min(30 * 2 ** attempt, 900)
                 print(f'[Login] Error (intento {attempt}): {err}. Reintentando en {delay}s...')
+                try:
+                    await client.http.close()
+                finally:
+                    client.http.clear()
+                    client.http.connector = discord.utils.MISSING
                 await asyncio.sleep(delay)
     finally:
         await client.close()
