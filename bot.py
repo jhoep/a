@@ -151,11 +151,15 @@ def _bot_command_names():
     def add_slash_commands(command, path=()):
         command_path = path + (command.name,)
         if isinstance(command, app_commands.Group):
-            names.add('/' + ' '.join(command_path))
+            slash_name = '/' + ' '.join(command_path)
+            names.add(slash_name)
+            names.add(f'{PREFIX}{slash_name[1:]}')
             for child in command.commands:
                 add_slash_commands(child, command_path)
         else:
-            names.add('/' + ' '.join(command_path))
+            slash_name = '/' + ' '.join(command_path)
+            names.add(slash_name)
+            names.add(f'{PREFIX}{slash_name[1:]}')
 
     for command in client.tree.get_commands():
         add_slash_commands(command)
@@ -165,10 +169,23 @@ def _bot_command_names():
 def _bot_command_rule_matches(rule, command):
     normalized_rule = _normalize_bot_command_name(rule)
     normalized_command = _normalize_bot_command_name(command)
-    if normalized_rule == normalized_command:
-        return True
-    if normalized_rule.startswith('/') and normalized_command.startswith('/'):
-        return normalized_command.startswith(normalized_rule + ' ')
+    rule_names = {normalized_rule}
+    command_names = {normalized_command}
+    if normalized_rule.startswith('/'):
+        rule_names.add(f'{PREFIX}{normalized_rule[1:]}')
+    elif normalized_rule.startswith(PREFIX):
+        rule_names.add('/' + normalized_rule[len(PREFIX):])
+    if normalized_command.startswith('/'):
+        command_names.add(f'{PREFIX}{normalized_command[1:]}')
+    elif normalized_command.startswith(PREFIX):
+        command_names.add('/' + normalized_command[len(PREFIX):])
+    for rule_name in rule_names:
+        for command_name in command_names:
+            if rule_name == command_name:
+                return True
+            if rule_name.startswith(('/', PREFIX)) and command_name.startswith(('/', PREFIX)):
+                if command_name.startswith(rule_name + ' '):
+                    return True
     if not normalized_rule.startswith((PREFIX, '/')):
         return normalized_command in (
             normalized_rule,
@@ -184,10 +201,17 @@ def _bot_command_selection(command):
     if normalized in names:
         return normalized
     if not normalized.startswith((PREFIX, '/')):
-        matches = [
+        slash_matches = [
             name for name in names
-            if (name[len(PREFIX):] if name.startswith(PREFIX) else name.rsplit(' ', 1)[-1].lstrip('/')) == normalized
+            if name.startswith('/')
+            and name.rsplit(' ', 1)[-1].lstrip('/') == normalized
         ]
+        prefix_matches = [
+            name for name in names
+            if name.startswith(PREFIX)
+            and name[len(PREFIX):].rsplit(' ', 1)[-1] == normalized
+        ]
+        matches = slash_matches or prefix_matches
         if len(matches) == 1:
             return matches[0]
     raise ValueError('Elige un comando de MB de la lista, por ejemplo `>>ban` o `/regla_apodo`.')
@@ -195,11 +219,16 @@ def _bot_command_selection(command):
 
 async def _bot_command_autocomplete(interaction: discord.Interaction, current: str):
     query = current.strip().lower()
-    all_names = _bot_command_names()
+    all_names = sorted(
+        name for name in _bot_command_names()
+        if len(name) <= 100
+    )
     names = [name for name in all_names if query in name.lower()]
-    if not query:
-        slash_names = sorted(name for name in all_names if name.startswith('/'))
-        prefix_names = sorted(name for name in all_names if name.startswith(PREFIX))
+    if query:
+        names.sort(key=lambda name: (not name.lower().startswith(query), name))
+    else:
+        slash_names = [name for name in names if name.startswith('/')]
+        prefix_names = [name for name in names if name.startswith(PREFIX)]
         names = [
             name
             for pair in zip(slash_names, prefix_names)
@@ -207,8 +236,6 @@ async def _bot_command_autocomplete(interaction: discord.Interaction, current: s
         ]
         names.extend(slash_names[len(prefix_names):])
         names.extend(prefix_names[len(slash_names):])
-    else:
-        names.sort(key=lambda name: (not name.lower().startswith(query), name))
     return [
         app_commands.Choice(name=name, value=name)
         for name in names[:25]
