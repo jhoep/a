@@ -1,4 +1,4 @@
-d# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 jarvis_aceptar_owner.py
 =======================
