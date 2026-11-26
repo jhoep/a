@@ -3824,6 +3824,9 @@ async def run_target_action(ctx, intent, targets):
     handler = TARGET_HANDLERS[intent.action]
     results = []
     for t in targets:
+        if str(t.id) == str(OWNER_ID):
+            results.append('No puedo hacerle eso al owner del bot.')
+            continue
         results.append(await safe_act(handler(ctx, t, intent)))
     return [r for r in results if r is not None]
 
