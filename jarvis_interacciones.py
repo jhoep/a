@@ -160,26 +160,26 @@ async def _handle_interaction(message: discord.Message):
         return False
 
     command = parts[0].lower()
-    targets = message.mentions
-    target = targets[0] if targets else None
+    targets = list({member.id: member for member in message.mentions}.values())
 
-    if target is None and message.reference:
+    if not targets and message.reference:
         replied = message.reference.resolved
         if isinstance(replied, discord.Message):
-            target = replied.author
+            targets = [replied.author]
 
-    if target is None:
+    if not targets:
         await message.reply(
             f'Uso: `{M.PREFIX}{command} @usuario` o responde al mensaje de alguien.'
         )
         return True
 
-    if target.id == message.author.id:
+    if any(target.id == message.author.id for target in targets):
         await message.reply('Elige a otra persona para esa interacción.')
         return True
 
     _verb, action, _singular, _plural, _label, _emoji = _ACTIONS[command]
-    await _send_action(message.reply, message.guild, message.author, target, action)
+    for target in targets:
+        await _send_action(message.reply, message.guild, message.author, target, action)
     return True
 
 
