@@ -3293,6 +3293,12 @@ def build_intent_prompt(ctx, chat, knowledge=None):
     roles = [r.name for r in sorted(g.roles, key=lambda r: -r.position) if r.name != '@everyone'][:40]
     if roles:
         parts.append('ROLES: ' + ', '.join(roles))
+    mentioned_roles = getattr(ctx.message, 'role_mentions', [])
+    if mentioned_roles:
+        parts.append(
+            'ROLES MENCIONADOS EN LA ORDEN (usa el ID exacto como campo role): '
+            + ', '.join(f'{role.name} <@&{role.id}>' for role in mentioned_roles)
+        )
     vcs = [c.name for c in g.channels if isinstance(c, (discord.VoiceChannel, discord.StageChannel))][:20]
     if vcs:
         parts.append('CANALES DE VOZ: ' + ', '.join(vcs))
@@ -7458,11 +7464,24 @@ async def execute_chain(ctx, steps):
     return True
 
 
+def apply_mentioned_role(ctx, intent):
+    mentioned_roles = getattr(ctx.message, 'role_mentions', [])
+    if len(mentioned_roles) != 1:
+        return
+    role_mention = f'<@&{mentioned_roles[0].id}>'
+    role_actions = {'role_add', 'role_remove', 'edit_role', 'delete_role'}
+    for step in [intent] + intent.chain:
+        if step.action in role_actions:
+            step.role = role_mention
+
+
 async def execute_intent(ctx, intent):
     """Resuelve personas, aplica protecciones/confirmacion y ejecuta.
     Devuelve False si es un patron ambiguo que mejor se trata como charla normal."""
     msg, act = ctx.message, intent.action
     reply = make_replier(msg)
+
+    apply_mentioned_role(ctx, intent)
 
     if act == 'clarify':
         await reply(content=intent.clarify or intent.reply or 'No termine de entenderte, me lo explicas un poco mas?')
