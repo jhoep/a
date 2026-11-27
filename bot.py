@@ -5400,26 +5400,23 @@ async def _apply_quarantine_overwrites(guild, member, role, entry):
 
     _save_quarantines()
 
-    semaphore = asyncio.Semaphore(5)
-
     async def apply_channel_overwrites(channel):
-        async with semaphore:
-            original = original_by_channel[str(channel.id)]
-            current_role_overwrite = channel.overwrites_for(role)
-            role_overwrite = _quarantine_overwrite(current_role_overwrite)
-            if current_role_overwrite != role_overwrite:
-                await channel.set_permissions(
-                    role, overwrite=role_overwrite, reason='[Jarvis] Bloquear canales al rol quarantine',
-                )
+        original = original_by_channel[str(channel.id)]
+        current_role_overwrite = channel.overwrites_for(role)
+        role_overwrite = _quarantine_overwrite(current_role_overwrite)
+        if current_role_overwrite != role_overwrite:
+            await channel.set_permissions(
+                role, overwrite=role_overwrite, reason='[Jarvis] Bloquear canales al rol quarantine',
+            )
 
-            current_member_overwrite = channel.overwrites_for(member)
-            member_overwrite = _quarantine_overwrite(_deserialize_overwrite(original))
-            if current_member_overwrite != member_overwrite:
-                await channel.set_permissions(
-                    member,
-                    overwrite=member_overwrite,
-                    reason='[Jarvis] Impedir permisos individuales durante quarantine',
-                )
+        current_member_overwrite = channel.overwrites_for(member)
+        member_overwrite = _quarantine_overwrite(_deserialize_overwrite(original))
+        if current_member_overwrite != member_overwrite:
+            await channel.set_permissions(
+                member,
+                overwrite=member_overwrite,
+                reason='[Jarvis] Impedir permisos individuales durante quarantine',
+            )
 
     results = await asyncio.gather(
         *(apply_channel_overwrites(channel) for channel in channels),
@@ -5484,7 +5481,7 @@ async def _enforce_quarantine_channel(channel, entry):
 
 
 async def _restore_quarantine_overwrites(guild, target, entry):
-    for saved in entry.get('channelOverwrites', []):
+    async def restore_channel(saved):
         channel = guild.get_channel(int(saved['channelId']))
         if channel is not None:
             try:
@@ -5497,7 +5494,15 @@ async def _restore_quarantine_overwrites(guild, target, entry):
                     reason='[Jarvis] Restaurar permisos previos a quarantine',
                 )
             except discord.NotFound:
-                continue
+                return
+
+    results = await asyncio.gather(
+        *(restore_channel(saved) for saved in entry.get('channelOverwrites', [])),
+        return_exceptions=True,
+    )
+    errors = [result for result in results if isinstance(result, BaseException)]
+    if errors:
+        raise errors[0]
 
 
 async def _restore_quarantine(entry):
