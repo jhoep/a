@@ -73,21 +73,39 @@ class ActionReturnButton(discord.ui.Button):
                 'Esta acción solo se puede devolver dentro del servidor.',
                 ephemeral=True,
             )
+        channel = interaction.channel
+        if channel is None:
+            return await interaction.response.send_message(
+                'No pude encontrar el canal para devolver la acción.',
+                ephemeral=True,
+            )
 
+        view.used = True
         actor = guild.get_member(view.actor_id)
         if actor is None:
             try:
                 actor = await guild.fetch_member(view.actor_id)
             except discord.HTTPException:
+                view.used = False
                 return await interaction.response.send_message(
                     'No pude encontrar a la persona para devolverle la acción.',
                     ephemeral=True,
                 )
 
-        await interaction.response.defer()
-        view.used = True
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            view.used = False
+            raise
+
+        if interaction.message:
+            try:
+                await interaction.message.edit(view=None)
+            except discord.HTTPException as exc:
+                print(f'[Interacciones] No pude quitar el boton de respuesta: {exc}')
+
         sent = await _send_action(
-            interaction.followup.send,
+            channel.send,
             guild,
             interaction.user,
             actor,
@@ -96,11 +114,11 @@ class ActionReturnButton(discord.ui.Button):
         )
         if not sent:
             view.used = False
-        if sent and interaction.message:
-            try:
-                await interaction.message.edit(view=None)
-            except discord.HTTPException as exc:
-                print(f'[Interacciones] No pude quitar el boton de respuesta: {exc}')
+            if interaction.message:
+                try:
+                    await interaction.message.edit(view=view)
+                except discord.HTTPException as exc:
+                    print(f'[Interacciones] No pude restaurar el boton de respuesta: {exc}')
 
 
 class ActionReturnView(discord.ui.View):
