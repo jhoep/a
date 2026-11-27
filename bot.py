@@ -722,17 +722,34 @@ try:
     _wl_updated = float(_wl_saved.get('updated') or 0)
 except (TypeError, ValueError):
     _wl_updated = 0.0
+_wl_temporary = {}
+_wl_expiry_started = False
+_wl_temporary_saved = _wl_saved.get('temporary')
+if not isinstance(_wl_temporary_saved, dict):
+    _wl_temporary_saved = {}
+for _wl_uid, _wl_until in _wl_temporary_saved.items():
+    try:
+        _wl_temporary[str(_wl_uid)] = float(_wl_until)
+    except (TypeError, ValueError):
+        continue
 JARVIS_WHITELIST = (
     (_WL_ENV | {str(x) for x in _wl_saved.get('added', [])})
     - {str(x) for x in _wl_saved.get('removed', [])}
+)
+JARVIS_WHITELIST.update(
+    uid for uid, until in _wl_temporary.items()
+    if until > time.time() and uid not in {str(x) for x in _wl_saved.get('removed', [])}
 )
 JARVIS_WHITELIST.add(str(OWNER_ID))   # el owner siempre esta dentro
 
 
 def _wl_payload():
+    now = time.time()
+    temporary = {uid: until for uid, until in _wl_temporary.items() if until > now}
     return {
-        'added': sorted(JARVIS_WHITELIST - _WL_ENV),
+        'added': sorted(JARVIS_WHITELIST - _WL_ENV - set(_wl_temporary)),
         'removed': sorted(_WL_ENV - JARVIS_WHITELIST),
+        'temporary': temporary,
         'updated': _wl_updated,
     }
 
@@ -749,8 +766,13 @@ def _save_whitelist():
     spawn(whitelist_push_to_discord())
 
 
-def whitelist_add(user_id):
-    JARVIS_WHITELIST.add(str(user_id))
+def whitelist_add(user_id, until=None):
+    user_id = str(user_id)
+    if until is None:
+        _wl_temporary.pop(user_id, None)
+    else:
+        _wl_temporary[user_id] = float(until)
+    JARVIS_WHITELIST.add(user_id)
     _save_whitelist()
 
 
@@ -758,9 +780,22 @@ def whitelist_remove(user_id):
     user_id = str(user_id)
     if user_id == str(OWNER_ID):
         return False
+    _wl_temporary.pop(user_id, None)
     JARVIS_WHITELIST.discard(user_id)
     _save_whitelist()
     return True
+
+
+async def whitelist_expiry_loop():
+    while True:
+        now = time.time()
+        expired = [uid for uid, until in _wl_temporary.items() if until <= now]
+        if expired:
+            for uid in expired:
+                _wl_temporary.pop(uid, None)
+                JARVIS_WHITELIST.discard(uid)
+            _save_whitelist()
+        await asyncio.sleep(30)
 
 
 # ---- almacenamiento en Discord (sobrevive aunque el host borre la carpeta data/) ----
@@ -884,11 +919,26 @@ async def whitelist_boot_sync():
         remote_ts = 0.0
     r_added = {str(x) for x in (data.get('added') or [])}
     r_removed = {str(x) for x in (data.get('removed') or [])}
+    r_temporary = {}
+    remote_temporary = data.get('temporary')
+    if not isinstance(remote_temporary, dict):
+        remote_temporary = {}
+    for uid, until in remote_temporary.items():
+        try:
+            r_temporary[str(uid)] = float(until)
+        except (TypeError, ValueError):
+            continue
 
     if remote_ts > _wl_updated or not WHITELIST_FILE.exists():
         # el respaldo de Discord es mas nuevo (o el host borro el disco) -> se aplica
+        _wl_temporary.clear()
+        _wl_temporary.update(r_temporary)
         JARVIS_WHITELIST.clear()
         JARVIS_WHITELIST.update((_WL_ENV | r_added) - r_removed)
+        JARVIS_WHITELIST.update(
+            uid for uid, until in _wl_temporary.items()
+            if until > time.time() and uid not in r_removed
+        )
         JARVIS_WHITELIST.add(str(OWNER_ID))
         _wl_updated = remote_ts
         save_json(WHITELIST_FILE, _wl_payload())
@@ -3218,7 +3268,8 @@ ACCIONES (action) y sus campos:
 - list_roles | members_count | server_info | help | whitelist_show
 - nick: target_ids, nick | dm: target_ids, text | say: text (lo que debe escribir el bot), channel opcional (donde escribirlo)
 - avatar | userinfo: target_ids (vacio = el JEFE)
-- whitelist_add | whitelist_remove: target_ids
+- whitelist_add: target_ids, duration opcional (ej "2h", "3 dias"; sin duracion = permanente). La whitelist temporal se quita sola al vencer.
+- whitelist_remove: target_ids
 - leave_server: SOLO si pide explicitamente salir del servidor
 - create_channel: kind (text|voice|stage|forum|announcement|category), name o names (varios), category (nombre de una categoria existente), topic, nsfw, private (true = solo el JEFE, Jarvis y target_ids), value (limite de usuarios en voz), seconds (slowmode)
 - delete_channel: channel (nombre o #mencion; SOLO si el JEFE lo pide explicitamente)
@@ -3265,7 +3316,7 @@ REGLAS
 19. "anti alt" / "antialt" (bloquear cuentas de Discord nuevas al entrar) SIEMPRE son acciones antialt_*, nunca antiraid_*. "activa el anti alt de 265 dias" = {"action":"antialt_on","value":265}. "deja entrar a 123456789012345678 aunque su cuenta sea nueva" = {"action":"antialt_allow","target_query":"123456789012345678"}.
 20. Cualquier "por X tiempo", "durante X", "X segundos/minutos", "un ratito" en role_add/role_remove significa TEMPORAL: pon duration y Jarvis lo revierte solo. Palabras de relleno como "completos", "enteros" no son parte del nombre del rol.
 21. bardear NUNCA es insultar: es defenderse con humor sano. Si el JEFE no nombra a nadie, elige a quien estuvo molestando a Jarvis o al JEFE en el HISTORIAL (o el autor del REPLY).
-22. whitelist_add / whitelist_remove: si el JEFE escribe un ID numerico (17 a 20 digitos) o una @mencion, usalo tal cual en target_ids, aunque esa persona no este en el servidor ni en el chat. "quitale la whitelist a 123456789012345678", "saca a 123456789012345678 de la whitelist" o "ya no tiene whitelist 123456789012345678" = whitelist_remove. "dale whitelist a 123456789012345678" = whitelist_add. Si dan un nombre en vez de ID, ponlo en target_query.
+22. whitelist_add / whitelist_remove: si el JEFE escribe un ID numerico (17 a 20 digitos) o una @mencion, usalo tal cual en target_ids, aunque esa persona no este en el servidor ni en el chat. "quitale la whitelist a 123456789012345678", "saca a 123456789012345678 de la whitelist" o "ya no tiene whitelist 123456789012345678" = whitelist_remove. "dale whitelist a 123456789012345678" = whitelist_add. En whitelist_add, si dice "por/durante X tiempo", llena duration (ej. "2h", "3 dias"); sin duracion es permanente. Si dan un nombre en vez de ID, ponlo en target_query.
 23. blacklist_add / blacklist_remove / blacklist_show: el JEFE puede decir "anade a 123456789012345678 a la lista negra", "blacklist <ID o tag>", "quita <ID> de la blacklist" o "muestra la lista negra". Usa target_query para el ID, mencion o tag/nombre escrito; no confundas blacklist con whitelist.
 24. timeout: acepta cualquier duracion, incluso meses o años ("30 dias", "6 meses", "9999 años"). Si dicen "permanente", "para siempre" o "hasta que lo quite", usa duration="9999 años". Jarvis renueva el silencio solo cuando se acaba el maximo de Discord (28 dias).
 """
@@ -4495,10 +4546,23 @@ async def act_whitelist_add(ctx, t, intent):
     uid = str(t.id)
     if t.member is not None and t.member.bot:
         raise JarvisError('No tiene sentido meter a un bot en la whitelist.')
-    if uid in JARVIS_WHITELIST:
+    secs = parse_natural_duration(intent.duration) if intent.duration else None
+    permanent = normalize_for_compare(intent.duration or '') in {
+        'permanente', 'para siempre', 'forever',
+    }
+    if intent.duration and not secs and not permanent:
+        raise JarvisError(f'No entendi la duracion `{intent.duration}`. Usa, por ejemplo, 30m, 2h o 1d.')
+    is_temporary = uid in _wl_temporary
+    if uid in JARVIS_WHITELIST and not (secs and is_temporary):
         raise JarvisError(f'<@{uid}> ya esta en la whitelist.')
-    whitelist_add(uid)
-    return simple_embed('Anadido a Whitelist', f'**{t.name}** (`{uid}`) ahora puede usar comandos de Jarvis.', 0x2ecc71)
+    until = time.time() + secs if secs else None
+    whitelist_add(uid, until)
+    expiry = f'\nEl acceso vence <t:{int(until)}:R>.' if until else ''
+    return simple_embed(
+        'Anadido a Whitelist',
+        f'**{t.name}** (`{uid}`) ahora puede usar comandos de Jarvis.{expiry}',
+        0x2ecc71,
+    )
 
 
 async def act_whitelist_remove(ctx, t, intent):
@@ -4512,7 +4576,12 @@ async def act_whitelist_remove(ctx, t, intent):
 
 
 async def act_whitelist_show(ctx, intent):
-    users = [f'<@{uid}> (`{uid}`)' for uid in sorted(JARVIS_WHITELIST)]
+    users = [
+        f'<@{uid}> (`{uid}`)' + (
+            f' - vence <t:{int(_wl_temporary[uid])}:R>' if uid in _wl_temporary else ''
+        )
+        for uid in sorted(JARVIS_WHITELIST)
+    ]
     return simple_embed('Whitelist de Jarvis', '\n'.join(users) or 'La whitelist de Jarvis esta vacia.')
 
 
@@ -4643,7 +4712,7 @@ def build_help_embed():
         inline=False,
     )
     embed.add_field(name='Defensa con humor', value='`>>bardealo @user` o `jarvis bardealo` — me defiendo con humor usando lo que ha escrito esa persona en el servidor (un parrafo de burla con sus propios mensajes), sin insultos graves, y le pongo un apodo temporal de 30 segundos que se restaura solo. Tambien sirve respondiendo a su mensaje.', inline=False)
-    embed.add_field(name='Whitelist / Blacklist', value='`jarvis anade a @user a la whitelist` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (solo owner)\n`/blacklist <ID o tag>` / `/blacklist_remove <ID o tag>` / `/blacklist_list` para la blacklist global del bot', inline=False)
+    embed.add_field(name='Whitelist / Blacklist', value='`jarvis anade a @user a la whitelist` / `jarvis anade a @user a la whitelist por 2 horas` / `jarvis quita a @user de la whitelist` / `jarvis muestra la whitelist` (solo owner)\n`>>wl add @user 2h` tambien admite whitelist temporal.\n`/blacklist <ID o tag>` / `/blacklist_remove <ID o tag>` / `/blacklist_list` para la blacklist global del bot', inline=False)
     embed.add_field(name='Voice Jail', value='`/voicejail` `/voicejailstatus` `/voicejailremove` `/voicejailclear`', inline=False)
     embed.add_field(name='Anti-spam', value='`/borrar_mensajes_persona` — Borra automaticamente los mensajes futuros de alguien', inline=False)
     embed.add_field(name='Backups', value='`/save` — Guardar canales, privacidad/permisos, roles y sus miembros\n`/restore` — Restaurar canales, permisos y asignaciones de roles desde el .json', inline=False)
@@ -7259,6 +7328,8 @@ def regex_parse_intent(ctx):
         # ID, @mencion o nombre, en cualquier orden: "quitale la whitelist a <ID>", "quita <ID> de la whitelist"...
         wl_nn = normalize_for_compare(text)
         wl_ids = list(dict.fromkeys(a or b for a, b in REF_RE.findall(text)))
+        wl_duration_match = DURATION_RE.search(text)
+        wl_duration = wl_duration_match.group(1).strip() if wl_duration_match else None
         wl_remove = re.search(
             r'\b(?:quita\w*|kita\w*|remueve\w*|remover\w*|elimina\w*|saca\w*|borra\w*|revoca\w*|retira\w*|'
             r'excluye\w*|fuera|ya\s+no\s+(?:esta|tiene|va|puede))\b', wl_nn, F)
@@ -7269,6 +7340,10 @@ def regex_parse_intent(ctx):
             wl_action = 'whitelist_remove' if wl_remove else 'whitelist_add'
             wl_q = None
             if not wl_ids:
+                query_text = text
+                if wl_duration_match:
+                    query_text = query_text[:wl_duration_match.start()] + ' ' + query_text[wl_duration_match.end():]
+                wl_nn = normalize_for_compare(query_text)
                 wl_q = re.sub(
                     r'\b(?:jarvis|quita\w*|kita\w*|remueve\w*|remover\w*|elimina\w*|saca\w*|borra\w*|revoca\w*|'
                     r'retira\w*|excluye\w*|anade\w*|agrega\w*|autoriza\w*|add|incluye\w*|mete\w*|pon\w*|'
@@ -7277,7 +7352,7 @@ def regex_parse_intent(ctx):
                     ' ', wl_nn, flags=F)
                 wl_q = re.sub(r'\s+', ' ', wl_q).strip() or None
             return Intent(action=wl_action, source='regex', targets=wl_ids, target_query=wl_q,
-                          explicit=bool(wl_ids) and nwords <= 16)
+                          duration=wl_duration, explicit=bool(wl_ids) and nwords <= 20)
         return Intent(action='whitelist_show', source='regex', explicit=True)
 
     # -- roles (separando la duracion del nombre del rol)
@@ -8354,7 +8429,12 @@ async def handle_command(message: discord.Message):
             return await message.reply('Solo el owner puede usar este comando.')
         sub = args[0].lower() if args else 'list'
         if sub in ('list', 'lista', 'ver', 'show'):
-            users = [f'<@{u}> (`{u}`)' for u in sorted(JARVIS_WHITELIST)]
+            users = [
+                f'<@{uid}> (`{uid}`)' + (
+                    f' - vence <t:{int(_wl_temporary[uid])}:R>' if uid in _wl_temporary else ''
+                )
+                for uid in sorted(JARVIS_WHITELIST)
+            ]
             return await message.reply(embed=simple_embed('Whitelist de Jarvis', '\n'.join(users) or 'Vacia.'))
         if sub in ('backup', 'sync', 'respaldo', 'estado'):
             ok = await whitelist_push_to_discord()
@@ -8366,18 +8446,32 @@ async def handle_command(message: discord.Message):
         adding = sub in ('add', 'agregar', 'anadir', 'a\u00f1adir', '+')
         removing = sub in ('remove', 'rm', 'del', 'delete', 'quitar', 'quita', 'borrar', 'eliminar', '-')
         if not (adding or removing):
-            return await message.reply('Uso: `>>wl add|remove|list <@usuario o ID>`')
+            return await message.reply('Uso: `>>wl add <@usuario o ID> [duracion]` | `>>wl remove <@usuario o ID>` | `>>wl list`')
         wl_ids = list(dict.fromkeys(a or b for a, b in REF_RE.findall(message.content)))
         if not wl_ids:
             return await message.reply('Dame al menos un ID o una mencion. Ej: `>>wl remove 123456789012345678`')
+        duration_match = DURATION_RE.search(message.content) if adding else None
+        duration = duration_match.group(1).strip() if duration_match else None
+        secs = parse_natural_duration(duration) if duration else None
+        if duration and not secs and normalize_for_compare(duration) not in {
+                'permanente', 'para siempre', 'forever'}:
+            return await message.reply(f'No entendi la duracion `{duration}`. Usa, por ejemplo, 30m, 2h o 1d.')
+        until = time.time() + secs if secs else None
         lines = []
         for uid in wl_ids[:20]:
             if adding:
                 if uid in JARVIS_WHITELIST:
-                    lines.append(f'`{uid}` ya estaba en la whitelist.')
+                    if secs and uid in _wl_temporary:
+                        whitelist_add(uid, until)
+                        lines.append(f'`{uid}` ya tenia whitelist temporal; vence <t:{int(until)}:R>.')
+                    else:
+                        lines.append(f'`{uid}` ya estaba en la whitelist.')
                 else:
-                    whitelist_add(uid)
-                    lines.append(f'`{uid}` anadido a la whitelist.')
+                    whitelist_add(uid, until)
+                    if until:
+                        lines.append(f'`{uid}` anadido a la whitelist hasta <t:{int(until)}:R>.')
+                    else:
+                        lines.append(f'`{uid}` anadido a la whitelist.')
             elif uid == str(OWNER_ID):
                 lines.append(f'`{uid}` es el owner, no se puede quitar.')
             elif uid not in JARVIS_WHITELIST:
@@ -8763,6 +8857,38 @@ async def handle_command(message: discord.Message):
             await message.reply(f'Error: {e}')
         return
 
+    # SVUNBAN (owner only; desbanea un ID en otro servidor)
+    if cmd == 'svunban':
+        if str(message.author.id) != OWNER_ID:
+            return await message.reply('Solo el owner del bot puede usar este comando.')
+        if len(args) != 2 or not all(re.fullmatch(r'\d{17,20}', value) for value in args):
+            return await message.reply(f'Uso: `{PREFIX}svunban <ID_del_servidor> <ID_del_usuario>`')
+        target_guild_id, user_id = map(int, args)
+        target_guild = client.get_guild(target_guild_id)
+        if target_guild is None:
+            return await message.reply(
+                f'No encontre el servidor con ID `{target_guild_id}` (el bot debe estar dentro).'
+            )
+        bot_member = target_guild.me
+        if bot_member is None or not bot_member.guild_permissions.ban_members:
+            return await message.reply(f'No tengo permisos para desbanear en **{target_guild.name}**.')
+        try:
+            await target_guild.unban(
+                discord.Object(id=user_id),
+                reason=f'[svunban] solicitado por {message.author} ({message.author.id})',
+            )
+        except discord.NotFound:
+            return await message.reply(
+                f'El usuario con ID `{user_id}` no esta baneado en **{target_guild.name}**.'
+            )
+        except discord.Forbidden:
+            return await message.reply(f'Discord denego el desban en **{target_guild.name}**.')
+        except discord.HTTPException as e:
+            return await message.reply(f'No pude desbanear en **{target_guild.name}**: {short_error(e)}')
+        return await message.reply(
+            f'Usuario `{user_id}` desbaneado de **{target_guild.name}** (`{target_guild.id}`).'
+        )
+
     # MEMBERS (owner only)
     if cmd == 'members':
         if str(message.author.id) != OWNER_ID:
@@ -8891,6 +9017,7 @@ async def sync_slash():
 
 @client.event
 async def on_ready():
+    global _wl_expiry_started
     print(f'Bot listo: {client.user}')
     print(f'Conectado a {len(client.guilds)} servidores')
     spawn(sync_slash())
@@ -8898,6 +9025,9 @@ async def on_ready():
         if str(guild.id) in JARVIS_KNOWLEDGE_GUILDS:
             _start_knowledge_sync(guild)
     await whitelist_boot_sync()
+    if not _wl_expiry_started:
+        _wl_expiry_started = True
+        spawn(whitelist_expiry_loop())
     await blacklist_boot_sync()
     await blacklist_enforce_all_guilds()
     print(f'Jarvis whitelist: {", ".join(JARVIS_WHITELIST)}')
