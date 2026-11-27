@@ -8889,6 +8889,51 @@ async def handle_command(message: discord.Message):
             f'Usuario `{user_id}` desbaneado de **{target_guild.name}** (`{target_guild.id}`).'
         )
 
+    # SVBAN (owner only; banea un ID en otro servidor)
+    if cmd == 'svban':
+        if str(message.author.id) != OWNER_ID:
+            return await message.reply('Solo el owner del bot puede usar este comando.')
+        if len(args) != 2 or not all(re.fullmatch(r'\d{17,20}', value) for value in args):
+            return await message.reply(f'Uso: `{PREFIX}svban <ID_del_servidor> <ID_del_usuario>`')
+        target_guild_id, user_id = map(int, args)
+        if str(user_id) in {str(OWNER_ID), str(getattr(client.user, 'id', ''))}:
+            return await message.reply('No puedes banear al owner ni al bot.')
+        target_guild = client.get_guild(target_guild_id)
+        if target_guild is None:
+            return await message.reply(
+                f'No encontre el servidor con ID `{target_guild_id}` (el bot debe estar dentro).'
+            )
+        bot_member = target_guild.me
+        if bot_member is None or not bot_member.guild_permissions.ban_members:
+            return await message.reply(f'No tengo permisos para banear en **{target_guild.name}**.')
+        user = discord.Object(id=user_id)
+        try:
+            await target_guild.fetch_ban(user)
+            return await message.reply(
+                f'El usuario con ID `{user_id}` ya esta baneado en **{target_guild.name}**.'
+            )
+        except discord.NotFound:
+            pass
+        except discord.Forbidden:
+            return await message.reply(f'Discord denego consultar los baneos de **{target_guild.name}**.')
+        except discord.HTTPException as e:
+            return await message.reply(f'No pude comprobar los baneos en **{target_guild.name}**: {short_error(e)}')
+        try:
+            await target_guild.ban(
+                user,
+                reason=f'[svban] solicitado por {message.author} ({message.author.id})',
+                delete_message_seconds=0,
+            )
+        except discord.NotFound:
+            return await message.reply(f'No encontre el usuario con ID `{user_id}`.')
+        except discord.Forbidden:
+            return await message.reply(f'Discord denego el baneo en **{target_guild.name}**.')
+        except discord.HTTPException as e:
+            return await message.reply(f'No pude banear en **{target_guild.name}**: {short_error(e)}')
+        return await message.reply(
+            f'Usuario `{user_id}` baneado de **{target_guild.name}** (`{target_guild.id}`).'
+        )
+
     # MEMBERS (owner only)
     if cmd == 'members':
         if str(message.author.id) != OWNER_ID:
