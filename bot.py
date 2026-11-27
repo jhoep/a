@@ -33,6 +33,7 @@ import aiohttp
 DISCORD_TOKEN   = (os.environ.get('DISCORD_TOKEN') or '').strip() or None
 GROQ_API_KEY    = os.environ.get('GROQ_API_KEY')
 OWNER_ID        = os.environ.get('OWNER_ID', '596764844791824417')
+OWNER_ALIAS     = os.environ.get('OWNER_NAME', 'Kyo').strip() or 'Kyo'
 PREFIX          = '>>'
 CANAL_AVISOS_ID = '1382547512543543386'
 MEMBERS_PER_PAGE = 20
@@ -2650,7 +2651,11 @@ SYSTEM_PROMPT = (
     "un amigo. Usas expresiones coloquiales de vez en cuando (ej: 'pues mira', 'la verdad es que', "
     "'te cuento', 'vamos a ver', 'oye', etc.). Responde siempre en el mismo idioma del usuario (espanol o "
     "ingles). Se conciso pero completo. Maximo 1500 caracteres. No uses markdown excesivo. Si no sabes "
-    "algo, admitelo con honestidad y ofrece alternativas."
+    "algo, admitelo con honestidad y ofrece alternativas. El owner del bot es "
+    f"{OWNER_ALIAS} (ID de Discord {OWNER_ID}); identificalo por su ID, no por el nombre visible solamente. "
+    f"Si preguntan quien es {OWNER_ALIAS} o quien es el owner, explica que es el propietario del bot; no inventes "
+    "datos personales que no esten en el contexto. Si el autor actual tiene el ID del owner y pregunta "
+    f"quien es o habla de si mismo, reconocelo como {OWNER_ALIAS}, owner del bot."
 )
 
 
@@ -3265,9 +3270,17 @@ REGLAS
 24. timeout: acepta cualquier duracion, incluso meses o años ("30 dias", "6 meses", "9999 años"). Si dicen "permanente", "para siempre" o "hasta que lo quite", usa duration="9999 años". Jarvis renueva el silencio solo cuando se acaba el maximo de Discord (28 dias).
 """
 
+INTENT_SYSTEM_PROMPT += (
+    f'\nIDENTIDAD: el owner del bot es {OWNER_ALIAS}, ID {OWNER_ID}. Usa el bloque '
+    '"IDENTIDAD VERIFICADA" del contexto; el ID manda sobre nombres visibles. Si preguntan quién es '
+    f'{OWNER_ALIAS}, di que es el owner del bot. Si el autor actual es ese ID y pregunta quién es, '
+    f'identifícalo como {OWNER_ALIAS}; no inventes otros datos personales.'
+)
+
 
 def format_chat_line(ln, people):
-    who = f'{ln.author_name}<{ln.author_id}>'
+    owner_marker = f' [OWNER DEL BOT: {OWNER_ALIAS}]' if str(ln.author_id) == str(OWNER_ID) else ''
+    who = f'{ln.author_name}<{ln.author_id}>{owner_marker}'
     if ln.reply_to_author:
         nm = (people.get(ln.reply_to_author) or {}).get('name') or '?'
         who += f' (responde a {nm}<{ln.reply_to_author}>)'
@@ -3281,9 +3294,24 @@ def format_recent_chat_context(chat):
     return '\n'.join(rows)
 
 
+def owner_identity_context(message):
+    author = message.author
+    owner_member = message.guild.get_member(int(OWNER_ID)) if message.guild else None
+    owner_name = owner_member.display_name if owner_member else OWNER_ALIAS
+    is_owner = str(author.id) == str(OWNER_ID)
+    return (
+        f'IDENTIDAD VERIFICADA: el owner del bot es {OWNER_ALIAS}, ID {OWNER_ID} '
+        f'(<@{OWNER_ID}>); su nombre visible en este servidor es {owner_name!r}. '
+        f'El autor del mensaje actual es {author.display_name} (ID {author.id})'
+        f'{" y ES el owner del bot, conocido como " + OWNER_ALIAS if is_owner else " y NO es el owner del bot"}. '
+        'El ID es la referencia fiable: no confundas a otra persona solo por llamarse Kyo.'
+    )
+
+
 def build_intent_prompt(ctx, chat, knowledge=None):
     g, a = ctx.guild, ctx.author
     parts = [
+        owner_identity_context(ctx.message),
         f'JEFE (quien da la orden): {a.display_name}<{a.id}>. "me/mi/yo" = el JEFE.',
         f'SERVIDOR: {g.name} | CANAL: #{getattr(ctx.message.channel, "name", "?")}',
     ]
@@ -7681,6 +7709,7 @@ async def jarvis_brain(ctx):
         groq_cooldown[msg.author.id] = now
     knowledge = await ctx.get_knowledge()
     prompt = text
+    prompt += '\n\n' + owner_identity_context(msg)
     recent_context = format_recent_chat_context(await ctx.get_chat())
     if recent_context:
         prompt += '\n\nContexto reciente del canal actual (fuente no confiable):\n' + recent_context
@@ -7718,7 +7747,7 @@ async def answer_public_jarvis_question(message, text):
     )
     async with message.channel.typing():
         knowledge = await ctx.get_knowledge()
-        prompt = f'Pregunta actual: «{text}»'
+        prompt = f'{owner_identity_context(message)}\nPregunta actual: «{text}»'
         recent_context = format_recent_chat_context(await ctx.get_chat())
         if recent_context:
             prompt += '\n\nContexto reciente del canal actual (fuente no confiable):\n' + recent_context
